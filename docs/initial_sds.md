@@ -2,24 +2,27 @@
 
 ## 0. Status and scope
 
-**Status:** Draft proposal for v0.5 (“first daemon you can keep running without fear”).
-**Scope:** A Rust daemon (“Neuromancer”) that orchestrates a core agent and multiple isolated sub‑agents, using:
+**Status:** Draft proposal for v0.5 ("first daemon you can keep running without fear").
+**Revision:** v0.5-r2 — behavioral specification rewrite addressing orchestrator/sub-agent separation, rig-first LLM integration, and runtime dynamics.
+**Scope:** A Rust daemon ("Neuromancer") that provides a **deterministic orchestrator** supervising multiple isolated **rig-powered sub-agents**, using:
 
 * **Agent Skills** for instruction bundles
-* **MCP** for external tools/services (via the official Rust SDK)
+* **MCP** for external tools/services (via rmcp, surfaced through rig's `.mcp_tool()`)
 * **A2A** for agent-to-agent delegation and isolation boundaries
 * **OpenTelemetry** for end-to-end observability
 
-No new “plugin protocol” is introduced: external extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the “instruction + packaging” layer.
+No new "plugin protocol" is introduced: external extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the "instruction + packaging" layer.
+
+**Key architectural invariant:** Sub-agents do ALL complex reasoning, planning, and tool use via [rig](https://docs.rs/rig-core). The orchestrator is primarily deterministic, but uses a **lightweight LLM routing call** when no deterministic rule matches an incoming trigger (e.g., arbitrary user messages like "download this file" or "update the check-email cron to every 10 minutes").
 
 ---
 
 ## 1. Motivation and problem statement
 
-Neuromancer is explicitly designed around failures we’ve now repeatedly seen in the wild:
+Neuromancer is explicitly designed around failures we've now repeatedly seen in the wild:
 
 * **Secrets leaking into model context and logs**: there are reports of resolved provider API keys being serialized into the LLM prompt context on every turn in OpenClaw gateway setups—meaning keys can leak cross-provider and persist in provider logs. ([GitHub][1])
-* **“Leaky skills” as a systemic pattern**: security research found a non-trivial fraction of marketplace skills that *instruct the agent* to mishandle secrets/PII, forcing API keys/passwords/credit-card data into the LLM context window or plaintext logs—i.e., not “a bug,” but a predictable outcome of the architecture. ([Snyk][2])
+* **"Leaky skills" as a systemic pattern**: security research found a non-trivial fraction of marketplace skills that *instruct the agent* to mishandle secrets/PII, forcing API keys/passwords/credit-card data into the LLM context window or plaintext logs—i.e., not "a bug," but a predictable outcome of the architecture. ([Snyk][2])
 * **Long-running instability and process leakage**: reports of orphaned child processes accumulating over 24–48 hours, memory pressure peaking in the tens of GB, and degraded Discord processing latency. ([GitHub][3])
 * **Supply chain reality**: credible practitioners are now converging on the same missing ingredients—provenance, mediated execution, and **specific + revocable permissions** tied to identity. ([1Password][4])
 
@@ -32,17 +35,17 @@ Neuromancer is explicitly designed around failures we’ve now repeatedly seen i
 ### 2.1 Goals
 
 1. **Daemon-first architecture**
-   A resilient, long-running service with explicit lifecycle management and resource controls (no “CLI app that you keep alive with prayers”).
+   A resilient, long-running service with explicit lifecycle management and resource controls (no "CLI app that you keep alive with prayers").
 
-2. **Extensible minimal core**
-   The core runtime can run an agent loop, call tools, execute skills, and delegate via A2A—everything else is modular.
+2. **Hybrid orchestration, LLM-powered agents**
+   The orchestrator is primarily a deterministic supervisor that routes via config rules. When no rule matches (e.g., arbitrary user messages), it falls back to a lightweight LLM routing call to classify intent and select the target agent. All complex reasoning, planning, and multi-step tool use happens in sub-agents via rig.
 
 3. **No new plugin protocol**
 
    * Tools/services → **MCP**
    * Remote agents → **A2A**
    * Instruction packaging → **Skills**
-     The “tool surface” is unified internally, but external “plugins” are expected to be MCP servers or A2A agents.
+     The "tool surface" is unified internally, but external "plugins" are expected to be MCP servers or A2A agents.
 
 4. **Security by construction**
 
@@ -55,34 +58,83 @@ Neuromancer is explicitly designed around failures we’ve now repeatedly seen i
    * Structured traces/spans for: trigger → task → LLM calls → tool calls → secret accesses → memory reads/writes
    * Export via OpenTelemetry OTLP
 
+6. **Admin API for runtime introspection**
+   Localhost HTTP endpoints for task inspection, agent health, cron management, and manual task submission.
+
 ### 2.2 Non-goals (v0.5)
 
 * A public skill marketplace / package manager (v0.5 supports local skill packs; supply-chain hardening is *foundation work*).
 * Full multi-tenant enterprise RBAC UI.
-* A polished web UI (v0.5 can expose a local admin API, but not required).
+* A polished web UI (v0.5 exposes a local admin API; a GUI is not required).
 
 ---
 
 ## 3. High-level architecture
 
-Neuromancer is split into **control plane** and **data plane**.
+Neuromancer is split into **control plane** and **data plane**. The control plane is primarily deterministic but has a lightweight LLM routing capability for classifying ambiguous inputs.
 
-### 3.1 Control plane: `neuromancerd` (daemon)
+### 3.1 Control plane: `neuromancerd` + Orchestrator (primarily deterministic, LLM-assisted routing)
 
-Responsibilities:
+The daemon process hosts the **Orchestrator**, a supervisor that is deterministic wherever possible but can invoke a lightweight LLM call for routing ambiguous inputs. The orchestrator:
 
-* Load **central TOML config**
-* Run **Trigger Manager** (Discord + cron)
-* Maintain **Secrets Broker**
-* Maintain **Memory Store**
-* Maintain **MCP Registry** (server configs + allowlists)
-* Maintain **A2A Registry** (peer configs + allowlists)
-* **Supervise agent runtimes** (in-process, subprocess, or container)
-* Provide a **task queue** and **audit trail**
+* Loads **central TOML config**
+* Runs **Trigger Manager** (Discord + cron)
+* Maintains **Secrets Broker**, **Memory Store**, **MCP Client Pool**, **A2A Registry**
+* Routes trigger events to agents via **configurable routing rules** (deterministic) or **LLM-based intent classification** (fallback)
+* Supervises sub-agent runtimes (in-process, subprocess, or container)
+* Manages the **task queue** and **audit trail**
+* Facilitates cross-agent communication and remediation
+* Provides an **Admin API** on localhost
 
-### 3.2 Data plane: agent runtimes (“workers”)
+The orchestrator does NOT do complex reasoning, multi-step planning, or tool use. Its only LLM interaction is a constrained routing/classification call when deterministic rules don't match. Examples of ambiguous inputs requiring LLM routing:
 
-Each agent runtime is an instance of the same core, configured with a strict **capability set**:
+* "go to huggingface.com and add $100 in compute credits" → route to `browser` agent
+* "update the interval of the 'check email' task to every 10 minutes" → route to `planner` or handle as admin action
+* "download this file" → route to `files` agent
+
+```rust
+struct Orchestrator {
+    config: Arc<NeuromancerConfig>,
+    agent_registry: AgentRegistry,
+    task_queue: TaskQueue,
+    memory_store: Arc<dyn MemoryStore>,
+    secrets_broker: Arc<dyn SecretsBroker>,
+    mcp_pool: McpClientPool,
+    policy_engine: Arc<dyn PolicyEngine>,
+    router: Router,  // deterministic rules + LLM fallback
+}
+
+impl Orchestrator {
+    /// Match a trigger event to an agent. Tries deterministic rules first;
+    /// falls back to LLM-based intent classification if no rule matches.
+    async fn route(&self, event: TriggerEvent) -> Result<TaskId>;
+
+    /// Main supervision loop: dequeue tasks, dispatch to agents, handle reports.
+    async fn supervise(&self) -> Result<()>;
+
+    /// Relay a message between agents (cross-agent communication).
+    async fn relay(&self, from: AgentId, to: AgentId, msg: AgentMessage) -> Result<()>;
+
+    /// Decide what to do when a sub-agent reports a problem.
+    async fn remediate(&self, report: SubAgentReport) -> RemediationAction;
+}
+
+struct Router {
+    rules: Vec<RoutingRule>,           // deterministic, evaluated first
+    default_agent: AgentId,            // used when LLM routing also fails
+    classifier_model: Box<dyn CompletionModel>,  // lightweight model for intent classification
+}
+
+impl Router {
+    /// Try deterministic rules first. If none match, call the classifier model
+    /// with the agent registry (names + descriptions) to pick the best agent.
+    async fn resolve(&self, event: &TriggerEvent) -> Result<AgentId>;
+}
+```
+
+### 3.2 Data plane: sub-agent runtimes (rig Agents do ALL reasoning)
+
+Each sub-agent runtime wraps a **rig Agent** configured with a strict **capability set**:
 
 * Allowed skills
 * Allowed MCP servers/tools
@@ -92,46 +144,55 @@ Each agent runtime is an instance of the same core, configured with a strict **c
 * Allowed filesystem roots
 * Allowed outbound network policy
 
-**Preferred pattern:** root orchestrator delegates work to specialized sub-agents (“browser”, “files”, “remote”), rather than giving one agent god-mode.
+Sub-agents are the **only** components that call LLMs. They are constructed using rig's `AgentBuilder`, given tools via rig's tool trait and `.mcp_tool()`, and execute via `agent.chat()`.
 
-### 3.3 Diagram
+### 3.3 Architecture diagram
 
 ```
-                         +---------------------------+
-Discord / Cron Triggers ->|   neuromancerd (control)  |
-                         |  - config + policy         |
-                         |  - secrets broker          |
-                         |  - memory store            |
-                         |  - OTEL exporter           |
-                         |  - agent supervisor        |
-                         +-----------+----------------+
-                                     |
-                                     | A2A (HTTP+JSON/SSE)
-                                     v
-     +-------------------+     +-------------------+     +-------------------+
-     | Agent: core       |     | Agent: browser    |     | Agent: files      |
-     | (planner/router)  |     | (isolated)        |     | (isolated)        |
-     | allowed: minimal  |     | allowed: browser  |     | allowed: fs tools |
-     +---------+---------+     +---------+---------+     +---------+---------+
-               |                         |                         |
-               | MCP (rmcp)              | MCP                      | MCP
-               v                         v                         v
-        [MCP servers...]         [Playwright MCP]         [FS MCP / built-in]
+                        +-------------------------------+
+Discord / Cron -------->|     neuromancerd (control)     |<-------- Admin API
+  Triggers              |  Orchestrator (hybrid routing)  |         (localhost)
+                        |  - rules + LLM classifier      |
+                        |  - secrets broker              |
+                        |  - memory store                |
+                        |  - task queue                  |
+                        |  - policy engine               |
+                        |  - OTEL exporter               |
+                        +-------+----------+--------+----+
+                                |          |        |
+                     dispatch   |          |        |   dispatch
+                    +-----------+    +-----+--+     +----------+
+                    v                v        |                v
+          +---------+------+ +------+--------++ +-------------+----+
+          | Agent: planner | | Agent: browser | | Agent: files     |
+          | (rig Agent)    | | (rig Agent)    | | (rig Agent)      |
+          | model: gpt-4o  | | model: gpt-4o  | | model: gpt-4o-m |
+          | skills: [plan] | | skills: [web]  | | skills: [fs]     |
+          +-------+--------+ +-------+--------+ +--------+--------+
+                  |                   |                    |
+                  | MCP (via rig)     | MCP (via rig)      | MCP (via rig)
+                  v                   v                    v
+           [MCP servers...]   [Playwright MCP]    [FS MCP / built-in]
 ```
+
+**Key difference from v0.5-r1:** There is no "Agent: core (planner/router)" that is itself an LLM agent. The orchestrator handles routing via deterministic rules first, falling back to a lightweight LLM classifier for ambiguous inputs. Sub-agents do all complex reasoning. Sub-agents may still delegate to each other via A2A, but the orchestrator is the supervisor, not a peer.
 
 ---
 
-## 4. Protocol choices (why “no new plugin protocol” works)
+## 4. Protocol choices (why "no new plugin protocol" works)
 
 ### 4.1 MCP for tools
 
 Neuromancer integrates tools via **MCP**, using the **official Rust SDK** (`rmcp`) which provides protocol implementation and supports building clients/servers on Tokio. ([GitHub][5])
+
+Tools are surfaced to rig agents via rig's `.mcp_tool()` integration, which wraps rmcp tool definitions as rig-compatible tools.
+
 This is the primary path for:
 
 * Browser automation servers
 * File tooling servers
 * External SaaS/API connectors
-* “Sidecar” services (indexers, search, etc.)
+* "Sidecar" services (indexers, search, etc.)
 
 ### 4.2 A2A for delegation and isolation
 
@@ -142,8 +203,14 @@ Key A2A elements Neuromancer relies on:
 * **Agent discovery via Agent Card** at `/.well-known/agent-card.json` ([A2A Protocol][6])
 * **HTTP+JSON binding** endpoints like `POST /message:send`, `POST /message:stream` (SSE), `GET /tasks/{id}`, etc. ([A2A Protocol][6])
 * Content type `application/a2a+json` and versioning headers ([A2A Protocol][6])
-* Strong guidance on permission failures and non-leaky errors (helpful to model Neuromancer’s “capability missing” UX) ([A2A Protocol][6])
+* Strong guidance on permission failures and non-leaky errors (helpful to model Neuromancer's "capability missing" UX) ([A2A Protocol][6])
 * Agent Cards may be signed with JWS; clients should verify when present ([A2A Protocol][6])
+
+**A2A task state mapping** to Neuromancer's internal states (see §6.5):
+* `SubAgentReport::Progress` → A2A `working`
+* `SubAgentReport::InputRequired` → A2A `input_required`
+* `SubAgentReport::Completed` → A2A `completed`
+* `SubAgentReport::Failed` → A2A `failed`
 
 ### 4.3 Skills as instruction packaging
 
@@ -165,110 +232,673 @@ Agent Skills as a broader convention emphasizes progressive disclosure: metadata
 ### Required by you → implemented as
 
 * **Minimum, extensible `core` for running an agent**
-  `neuromancer-core` library crate: runtime, tool broker, memory interface, policy hooks.
+  `neuromancer-core` library crate: core traits (ToolBroker, MemoryStore, SecretsBroker, PolicyEngine). `neuromancer-agent` crate: rig-based agent execution runtime.
 * **Detailed logging via OpenTelemetry**
   `tracing` + OTLP exporter; spans for every step; trace propagation across A2A and MCP.
-* **Core agent can run skills, use MCP, and A2A**
-  Tool broker with 3 backends: SkillsExecutor, McpClientPool, A2aClient.
+* **Sub-agents can run skills, use MCP, and A2A**
+  ToolBroker with 3 backends: SkillsExecutor, McpClientPool (via rig `.mcp_tool()`), A2aClient.
 * **Centralized configuration format (TOML)**
-  Single TOML file defines org-tree of agents, triggers, servers, secrets, memory partitions.
-* **Trigger system to core agent**
-  Trigger Manager produces tasks into queue → core orchestrator decides routing.
+  Single TOML file defines agents, routing rules, triggers, servers, secrets, memory partitions.
+* **Trigger system to orchestrator**
+  Trigger Manager produces tasks into queue → Orchestrator routes via rules.
 * **Triggers supported: Discord and cron**
-  Discord via `twilight` or `serenity`; cron via `tokio-cron-scheduler`.
+  Discord via `twilight`; cron via `tokio-cron-scheduler`.
 * **Secure secrets store with access controls**
-  Secrets Broker with encrypted-at-rest store, ACLs, and “handle-based injection”.
+  Secrets Broker with encrypted-at-rest store, ACLs, and "handle-based injection".
 * **Hierarchical, partitioned memory**
   Memory partitions per agent/scope with explicit sharing rules.
+* **Admin API for runtime introspection**
+  Localhost HTTP endpoints via axum for task/agent/cron/memory visibility and manual task submission.
 
 ---
 
-## 6. Core runtime design (`neuromancer-core`)
+## 6. Core runtime design
 
 ### 6.1 Core interfaces (traits)
 
-This is the key to modularity and unit-testability.
+These traits define the modularity and testability surface of Neuromancer. They live in `neuromancer-core`.
 
 ```rust
-trait LlmProvider {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse>;
-}
+// LlmProvider: REMOVED.
+// Neuromancer does not define its own LLM abstraction. Use rig's
+// `rig::completion::CompletionModel` and `rig::agent::Agent` directly.
+// See §7 for rig integration details.
 
-trait ToolBroker {
+/// Policy-enforcing tool broker. Wraps rig tool definitions with
+/// capability checks before execution.
+trait ToolBroker: Send + Sync {
+    /// List tools visible to this agent context, filtered by policy.
     async fn list_tools(&self, ctx: &AgentContext) -> Vec<ToolSpec>;
-    async fn call_tool(&self, ctx: &AgentContext, call: ToolCall) -> ToolResult;
+
+    /// Execute a tool call after policy checks. Returns a rig-compatible ToolResult.
+    async fn call_tool(&self, ctx: &AgentContext, call: ToolCall) -> Result<ToolResult>;
 }
 
-trait MemoryStore {
-    async fn put(&self, ctx: &AgentContext, item: MemoryItem) -> Result<()>;
-    async fn query(&self, ctx: &AgentContext, q: MemoryQuery) -> Result<Vec<MemoryItem>>;
+/// Persistent, partitioned memory store. See §13 for full specification.
+trait MemoryStore: Send + Sync {
+    async fn put(&self, ctx: &AgentContext, item: MemoryItem) -> Result<MemoryId>;
+    async fn query(&self, ctx: &AgentContext, q: MemoryQuery) -> Result<MemoryPage>;
+    async fn get(&self, ctx: &AgentContext, id: MemoryId) -> Result<Option<MemoryItem>>;
+    async fn delete(&self, ctx: &AgentContext, id: MemoryId) -> Result<()>;
+    async fn gc(&self) -> Result<u64>;
 }
 
-trait SecretsBroker {
+/// Handle-based secret resolution. Secrets never enter LLM context.
+trait SecretsBroker: Send + Sync {
     async fn resolve_handle_for_tool(
         &self,
         ctx: &AgentContext,
         secret_ref: SecretRef,
         usage: SecretUsage,
-    ) -> Result<ResolvedSecret>; // often injected, not returned as plaintext
+    ) -> Result<ResolvedSecret>;
 }
 
-trait PolicyEngine {
+/// Stacked policy gates evaluated before/after tool and LLM calls.
+trait PolicyEngine: Send + Sync {
     async fn pre_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> PolicyDecision;
-    async fn pre_llm_call(&self, ctx: &AgentContext, req: &CompletionRequest) -> PolicyDecision;
+    async fn pre_llm_call(&self, ctx: &AgentContext, messages: &[ChatMessage]) -> PolicyDecision;
     async fn post_tool_call(&self, ctx: &AgentContext, result: &ToolResult) -> PolicyDecision;
 }
 ```
 
-### 6.2 Agent loop (state machine)
+### 6.2 Orchestrator loop
 
-1. Receive `Task` (from trigger or A2A)
-2. Assemble context:
+The orchestrator is the main event loop of `neuromancerd`. It is primarily deterministic — routing and remediation decisions are based on configuration and rules. When no rule matches an incoming event, a lightweight LLM classifier selects the target agent.
 
-   * relevant memory (partitioned)
-   * skill metadata (not full instructions unless needed)
-   * available tools (MCP + local + A2A)
-3. Call LLM (planner/executor model chosen by router)
-4. Parse tool calls (or explicit action plan)
-5. For each tool call:
+```
+loop {
+    select! {
+        event = trigger_rx.recv() => {
+            let task = self.route(event).await?;  // rules-first, LLM fallback
+            self.task_queue.enqueue(task).await?;
+        }
+        task = self.task_queue.dequeue().await => {
+            let agent_id = task.assigned_agent;
+            self.agent_registry.dispatch(agent_id, task).await?;
+        }
+        report = agent_report_rx.recv() => {
+            match self.remediate(report).await {
+                RemediationAction::Retry { .. } => { /* re-enqueue */ }
+                RemediationAction::Clarify { .. } => { /* inject context, re-dispatch */ }
+                RemediationAction::GrantTemporary { .. } => { /* issue scoped grant */ }
+                RemediationAction::Reassign { .. } => { /* route to different agent */ }
+                RemediationAction::EscalateToUser { .. } => { /* send to trigger channel */ }
+                RemediationAction::Abort { .. } => { /* mark task failed */ }
+            }
+        }
+        _ = shutdown_signal() => break,
+    }
+}
+```
 
-   * policy check
-   * secrets broker resolves secret handles/injection
-   * execute tool (MCP / skill / A2A)
-   * log spans + store memory artifacts
-6. Produce final output + persist summary/episodic memory
+**Routing** uses a two-tier approach:
 
-This is explicitly designed to prevent “secret values in prompt” and to keep tool execution brokered.
+**Tier 1 — Deterministic rules** (evaluated first, no LLM cost):
+
+```toml
+[routing]
+default_agent = "planner"
+classifier_model = "router"   # model slot for Tier 2
+
+[[routing.rules]]
+match = { channel_id = "browser-tasks" }
+agent = "browser"
+
+[[routing.rules]]
+match = { trigger = "cron", id = "daily-issue-summary" }
+agent = "github-summarizer"
+```
+
+Rules are evaluated top-to-bottom. First match wins. Matching criteria include: `channel_id`, `trigger` type, `guild_id`, `user_id`, `prefix`, or combinations.
+
+**Tier 2 — LLM-based intent classification** (fallback when no rule matches):
+
+When no deterministic rule matches, the orchestrator calls the `classifier_model` (a cheap, fast model like `gpt-4o-mini`) with:
+* The incoming message text
+* A list of available agents with their descriptions and capabilities
+* A constrained prompt asking: "Which agent should handle this? Respond with the agent name only."
+
+This handles arbitrary user messages like:
+* "go to huggingface.com and add $100 in compute credits" → `browser`
+* "update the interval of the 'check email' task to every 10 minutes" → `planner`
+* "download this file" → `files`
+
+If the classifier also fails (low confidence, invalid response), `default_agent` is used as the final fallback.
+
+### 6.3 Agent execution state machine
+
+Each sub-agent task execution follows a state machine. This replaces the linear 6-step loop from v0.5-r1 with a proper model that handles multi-step reasoning, checkpointing, and failure recovery.
+
+```rust
+enum TaskExecutionState {
+    /// Agent runtime is being initialized: loading skills, connecting MCP, building rig Agent.
+    Initializing { task: Task },
+
+    /// rig Agent is reasoning: preparing the next chat() call.
+    /// `iteration` counts Thinking→Acting cycles (capped by max_iterations).
+    Thinking {
+        conversation: ConversationContext,
+        iteration: u32,
+    },
+
+    /// Agent has produced tool calls; executing them sequentially or in parallel.
+    Acting {
+        conversation: ConversationContext,
+        pending_calls: Vec<ToolCall>,
+        completed_calls: Vec<ToolResult>,
+    },
+
+    /// Agent needs external input (e.g., human clarification). Task is suspended
+    /// with a checkpoint so it can resume when input arrives.
+    WaitingForInput {
+        conversation: ConversationContext,
+        question: String,
+        checkpoint: Checkpoint,
+    },
+
+    /// Agent has produced a candidate output. Self-assessment or verifier check.
+    Evaluating {
+        conversation: ConversationContext,
+        candidate_output: Artifact,
+    },
+
+    /// Task completed successfully.
+    Completed { output: TaskOutput },
+
+    /// Task failed.
+    Failed {
+        error: AgentError,
+        partial_output: Option<TaskOutput>,
+    },
+
+    /// Task suspended (long-running, crash recovery, or resource pressure).
+    Suspended {
+        checkpoint: Checkpoint,
+        reason: String,
+    },
+}
+```
+
+**State transitions:**
+
+```
+Initializing ──→ Thinking ──→ Acting ──→ Thinking  (loop)
+                    │            │
+                    │            ├──→ WaitingForInput ──→ Thinking (on input)
+                    │            │
+                    ├──→ Evaluating ──→ Completed
+                    │                   ──→ Thinking (refinement)
+                    │
+                    ├──→ Failed
+                    ├──→ Suspended
+```
+
+**Key behaviors:**
+
+* **Thinking → Acting → Thinking** loop continues until the agent produces a final output or hits `max_iterations`.
+* Each **Thinking → Acting** cycle corresponds to one `agent.chat()` call in rig. The LLM response may contain tool calls (→ Acting) or a final answer (→ Evaluating or Completed).
+* **Checkpointing** occurs at every state transition. The checkpoint includes the serialized `ConversationContext` and current state, persisted to SQLite. On crash recovery, the orchestrator can resume tasks from their last checkpoint.
+* **WaitingForInput** is entered when the agent explicitly requests human clarification. The orchestrator sends the question to the trigger channel and suspends the task.
+* **Evaluating** enables self-assessment: the agent (or a separate verifier model) reviews the candidate output. It may loop back to Thinking for refinement.
+* **Conversation continuity across tasks:** When a task is related to a prior task, the new task's `ConversationContext` is initialized with a summary from the parent task (referenced via `parent_task_id`).
+
+### 6.4 Conversation and message history
+
+`ConversationContext` is the runtime message history container. It is **ephemeral** (lives for the duration of a task) and distinct from `MemoryStore` (persistent across tasks).
+
+```rust
+enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+struct ChatMessage {
+    role: MessageRole,
+    content: MessageContent,
+    timestamp: DateTime<Utc>,
+    token_estimate: u32,
+    metadata: MessageMetadata,
+}
+
+enum MessageContent {
+    Text(String),
+    ToolCall(Vec<ToolCall>),
+    ToolResult(ToolResult),
+    Mixed(Vec<ContentPart>),
+}
+
+struct MessageMetadata {
+    source: Option<String>,       // "discord", "cron", "memory", "tool:<tool_id>"
+    parent_message_id: Option<u64>,
+    redacted: bool,               // true if content was policy-filtered
+}
+
+struct ConversationContext {
+    messages: Vec<ChatMessage>,
+    token_budget: u32,
+    token_used: u32,
+    truncation_strategy: TruncationStrategy,
+}
+
+enum TruncationStrategy {
+    /// Keep the last N messages, always preserving the system prompt.
+    SlidingWindow { keep_last: usize },
+    /// When token_used exceeds threshold_pct of token_budget, summarize
+    /// older messages using the specified model.
+    Summarize { summarizer_model: String, threshold_pct: f32 },
+    /// Hard truncation: drop oldest messages when budget exceeded.
+    Strict,
+}
+```
+
+**Message ordering in the context window:**
+
+1. System prompt (agent identity, personality, constraints)
+2. Memory context (relevant items from MemoryStore, injected as system messages)
+3. Conversation history (accumulated ChatMessages from prior iterations)
+4. Current user message / task instruction
+
+**History accumulation during agent execution:**
+
+Each Thinking → Acting cycle appends messages:
+1. The LLM response (Assistant role, may contain tool calls)
+2. Tool results (Tool role, one per tool call)
+3. These become part of the conversation for the next `agent.chat()` call
+
+**History vs. Memory distinction:**
+
+| Aspect | ConversationContext | MemoryStore |
+|---|---|---|
+| Lifetime | Single task execution | Persistent across tasks |
+| Scope | One agent, one task | Partitioned, shared per policy |
+| Content | Full message history | Summaries, facts, artifacts |
+| Token cost | Directly in context window | Injected selectively |
+
+**Sub-agent context isolation:**
+
+When the orchestrator dispatches a task to a sub-agent, the sub-agent receives a **fresh** `ConversationContext` containing:
+1. The sub-agent's own system prompt
+2. Relevant memory items for the sub-agent's authorized partitions
+3. A context slice from the parent task (if any): the task instruction + summary of prior context, NOT the full parent conversation. This prevents token bloat and enforces need-to-know.
+
+**rig integration:**
+
+```rust
+impl ConversationContext {
+    /// Convert to rig's message format for agent.chat().
+    fn to_rig_messages(&self) -> Vec<rig::completion::Message> { ... }
+
+    /// Append a rig completion response back into the context.
+    fn append_response(&mut self, response: &rig::completion::CompletionResponse) { ... }
+
+    /// Check if truncation is needed and apply the configured strategy.
+    async fn maybe_truncate(&mut self) -> Result<()> { ... }
+}
+```
+
+### 6.5 Sub-agent remediation protocol
+
+When a sub-agent encounters a problem, it sends a structured `SubAgentReport` to the orchestrator. The orchestrator evaluates the report and responds with a `RemediationAction`. This protocol replaces ad-hoc error handling with a well-defined contract.
+
+```rust
+enum SubAgentReport {
+    /// Periodic progress update during long-running tasks.
+    Progress {
+        task_id: TaskId,
+        step: u32,
+        description: String,
+        artifacts_so_far: Vec<Artifact>,
+    },
+
+    /// Agent needs external input to continue.
+    InputRequired {
+        task_id: TaskId,
+        question: String,
+        context: String,
+        suggested_options: Vec<String>,
+    },
+
+    /// A tool call failed.
+    ToolFailure {
+        task_id: TaskId,
+        tool_id: String,
+        error: ToolError,
+        retry_eligible: bool,
+        attempted_count: u32,
+    },
+
+    /// Policy engine denied a requested action.
+    PolicyDenied {
+        task_id: TaskId,
+        action: String,
+        policy_code: String,
+        capability_needed: CapabilityRef,
+    },
+
+    /// Agent is stuck: exceeded iterations, circular reasoning, or no progress.
+    Stuck {
+        task_id: TaskId,
+        reason: String,
+        partial_result: Option<Artifact>,
+    },
+
+    /// Task completed successfully.
+    Completed {
+        task_id: TaskId,
+        artifacts: Vec<Artifact>,
+        summary: String,
+    },
+
+    /// Task failed unrecoverably.
+    Failed {
+        task_id: TaskId,
+        error: AgentError,
+        partial_result: Option<Artifact>,
+    },
+}
+
+enum RemediationAction {
+    /// Retry the failed operation with backoff.
+    Retry { max_attempts: u32, backoff: Duration },
+
+    /// Inject additional context and re-dispatch to the same agent.
+    Clarify { additional_context: String },
+
+    /// Grant a temporary capability scoped to this task only.
+    GrantTemporary { capability: CapabilityRef, scope: TaskId },
+
+    /// Reassign the task to a different agent.
+    Reassign { new_agent_id: AgentId, reason: String },
+
+    /// Escalate to the user via the trigger channel.
+    EscalateToUser { question: String, channel: TriggerChannel },
+
+    /// Abort the task.
+    Abort { reason: String },
+}
+```
+
+**A2A state mapping:**
+
+| SubAgentReport variant | A2A task state |
+|---|---|
+| Progress | `working` |
+| InputRequired | `input_required` |
+| Completed | `completed` |
+| Failed | `failed` |
+| Stuck | `failed` (with partial result) |
+| ToolFailure | `working` (if retry eligible) or `failed` |
+| PolicyDenied | `input_required` (escalation) or `failed` |
+
+**Health monitoring:**
+
+* **Heartbeat:** Sub-agents send `Progress` reports at configurable intervals (default: 30s). If no report arrives within `2 * heartbeat_interval`, the orchestrator marks the agent as unresponsive.
+* **Watchdog:** Unresponsive agents are sent a cancellation signal. If they don't respond within `watchdog_timeout` (default: 60s), the orchestrator kills the runtime and marks the task as `Failed`.
+
+**Circuit breaker:**
+
+If an agent produces `N` failures within `M` minutes (configurable), the orchestrator stops dispatching new tasks to it and emits an alert. Default: 5 failures in 10 minutes.
+
+```toml
+[agents.browser.health]
+heartbeat_interval = "30s"
+watchdog_timeout = "60s"
+circuit_breaker = { failures = 5, window = "10m" }
+```
+
+### 6.6 Task queue and lifecycle
+
+The task queue is the central coordination point between the orchestrator and sub-agents.
+
+```rust
+struct Task {
+    id: TaskId,
+    parent_id: Option<TaskId>,
+    trigger_source: TriggerSource,
+    instruction: String,
+    assigned_agent: AgentId,
+    state: TaskState,
+    priority: TaskPriority,
+    deadline: Option<DateTime<Utc>>,
+    checkpoints: Vec<Checkpoint>,
+    idempotency_key: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+enum TaskState {
+    Queued,
+    Dispatched,
+    Running { execution_state: TaskExecutionState },
+    Completed { output: TaskOutput },
+    Failed { error: AgentError },
+    Cancelled { reason: String },
+}
+
+enum TaskPriority {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+struct TaskOutput {
+    artifacts: Vec<Artifact>,
+    summary: String,
+    token_usage: TokenUsage,
+    duration: Duration,
+}
+```
+
+**Queue implementation:**
+
+* In-process: `tokio::sync::mpsc` channel for low-latency dispatch.
+* Persistence: All tasks are written to SQLite on state transitions for crash recovery. On startup, the orchestrator reloads tasks in `Queued` or `Dispatched` state.
+* Priority ordering: Tasks are dequeued by priority (Critical > High > Normal > Low), then by creation time within the same priority.
+
+**Idempotency:**
+
+Tasks with an `idempotency_key` are deduplicated. Before enqueuing, the orchestrator checks if a task with the same key exists in a non-terminal state (`Queued`, `Dispatched`, `Running`). If so, the new task is dropped and the existing task's ID is returned.
+
+### 6.7 Error taxonomy
+
+All Neuromancer errors map to a unified enum for consistent handling, logging, and reporting.
+
+```rust
+enum NeuromancerError {
+    // Agent execution errors
+    Agent(AgentError),
+
+    // LLM provider errors (surfaced from rig)
+    Llm(LlmError),
+
+    // Tool execution errors
+    Tool(ToolError),
+
+    // Policy violations
+    Policy(PolicyError),
+
+    // Infrastructure errors
+    Infra(InfraError),
+}
+
+enum AgentError {
+    MaxIterationsExceeded { task_id: TaskId, iterations: u32 },
+    InvalidToolCall { tool_id: String, reason: String },
+    ContextOverflow { budget: u32, used: u32 },
+    CheckpointCorrupted { task_id: TaskId },
+    Timeout { task_id: TaskId, elapsed: Duration },
+}
+
+enum LlmError {
+    ProviderUnavailable { provider: String, status: u16 },
+    RateLimited { provider: String, retry_after: Duration },
+    InvalidResponse { reason: String },
+    ContentFiltered { reason: String },
+}
+
+enum ToolError {
+    NotFound { tool_id: String },
+    ExecutionFailed { tool_id: String, message: String },
+    Timeout { tool_id: String, elapsed: Duration },
+    McpServerDown { server_id: String },
+}
+
+enum PolicyError {
+    CapabilityDenied { agent_id: AgentId, capability: CapabilityRef },
+    SecretAccessDenied { agent_id: AgentId, secret_ref: SecretRef },
+    PartitionAccessDenied { agent_id: AgentId, partition: String },
+    HeuristicBlocked { pattern: String, description: String },
+}
+
+enum InfraError {
+    Database(sqlx::Error),
+    Io(std::io::Error),
+    Config(ConfigError),
+    ContainerRuntime(String),
+}
+```
+
+All errors implement `std::error::Error` and produce structured OTEL events with the error variant as an attribute.
 
 ---
 
-## 7. LLM integration and model differentiation
+## 7. LLM integration via Rig
 
-### 7.1 Rig as an optional integration layer
+### 7.1 Rig as first-class dependency
 
-Rig is a Rust library focused on ergonomics/modularity for LLM-powered apps; it provides abstractions for completion and embedding models and higher-level “Agent” constructs. ([Docs.rs][9])
+Rig is not an "optional adapter" — it is the **primary** LLM integration layer. Neuromancer does not define a custom `LlmProvider` trait. ([Docs.rs][9])
 
-**Recommendation for v0.5:**
+**Rationale:** Rig already provides:
+* Multi-provider support (OpenAI, Anthropic, Gemini, etc.)
+* `CompletionModel` trait for model abstraction
+* `Agent` with tool use and conversation management
+* MCP tool integration via `.mcp_tool()` (wraps rmcp)
+* Embedding models and vector store abstractions for future RAG
 
-* Use a Neuromancer-native `LlmProvider` trait.
-* Provide a `rig-adapter` crate so Rig can be used as one backend (especially for multi-provider support and embeddings), without locking core architecture to Rig’s agent abstractions.
+Wrapping rig in a Neuromancer-specific trait would add indirection without value. Instead, Neuromancer uses rig types directly in `neuromancer-agent` and keeps `neuromancer-core` rig-free (traits only, no rig dependency).
 
-This keeps the daemon architecture independent while still leveraging Rig where it fits (providers, embeddings, vector store glue).
+**Dependency boundary:**
 
-### 7.2 “Dedicated models” support (first-class)
+| Crate | rig dependency? | Reason |
+|---|---|---|
+| `neuromancer-core` | No | Defines traits only |
+| `neuromancer-orchestrator` | **Yes** (lightweight) | LLM-based intent classifier for routing fallback |
+| `neuromancer-agent` | **Yes** (full) | Agent construction, execution, tool dispatch |
+| `neuromancerd` | Transitive | Via orchestrator + agent |
 
-Neuromancer includes a `ModelRouter`:
+Note: `neuromancer-orchestrator` uses rig only for the routing classifier — a single `CompletionModel::complete()` call with a constrained prompt. It does NOT use rig's Agent, tool, or conversation abstractions.
 
-* `planner_model` (cheap reasoning/planning)
-* `executor_model` (tool-use heavy)
-* `browser_model` (text-only controller for browser agent)
-* `verifier_model` (safety/guard checks)
+### 7.2 Agent construction with rig AgentBuilder
 
-The router can be driven by:
+Each sub-agent is constructed at dispatch time using rig's `AgentBuilder`:
 
-* central TOML config defaults
-* per-agent overrides
-* per-skill hinting in frontmatter (see §8)
+```rust
+use rig::agent::AgentBuilder;
+use rig::providers::openai;
+
+async fn build_agent(
+    config: &AgentConfig,
+    model_router: &ModelRouter,
+    tools: Vec<Box<dyn rig::tool::Tool>>,
+    mcp_tools: Vec<(McpToolDefinition, McpPeer)>,
+    system_prompt: String,
+) -> Result<rig::agent::Agent> {
+    let model = model_router.resolve(&config.model_slot)?;
+
+    let mut builder = model
+        .agent(system_prompt)
+        .preamble(&config.preamble);
+
+    // Add policy-wrapped native tools
+    for tool in tools {
+        builder = builder.tool(tool);
+    }
+
+    // Add MCP tools via rig's mcp integration
+    for (tool_def, peer) in mcp_tools {
+        builder = builder.mcp_tool(tool_def, peer.into());
+    }
+
+    Ok(builder.build())
+}
+```
+
+**Execution loop integration:**
+
+Each Thinking → Acting cycle in the state machine (§6.3) corresponds to:
+
+```rust
+// In Thinking state:
+let rig_messages = conversation.to_rig_messages();
+let response = agent.chat(&current_instruction, rig_messages).await?;
+
+// Parse response:
+match response {
+    // Contains tool calls → transition to Acting
+    response if response.has_tool_calls() => {
+        let tool_calls = response.extract_tool_calls();
+        // transition to Acting { pending_calls: tool_calls, ... }
+    }
+    // Final answer → transition to Evaluating or Completed
+    response => {
+        let output = response.extract_text();
+        // transition to Evaluating or Completed
+    }
+}
+```
+
+### 7.3 MCP tool integration via rig + rmcp
+
+MCP tools are surfaced to rig agents via rig's built-in MCP support, which wraps `rmcp` tool definitions:
+
+1. The `McpClientPool` (in `neuromancer-mcp`) maintains connections to configured MCP servers.
+2. At agent construction time, allowed MCP tools are resolved from the pool.
+3. Each MCP tool is wrapped via `builder.mcp_tool(tool_def, peer)`, making it callable through rig's standard tool dispatch.
+4. The `ToolBroker` performs policy checks before tool execution, even for MCP tools.
+
+### 7.4 Model router
+
+The `ModelRouter` maps logical model slots to concrete rig `CompletionModel` instances:
+
+```rust
+struct ModelRouter {
+    slots: HashMap<String, Box<dyn CompletionModel>>,
+}
+
+impl ModelRouter {
+    /// Resolve a slot name (e.g., "planner", "executor") to a rig CompletionModel.
+    fn resolve(&self, slot: &str) -> Result<&dyn CompletionModel>;
+}
+```
+
+Slot assignments are driven by:
+1. Central TOML config defaults (`[models]` section)
+2. Per-agent overrides (`[agents.<name>.models]`)
+3. Per-skill hinting in frontmatter (`metadata.neuromancer.models.preferred`)
+
+Example config:
+
+```toml
+[models]
+router = { provider = "openai", model = "gpt-4o-mini" }    # orchestrator intent classifier
+planner = { provider = "openai", model = "gpt-4o" }
+executor = { provider = "openai", model = "gpt-4o" }
+browser = { provider = "anthropic", model = "claude-sonnet-4-5-20250929" }
+verifier = { provider = "openai", model = "gpt-4o-mini" }
+```
+
+### 7.5 Embeddings and RAG (future)
+
+Rig provides `EmbeddingModel` and `VectorStoreIndex` abstractions. ([Docs.rs][9])
+
+When Neuromancer adds semantic memory search (post-v0.5), it will use rig's embedding pipeline:
+* `model.embed_document()` for storing memory items with embeddings
+* `vector_store.top_n()` for semantic retrieval during memory context injection
+
+This is a non-goal for v0.5 but the architecture accommodates it without breaking changes.
 
 ---
 
@@ -311,11 +941,11 @@ metadata:
 ---
 ```
 
-**Important:** skill metadata is not sufficient to grant permissions. It’s a *declaration*. The central config must authorize it.
+**Important:** skill metadata is not sufficient to grant permissions. It's a *declaration*. The central config must authorize it.
 
 ### 8.3 Parsing frontmatter (Rust crate reality)
 
-Many skill ecosystems use YAML frontmatter. But `serde_yaml` is marked “no longer maintained” in its docs. ([Docs.rs][10])
+Many skill ecosystems use YAML frontmatter. But `serde_yaml` is marked "no longer maintained" in its docs. ([Docs.rs][10])
 
 For v0.5, implement YAML parsing using maintained components:
 
@@ -330,7 +960,7 @@ Each skill can be executed as:
 * **Host execution**: only when explicitly allowed (dangerous by default)
 * **Isolated execution**: run in a sandbox (container) with minimal mounts and no ambient secrets
 
-This directly responds to the demonstrated “skills as supply chain” risk, where provenance + mediated execution + specific permissions are repeatedly cited as the missing layer. ([1Password][4])
+This directly responds to the demonstrated "skills as supply chain" risk, where provenance + mediated execution + specific permissions are repeatedly cited as the missing layer. ([1Password][4])
 
 ---
 
@@ -338,7 +968,9 @@ This directly responds to the demonstrated “skills as supply chain” risk, wh
 
 ### 9.1 SDK choice
 
-Use **RMCP** (`rmcp`) from the official MCP Rust SDK repository; it’s explicitly described as the official Rust SDK and supports Tokio. ([GitHub][5])
+Use **RMCP** (`rmcp`) from the official MCP Rust SDK repository; it's explicitly described as the official Rust SDK and supports Tokio. ([GitHub][5])
+
+MCP tools are surfaced to agents via **rig's `.mcp_tool()` integration**, which wraps rmcp tool definitions as rig-compatible tool implementations. The `neuromancer-mcp` crate manages connections and lifecycle; the `neuromancer-agent` crate passes them to rig.
 
 v0.5 features:
 
@@ -385,17 +1017,17 @@ Every A2A request is evaluated by policy:
 * requested operation
 * requested resource (memory partition, tool invocation, etc.)
 
-A2A spec guidance around permissions and non-leaky error behavior is adopted (e.g., don’t reveal resource existence to unauthorized clients). ([A2A Protocol][6])
+A2A spec guidance around permissions and non-leaky error behavior is adopted (e.g., don't reveal resource existence to unauthorized clients). ([A2A Protocol][6])
 
-### 10.3 “Out-of-bounds permission request” workflow
+### 10.3 "Out-of-bounds permission request" workflow
 
-1. Sub-agent fails policy check (e.g., needs a secret, MCP server, filesystem root)
-2. Sub-agent returns a structured “capability_missing” error payload
-3. Orchestrator:
+This workflow is now formalized via the remediation protocol (§6.5):
 
-   * logs it
-   * asks user via the trigger channel (Discord DM or configured approver)
-   * if approved: issues a **one-time grant** scoped to *task_id* (or writes config update if configured)
+1. Sub-agent fails policy check → emits `SubAgentReport::PolicyDenied`
+2. Orchestrator evaluates: if `GrantTemporary` is appropriate (configured), issues a scoped grant
+3. Otherwise, `EscalateToUser`: sends question via trigger channel (Discord DM or configured approver)
+4. If user approves: issues a **one-time grant** scoped to `task_id`
+5. If user denies: `Abort` the task with a clear reason
 
 ---
 
@@ -416,7 +1048,7 @@ Use a single TOML file as the source of truth.
   * audit metadata (owner, purpose)
   * scope (agent, skill, task)
 
-### 11.2 Example config sketch
+### 11.2 Example config
 
 ```toml
 [global]
@@ -437,6 +1069,13 @@ require_acl = true
 backend = "sqlite"
 sqlite_path = "/var/lib/neuromancer/data/memory.db"
 
+[models]
+router = { provider = "openai", model = "gpt-4o-mini" }
+planner = { provider = "openai", model = "gpt-4o" }
+executor = { provider = "openai", model = "gpt-4o" }
+browser = { provider = "anthropic", model = "claude-sonnet-4-5-20250929" }
+verifier = { provider = "openai", model = "gpt-4o-mini" }
+
 [mcp_servers.playwright]
 kind = "child_process"
 command = ["npx", "-y", "@playwright/mcp-server"]
@@ -451,23 +1090,49 @@ allowed_roots = ["/var/lib/neuromancer/workspaces"]
 bind_addr = "0.0.0.0:8800"
 agent_card_signing = "optional"
 
-[agents.core]
+# --- Routing (replaces agents.core) ---
+
+[routing]
+default_agent = "planner"
+classifier_model = "router"
+
+[[routing.rules]]
+match = { channel_id = "browser-tasks" }
+agent = "browser"
+
+[[routing.rules]]
+match = { trigger = "cron", id = "daily-issue-summary" }
+agent = "github-summarizer"
+
+# --- Agents (sub-agents only, no "core" agent) ---
+
+[agents.planner]
 mode = "inproc"
-models.planner = "gpt-planner"
-models.executor = "gpt-executor"
-capabilities.skills = ["router", "task_manager"]
+models.planner = "planner"
+models.executor = "executor"
+capabilities.skills = ["task_manager", "code_review"]
 capabilities.mcp_servers = []
 capabilities.a2a_peers = ["browser", "files"]
 capabilities.secrets = []
-capabilities.memory_partitions = ["workspace:default", "agent:core"]
+capabilities.memory_partitions = ["workspace:default", "agent:planner"]
+
+[agents.planner.health]
+heartbeat_interval = "30s"
+watchdog_timeout = "60s"
 
 [agents.browser]
 mode = "container"
 image = "neuromancer:0.5"
+models.executor = "browser"
 capabilities.skills = ["browser_summarize", "browser_clickpath"]
 capabilities.mcp_servers = ["playwright"]
 capabilities.secrets = ["web_login_cookiejar"]
 capabilities.memory_partitions = ["workspace:default", "agent:browser"]
+
+[agents.browser.health]
+heartbeat_interval = "30s"
+watchdog_timeout = "60s"
+circuit_breaker = { failures = 5, window = "10m" }
 
 [agents.files]
 mode = "container"
@@ -477,21 +1142,80 @@ capabilities.mcp_servers = ["filesystem"]
 capabilities.secrets = []
 capabilities.memory_partitions = ["workspace:default", "agent:files"]
 
+# --- Discord trigger ---
+
 [triggers.discord]
 enabled = true
 token_secret = "discord_bot_token"
 allowed_guilds = ["123456"]
-route_agent = "core"
+dm_policy = "allowed_users_only"
+
+[triggers.discord.rate_limit]
+per_user_per_minute = 10
+per_channel_per_minute = 30
+max_concurrent_tasks = 5
+
+[[triggers.discord.channel_routes]]
+channel_id = "general"
+agent = "planner"
+thread_mode = "per_task"
+activation = "mention"
+
+[[triggers.discord.channel_routes]]
+channel_id = "browser-tasks"
+agent = "browser"
+thread_mode = "per_task"
+activation = "all"
+
+[triggers.discord.response]
+max_message_length = 2000
+overflow = "split"
+use_embeds = true
+auto_code_blocks = true
+
+# --- Cron triggers ---
 
 [[triggers.cron]]
-schedule = "0 */2 * * * *"
-route_agent = "core"
-payload = "Summarize new issues and report"
+id = "daily-issue-summary"
+description = "Summarize new GitHub issues and post to #reports"
+enabled = true
+schedule = "0 0 9 * * *"
+
+[triggers.cron.task_template]
+agent = "github-summarizer"
+instruction = "Summarize all new issues opened in the last 24 hours for repos: {{repos}}."
+
+[triggers.cron.task_template.parameters]
+repos = ["org/repo-a", "org/repo-b"]
+
+[triggers.cron.execution]
+timeout = "5m"
+idempotency_key = "issue-summary-{{date}}"
+dedup_window = "1h"
+on_failure = "retry"
+max_retries = 2
+
+[triggers.cron.notification]
+on_success = { channel = "123456789", template = "Completed: {{summary}}" }
+on_failure = { channel = "admin-dm", template = "FAILED: {{error}}" }
+
+# --- Admin API ---
+
+[admin_api]
+bind_addr = "127.0.0.1:9090"
+enabled = true
 ```
 
 ### 11.3 Hot reload
 
 Add a file watcher to reload config safely (with validation + diff). `notify` provides cross-platform filesystem notifications. ([Docs.rs][13])
+
+On reload:
+* Validate the new config fully before applying
+* Diff against current config to determine what changed
+* Agent capability changes take effect on next task dispatch (not mid-task)
+* Routing rule changes take effect immediately
+* Trigger config changes restart the affected trigger source
 
 ---
 
@@ -502,7 +1226,7 @@ Add a file watcher to reload config safely (with validation + diff). `notify` pr
 **Secrets are not LLM context.**
 Agents reference secrets by **handle**; only tool execution contexts receive secret values (ideally injected into a subprocess/container environment).
 
-This is a direct architectural countermeasure to the class of “keys serialized into prompt context” bugs. ([GitHub][1])
+This is a direct architectural countermeasure to the class of "keys serialized into prompt context" bugs. ([GitHub][1])
 
 ### 12.2 Implementation (v0.5)
 
@@ -551,12 +1275,12 @@ Each agent is allowed to read/write only its authorized partitions.
 * SQLite via `sqlx` (simple ops + easy backup + transactional) ([GitHub][14])
 * Optional vector embeddings later:
 
-  * either via Rig’s embeddings abstractions ([Docs.rs][9])
+  * via Rig's embeddings abstractions ([Docs.rs][9])
   * or external vector DB as MCP service
 
 ### 13.3 Memory record schema (conceptual)
 
-* `memory_id`
+* `memory_id` (returned as `MemoryId` from `put()`)
 * `partition`
 * `kind`: {message, summary, fact, artifact, link, tool_result}
 * `content` (text or structured JSON)
@@ -566,13 +1290,57 @@ Each agent is allowed to read/write only its authorized partitions.
 * `sensitivity`: {public, private, secret_ref_only}
 * optional `embedding_ref`
 
-### 13.4 “Never store raw secrets” rule
+### 13.4 "Never store raw secrets" rule
 
 Memory may store:
 
 * secret handles and references
 * redacted snippets
   But never plaintext secrets (enforced by policy + linter + runtime filters).
+
+### 13.5 Memory usage during agent execution
+
+This section specifies **when** and **what** agents read from and write to the MemoryStore during task execution.
+
+**On task initialization (read):**
+
+1. Query `workspace:<name>` partition for items matching the task's topic/tags (relevance ranking by recency + tag overlap).
+2. Query `agent:<agent_id>` partition for the agent's own long-term context.
+3. Inject retrieved items into the `ConversationContext` as system messages, respecting the token budget. Items are ordered: most relevant first, truncated if budget is exceeded.
+
+**After each tool call (write):**
+
+1. Store the tool result in `task:<task_id>` partition with `kind: tool_result`.
+2. If the tool produced a notable artifact (file, URL, data), store it with `kind: artifact`.
+
+**On task completion (write):**
+
+1. Generate a summary of the task execution (via the agent's final output or a dedicated summarizer).
+2. Store the summary in `agent:<agent_id>` partition with `kind: summary`.
+3. Extract and store factual information (e.g., "the user prefers X", "repo Y uses framework Z") in the appropriate partition with `kind: fact`.
+
+**Explicit agent tools:**
+
+Agents have access to two memory-related tools:
+* **`remember`**: Explicitly store a fact or note. The agent calls this when it determines something is worth persisting. Writes to `agent:<agent_id>` or `workspace:<name>` per policy.
+* **`recall`**: Search memory by query string. Returns matching items from authorized partitions. The agent calls this during reasoning when it needs historical context beyond what was injected at init.
+
+### 13.6 Memory crate separation
+
+The `MemoryStore` trait is defined in `neuromancer-core` (no implementation).
+
+The SQLite implementation lives in a separate crate: `neuromancer-memory-simple/`.
+
+```
+neuromancer-core/src/memory.rs       # trait MemoryStore, MemoryItem, MemoryQuery, etc.
+neuromancer-memory-simple/src/lib.rs  # SqliteMemoryStore: impl MemoryStore
+neuromancer-memory-simple/migrations/ # SQLite schema migrations
+```
+
+This separation allows:
+* `neuromancer-core` to remain lightweight with no sqlx dependency
+* Future alternative implementations (e.g., `neuromancer-memory-pg` for Postgres, `neuromancer-memory-vector` for semantic search)
+* The orchestrator to depend on `neuromancer-core` without pulling in storage dependencies
 
 ---
 
@@ -584,26 +1352,183 @@ A trigger source produces:
 
 ```rust
 struct TriggerEvent {
-  trigger_id: String,
-  occurred_at: DateTime,
-  principal: Principal, // discord user, system cron, etc.
-  payload: TriggerPayload, // message text, attachments, schedule payload, etc.
-  route_hint: Option<AgentId>,
+    trigger_id: String,
+    occurred_at: DateTime<Utc>,
+    principal: Principal,         // discord user, system cron, etc.
+    payload: TriggerPayload,      // message text, attachments, schedule context, etc.
+    route_hint: Option<AgentId>,  // from channel_routes or cron config
+    metadata: TriggerMetadata,    // channel_id, guild_id, thread_id, etc.
 }
 ```
 
-### 14.2 Discord trigger (v0.5)
+The Trigger Manager owns a `tokio::sync::mpsc::Sender<TriggerEvent>` and sends events to the orchestrator's main loop.
 
-Crate choice options:
+### 14.2 Discord trigger
 
-* `twilight`: described as a powerful, flexible, scalable ecosystem of Rust libraries for Discord. ([Docs.rs][18])
-* `serenity`: widely used Rust Discord library; `poise` is a command framework built on top. ([Docs.rs][19])
+The Discord trigger provides a full specification of how Discord messages become tasks and how responses are delivered.
 
-**Recommendation:** start with `twilight` for gateway/event scale and keep an abstraction layer so you can swap.
+**Crate choice:** `twilight` — a modular, scalable Discord library that separates gateway, HTTP, and model concerns. ([Docs.rs][18])
 
-### 14.3 Cron trigger (v0.5)
+#### 14.2.1 Configuration
 
-Use `tokio-cron-scheduler` (cron-like scheduling on Tokio, optional persistence). ([Docs.rs][20])
+```rust
+struct DiscordTriggerConfig {
+    token_secret: SecretRef,
+    allowed_guilds: Vec<GuildId>,
+    channel_routes: Vec<ChannelRoute>,
+    dm_policy: DmPolicy,
+    rate_limit: RateLimitConfig,
+    response: DiscordResponseConfig,
+}
+
+struct ChannelRoute {
+    channel_id: ChannelId,
+    agent: AgentId,
+    thread_mode: ThreadMode,
+    activation: ActivationRule,
+}
+
+enum ThreadMode {
+    /// Create a new Discord thread for each task. Responses go to the thread.
+    PerTask,
+    /// Use the existing thread if the message is in one; otherwise create.
+    Inherit,
+    /// No thread management; respond in the same channel.
+    Disabled,
+}
+
+enum ActivationRule {
+    /// Process all messages in this channel.
+    All,
+    /// Only process messages that @mention the bot.
+    Mention,
+    /// Only process messages starting with a prefix (e.g., "!nm").
+    Prefix(String),
+    /// Only process messages that are replies to the bot.
+    Reply,
+}
+
+enum DmPolicy {
+    /// Accept DMs from any user.
+    Open,
+    /// Accept DMs only from users in allowed_guilds.
+    AllowedUsersOnly,
+    /// Reject all DMs.
+    Disabled,
+}
+```
+
+#### 14.2.2 Message-to-task mapping
+
+When a Discord message passes activation and rate limit checks:
+
+1. Extract message content, attachments, and thread context.
+2. If attachments are present: download them to a task-scoped workspace directory. Include file paths in the task instruction.
+3. Resolve the target agent via `channel_routes` (overrides global `routing.rules` for Discord).
+4. If `thread_mode` is `PerTask`: create a Discord thread for the task. All subsequent responses for this task go to the thread.
+5. Construct a `TriggerEvent` with `principal` set to the Discord user, `payload` containing the message text + attachment paths, and `metadata` containing channel/guild/thread IDs.
+6. Send to the orchestrator.
+
+#### 14.2.3 Response delivery
+
+When a task produces output:
+
+1. Format the response according to `DiscordResponseConfig`.
+2. If the response exceeds `max_message_length`:
+   * `Split`: break into multiple messages at paragraph/code-block boundaries.
+   * `FileAttachment`: send as a `.md` file attachment with a brief summary message.
+   * `Truncate`: truncate with a "... (truncated)" suffix.
+3. If `use_embeds` is true and the output contains structured data (tables, key-value pairs), format as Discord embeds.
+4. If `auto_code_blocks` is true, wrap code snippets in Discord code blocks with language hints.
+5. Send to the appropriate channel/thread.
+
+```rust
+struct DiscordResponseConfig {
+    max_message_length: usize,   // default: 2000 (Discord limit)
+    overflow: OverflowStrategy,
+    use_embeds: bool,
+    auto_code_blocks: bool,
+}
+
+enum OverflowStrategy {
+    Split,
+    FileAttachment,
+    Truncate,
+}
+```
+
+#### 14.2.4 Rate limiting
+
+```rust
+struct RateLimitConfig {
+    per_user_per_minute: u32,      // default: 10
+    per_channel_per_minute: u32,   // default: 30
+    max_concurrent_tasks: u32,     // default: 5
+}
+```
+
+Rate limits are tracked in-memory with a sliding window. When exceeded, the bot reacts with a rate-limit emoji and does not create a task.
+
+#### 14.2.5 Connection lifecycle
+
+* On startup: connect to Discord gateway via twilight, register for `MESSAGE_CREATE` events.
+* On disconnect: automatic reconnection with exponential backoff (handled by twilight's gateway).
+* On shutdown: gracefully close the gateway connection. In-flight tasks continue; new events are dropped.
+
+### 14.3 Cron trigger
+
+Cron triggers produce tasks on a schedule, with structured task templates replacing raw payload strings.
+
+**Crate:** `tokio-cron-scheduler` for cron-like scheduling on Tokio. ([Docs.rs][20])
+
+#### 14.3.1 Configuration
+
+Each cron trigger is a named job with a schedule, a task template, execution parameters, and notification rules. See §11.2 for the full TOML format.
+
+Key fields:
+
+| Field | Description |
+|---|---|
+| `id` | Unique job identifier, used for idempotency and admin API |
+| `description` | Human-readable purpose |
+| `schedule` | Cron expression (6-field: sec min hour day month weekday) |
+| `task_template.agent` | Target agent for the generated task |
+| `task_template.instruction` | Instruction text, supports `{{variable}}` template syntax |
+| `task_template.parameters` | Key-value pairs injected into the instruction template |
+| `execution.timeout` | Max execution time before the task is cancelled |
+| `execution.idempotency_key` | Template for dedup key (e.g., `"job-{{date}}"`) |
+| `execution.dedup_window` | Time window for idempotency dedup |
+| `execution.on_failure` | `"retry"` or `"skip"` |
+| `execution.max_retries` | Max retry attempts |
+| `notification.on_success` | Channel + template for success notification |
+| `notification.on_failure` | Channel + template for failure notification |
+
+#### 14.3.2 Template rendering
+
+Instruction templates use `minijinja` for rendering. Available variables:
+
+* All keys from `task_template.parameters`
+* `{{date}}` — current date (YYYY-MM-DD)
+* `{{datetime}}` — current datetime (ISO 8601)
+* `{{job_id}}` — the cron job ID
+
+#### 14.3.3 Execution flow
+
+1. `tokio-cron-scheduler` fires at the scheduled time.
+2. Render the instruction template with current parameters.
+3. Compute the `idempotency_key` (if configured).
+4. Check dedup: if a task with the same idempotency key exists in a non-terminal state within `dedup_window`, skip.
+5. Create a `Task` with the rendered instruction, assigned agent, and priority `Normal`.
+6. Enqueue via the orchestrator.
+7. On completion/failure: render and send notification (if configured).
+
+#### 14.3.4 Management via Admin API
+
+Cron jobs can be managed at runtime through the Admin API (§21):
+* `GET /admin/cron` — list all cron jobs with next-fire times
+* `POST /admin/cron/{id}/trigger` — manually trigger a cron job now
+* `POST /admin/cron/{id}/disable` — disable without removing
+* `POST /admin/cron/{id}/enable` — re-enable
 
 ---
 
@@ -619,21 +1544,23 @@ Each task run emits spans:
 
 * `trigger.receive`
 * `task.create`
+* `task.route` (which routing rule matched)
 * `agent.dispatch`
-* `agent.loop.step`
+* `agent.state_transition` (from → to state, with state machine context)
 * `llm.call` (model id, token counts, latency)
 * `tool.call` (tool id, MCP server, A2A peer, skill id)
 * `secret.access` (handle id only, no value)
 * `memory.query` / `memory.put`
 * `policy.decision` (allow/deny + reason code)
+* `remediation.action` (what the orchestrator decided)
 
 ### 15.3 Log redaction requirements
 
 * Never log raw prompts containing secrets
 * Redact configured patterns
-* Emit “structured events” rather than dumping payloads
+* Emit "structured events" rather than dumping payloads
 
-(These are must-haves to prevent the ecosystem-wide “keys in logs” class of failures.)
+(These are must-haves to prevent the ecosystem-wide "keys in logs" class of failures.)
 
 ---
 
@@ -659,7 +1586,7 @@ v0.5 implements:
 
 ---
 
-## 17. Security model (the “missing trust layer”)
+## 17. Security model (the "missing trust layer")
 
 This is the heart of the design.
 
@@ -667,7 +1594,7 @@ This is the heart of the design.
 
 * Every agent has an identity (agent_id + credentials for A2A)
 * Every external capability is explicit and revocable
-* This directly matches the industry recommendation that permissions must be “specific, revocable, continuously enforced,” not granted once and forgotten. ([1Password][4])
+* This directly matches the industry recommendation that permissions must be "specific, revocable, continuously enforced," not granted once and forgotten. ([1Password][4])
 
 ### 17.2 Policy engine + verification middleware
 
@@ -675,8 +1602,8 @@ Neuromancer supports stacked gates:
 
 1. **Static gates** (config policy): allow/deny by capability.
 2. **Heuristic gates** (cheap): detect dangerous patterns (rm -rf, curl | sh, etc.).
-3. **Verifier gate** (optional): call a dedicated “safeguard model” for tool call approval.
-4. **Human-in-the-loop**: for destructive/sensitive actions.
+3. **Verifier gate** (optional): call a dedicated "safeguard model" for tool call approval.
+4. **Human-in-the-loop**: for destructive/sensitive actions (via remediation protocol §6.5).
 
 ### 17.3 Skill linting (v0.5 foundation)
 
@@ -684,7 +1611,7 @@ Given research showing that skills often instruct agents to pass secrets into pr
 
 * **Skill linter** at install/load time:
 
-  * flags “print your API key” patterns
+  * flags "print your API key" patterns
   * flags instructions that tell the agent to store secrets in memory/config
   * flags commands that download/execute remote scripts
 * **Runtime outbound filter** (optional):
@@ -697,13 +1624,17 @@ Given research showing that skills often instruct agents to pass secrets into pr
 
 ### Daemon/runtime fundamentals
 
-* **Async runtime:** `tokio` (ecosystem standard; required by rmcp usage patterns) ([GitHub][5])
+* **Async runtime:** `tokio` (ecosystem standard; required by rmcp and rig) ([GitHub][5])
 * **HTTP server (A2A/admin):** `axum` (ergonomics + modularity; uses tower ecosystem). ([Docs.rs][23])
 * **TLS:** `rustls` (secure defaults, no unsafe features by default). ([Docs.rs][24])
 
+### LLM integration
+
+* **LLM framework:** `rig-core` (**mandatory** — primary LLM integration, agent construction, tool dispatch) ([Docs.rs][9])
+
 ### Protocols
 
-* **MCP:** `rmcp` official SDK ([GitHub][5])
+* **MCP:** `rmcp` official SDK, surfaced through rig's `.mcp_tool()` ([GitHub][5])
 * **A2A:** implement HTTP+JSON binding in axum using the spec endpoints ([A2A Protocol][6])
 
 ### Observability
@@ -722,7 +1653,7 @@ Given research showing that skills often instruct agents to pass secrets into pr
 
 ### Triggers
 
-* **Discord:** `twilight` or `serenity` ([Docs.rs][18])
+* **Discord:** `twilight` ([Docs.rs][18])
 * **Cron:** `tokio-cron-scheduler` ([Docs.rs][20])
 
 ### Skills parsing
@@ -730,57 +1661,168 @@ Given research showing that skills often instruct agents to pass secrets into pr
 * **Frontmatter extraction:** `gray_matter` ([Docs.rs][12])
 * **YAML parsing:** `yaml-rust2` (serde_yaml is unmaintained) ([Docs.rs][11])
 
+### Template rendering
+
+* **Templates:** `minijinja` (lightweight Jinja2-compatible engine for cron task templates) ([Docs.rs][25])
+
 ### Container orchestration
 
 * **Docker:** `bollard` ([Docs.rs][22])
 
-### LLM integration
+---
 
-* **Optional provider abstraction:** Rig ([Docs.rs][9])
-* **Recommended architecture:** Neuromancer-native trait + Rig adapter
+## 19. Crate layout and milestones
+
+### 19.1 Crate layout
+
+```
+neuromancer/
+  Cargo.toml                      # workspace root
+  neuromancer-core/               # Core traits: ToolBroker, MemoryStore, SecretsBroker,
+                                  #   PolicyEngine, error types, shared types.
+                                  #   NO rig dependency. NO sqlx dependency.
+  neuromancer-orchestrator/       # Orchestrator, routing rules + LLM classifier,
+                                  #   supervision loop, task queue, remediation logic.
+                                  #   Depends on: neuromancer-core, rig-core (for classifier only).
+  neuromancer-agent/              # Agent execution runtime: state machine, rig Agent
+                                  #   construction, ConversationContext, model router.
+                                  #   Depends on: neuromancer-core, rig-core.
+  neuromancerd/                   # Daemon binary: config loading, signal handling,
+                                  #   lifecycle management, admin API server.
+                                  #   Depends on: all crates.
+  neuromancer-a2a/                # A2A HTTP+JSON endpoints (axum handlers),
+                                  #   Agent Card serving, task state mapping.
+  neuromancer-mcp/                # MCP client pool: wraps rmcp, manages server
+                                  #   lifecycle, health checks.
+  neuromancer-skills/             # Skill loading, frontmatter parsing, linting,
+                                  #   permission declaration extraction.
+  neuromancer-triggers/           # Trigger manager, Discord trigger (twilight),
+                                  #   cron trigger (tokio-cron-scheduler).
+  neuromancer-memory-simple/      # SQLite MemoryStore implementation.
+                                  #   Depends on: neuromancer-core, sqlx.
+  neuromancer-secrets/            # Secrets broker: encrypted store, ACL enforcement,
+                                  #   handle resolution, injection.
+```
+
+**Dependency note:** Both `neuromancer-orchestrator` and `neuromancer-agent` depend on `rig-core`, but for different reasons. The orchestrator uses only `CompletionModel::complete()` for the routing classifier. The agent crate uses rig's full Agent/tool/conversation stack. The orchestrator never constructs a rig Agent or uses tool dispatch.
+
+### 19.2 Implementation milestones
+
+1. **Repo + crate layout + workspace Cargo.toml**
+2. **`neuromancer-core`**: traits, error types, shared types
+3. **TOML config + validation + hot reload** (in `neuromancerd`)
+4. **OTEL tracing pipeline**
+5. **`neuromancer-secrets`**: keyring master key, age-encrypted payloads, ACL enforcement
+6. **`neuromancer-memory-simple`**: partitioned SQLite schema, basic query
+7. **`neuromancer-mcp`**: MCP client pool using rmcp
+8. **`neuromancer-agent`**: rig-based agent runtime, state machine, conversation context
+9. **`neuromancer-orchestrator`**: routing, task queue, supervision loop, remediation
+10. **`neuromancer-a2a`**: A2A HTTP+JSON endpoints
+11. **`neuromancer-triggers`**: cron + Discord
+12. **`neuromancer-skills`**: skill loader + permission declarations + linter MVP
+13. **`neuromancerd`**: daemon lifecycle, admin API, integration
 
 ---
 
-## 19. v0.5 implementation milestones
+## 20. Daemon lifecycle
 
-1. **Repo + crate layout**
+### 20.1 Startup sequence
 
-   * `neuromancer-core` (library)
-   * `neuromancerd` (daemon binary)
-   * `neuromancer-a2a` (module/crate)
-   * `neuromancer-mcp` (module/crate)
-   * `neuromancer-skills` (module/crate)
-   * `neuromancer-storage` (sqlite/sqlx)
-2. **TOML config + validation + hot reload**
-3. **OTEL tracing pipeline**
-4. **Secrets broker MVP**
+1. Load and validate TOML config.
+2. Initialize OTEL tracing pipeline.
+3. Open SQLite databases (memory, secrets, task queue).
+4. Initialize Secrets Broker (unlock master key from OS keychain).
+5. Initialize MCP Client Pool (start configured MCP servers).
+6. Build Agent Registry (validate agent configs, pre-resolve model slots).
+7. Start Trigger Manager (connect to Discord gateway, schedule cron jobs).
+8. Recover in-flight tasks: reload tasks in `Queued`/`Dispatched`/`Running` states from SQLite, re-enqueue or resume from checkpoints.
+9. Start Admin API HTTP server.
+10. Enter Orchestrator main loop.
 
-   * keyring master key
-   * age-encrypted payload storage
-   * ACL enforcement
-5. **Memory store MVP**
+### 20.2 Signal handling
 
-   * partitioned sqlite schema
-   * basic query (partition + tags + recency)
-6. **MCP client manager using rmcp**
-7. **A2A HTTP+JSON endpoints**
-8. **Agent supervisor**
+| Signal | Behavior |
+|---|---|
+| `SIGTERM` | Graceful shutdown: stop accepting new triggers, drain in-flight tasks (with timeout), persist checkpoints, exit. |
+| `SIGINT` | Same as SIGTERM (for interactive use). |
+| `SIGHUP` | Hot reload: re-read TOML config, apply changes per §11.3 rules. |
 
-   * inproc workers
-   * container workers (bollard)
-9. **Triggers**
+### 20.3 Graceful shutdown sequence
 
-   * cron
-   * discord
-10. **Skill loader + permission declarations + linter MVP**
+1. Stop Trigger Manager (disconnect Discord, stop cron scheduler).
+2. Stop accepting new tasks in the queue.
+3. Wait for in-flight tasks to complete (up to `shutdown_timeout`, default: 30s).
+4. For tasks that don't complete in time:
+   * Persist their current checkpoint to SQLite.
+   * Mark them as `Suspended` with reason "daemon shutdown".
+5. Close MCP server connections (send graceful shutdown to child processes).
+6. Stop container-based agents (send SIGTERM to containers, wait, then SIGKILL).
+7. Flush OTEL spans.
+8. Close SQLite databases.
+9. Exit with code 0.
+
+### 20.4 Restart recovery
+
+On next startup, the daemon:
+1. Finds tasks in `Suspended` state with reason "daemon shutdown".
+2. For tasks with valid checkpoints: resumes from the checkpoint (restores `ConversationContext` and state machine state).
+3. For tasks without checkpoints or with corrupted checkpoints: marks as `Failed` with error `CheckpointCorrupted`.
 
 ---
 
-## 20. Open questions (intentionally deferred)
+## 21. Admin API
+
+A localhost-only HTTP API for runtime introspection and management. Served by axum on a configurable port (default: `127.0.0.1:9090`).
+
+### 21.1 Task endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/tasks` | List tasks with optional filters (state, agent, time range) |
+| `GET` | `/admin/tasks/{id}` | Get task details including state, checkpoints, output |
+| `POST` | `/admin/tasks` | Submit a manual task (instruction + target agent) |
+| `POST` | `/admin/tasks/{id}/cancel` | Cancel a running task |
+
+### 21.2 Agent endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/agents` | List agents with health status and current task |
+| `GET` | `/admin/agents/{id}` | Agent details: config, health, recent tasks, circuit breaker state |
+
+### 21.3 Cron endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/cron` | List cron jobs with schedule, next fire time, last result |
+| `POST` | `/admin/cron/{id}/trigger` | Manually trigger a cron job now |
+| `POST` | `/admin/cron/{id}/disable` | Disable a cron job |
+| `POST` | `/admin/cron/{id}/enable` | Enable a cron job |
+
+### 21.4 Memory and system endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/memory/stats` | Memory store stats: partition sizes, item counts, GC status |
+| `GET` | `/admin/health` | Daemon health: uptime, task counts, agent states, MCP server status |
+| `POST` | `/admin/config/reload` | Trigger config hot-reload (same as SIGHUP) |
+
+### 21.5 Security
+
+* Bind to `127.0.0.1` only (no remote access by default).
+* Optional bearer token authentication for environments where localhost access is shared.
+* All admin actions are logged to OTEL with `admin.action` spans.
+
+---
+
+## 22. Open questions (intentionally deferred)
 
 * How strongly do you want to enforce skill provenance in v0.5 (signatures, SBOM, pinned git SHAs)?
-* Should “file tools” be a built-in tool surface (preferred for safety) or only via MCP servers (preferred for protocol purity)?
+* Should "file tools" be a built-in tool surface (preferred for safety) or only via MCP servers (preferred for protocol purity)?
   (My bias: built-in restricted FS tool for v0.5, plus MCP support for external servers.)
+* Should the Admin API support WebSocket subscriptions for real-time task/agent status updates, or is polling sufficient for v0.5?
+* What is the maximum conversation history size before mandatory truncation? (Current proposal: per-agent configurable, default 128k tokens.)
+* Should cron job definitions be splittable across multiple TOML files (e.g., `cron.d/` directory pattern), or must everything remain in the single config file for v0.5?
 
 ---
 
@@ -808,4 +1850,4 @@ Given research showing that skills often instruct agents to pass secrets into pr
 [22]: https://docs.rs/bollard "https://docs.rs/bollard"
 [23]: https://docs.rs/axum/latest/axum/ "https://docs.rs/axum/latest/axum/"
 [24]: https://docs.rs/rustls "https://docs.rs/rustls"
-
+[25]: https://docs.rs/minijinja "https://docs.rs/minijinja"
