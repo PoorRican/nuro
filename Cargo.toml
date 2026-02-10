@@ -1,6 +1,99 @@
-[package]
-name = "neuromancer"
+[workspace]
+resolver = "2"
+members = [
+    "neuromancer-core",
+    "neuromancer-orchestrator",
+    "neuromancer-agent",
+    "neuromancerd",
+    "neuromancer-a2a",
+    "neuromancer-mcp",
+    "neuromancer-skills",
+    "neuromancer-triggers",
+    "neuromancer-memory-simple",
+    "neuromancer-secrets",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+neuromancer-core = { path = "neuromancer-core" }
+neuromancer-orchestrator = { path = "neuromancer-orchestrator" }
+neuromancer-agent = { path = "neuromancer-agent" }
+neuromancer-a2a = { path = "neuromancer-a2a" }
+neuromancer-mcp = { path = "neuromancer-mcp" }
+neuromancer-skills = { path = "neuromancer-skills" }
+neuromancer-triggers = { path = "neuromancer-triggers" }
+neuromancer-memory-simple = { path = "neuromancer-memory-simple" }
+neuromancer-secrets = { path = "neuromancer-secrets" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Time and IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# HTTP / web
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+
+# LLM
+rig-core = { version = "0.11", features = ["derive"] }
+
+# MCP
+rmcp = { version = "0.1", features = ["client", "transport-sse", "transport-child-process"] }
+
+# Secrets
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# Discord
+twilight-gateway = "0.16"
+twilight-http = "0.16"
+twilight-model = "0.16"
+
+# Cron
+tokio-cron-scheduler = "0.13"
+
+# Containers
+bollard = "0.18"
+
+# Observability
+opentelemetry = "0.28"
+opentelemetry-otlp = "0.28"
+opentelemetry_sdk = "0.28"
+
+# Skills parsing
+gray_matter = "0.2"
+yaml-rust2 = "0.9"
+
+# Templates
+minijinja = "2"
+
+# Config hot-reload
+notify = "7"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
