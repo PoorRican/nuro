@@ -1,0 +1,161 @@
+use serde::{Deserialize, Serialize};
+
+/// JSON-RPC 2.0 id type supported by the daemon control-plane RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(i64),
+    String(String),
+}
+
+/// JSON-RPC 2.0 request envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<JsonRpcId>,
+}
+
+/// JSON-RPC 2.0 response envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<JsonRpcId>,
+}
+
+impl JsonRpcResponse {
+    pub fn success(id: JsonRpcId, result: serde_json::Value) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            result: Some(result),
+            error: None,
+            id: Some(id),
+        }
+    }
+
+    pub fn error(id: Option<JsonRpcId>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+            id,
+        }
+    }
+}
+
+/// JSON-RPC 2.0 error object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+pub const JSON_RPC_PARSE_ERROR: i64 = -32700;
+pub const JSON_RPC_INVALID_REQUEST: i64 = -32600;
+pub const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+pub const JSON_RPC_INVALID_PARAMS: i64 = -32602;
+pub const JSON_RPC_INTERNAL_ERROR: i64 = -32603;
+pub const JSON_RPC_GENERIC_SERVER_ERROR: i64 = -32000;
+pub const JSON_RPC_RESOURCE_NOT_FOUND: i64 = -32004;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResult {
+    pub status: String,
+    pub version: String,
+    pub uptime_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummaryDto {
+    pub id: String,
+    pub instruction: String,
+    pub assigned_agent: String,
+    pub state: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSubmitParams {
+    pub instruction: String,
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSubmitResult {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListResult {
+    pub tasks: Vec<TaskSummaryDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskGetParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskGetResult {
+    pub task: TaskSummaryDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCancelParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCancelResult {
+    pub status: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadResult {
+    pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonrpc_request_roundtrip_supports_string_id() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "task.get".to_string(),
+            params: Some(serde_json::json!({ "task_id": "abc" })),
+            id: Some(JsonRpcId::String("req-1".to_string())),
+        };
+
+        let encoded = serde_json::to_string(&req).expect("request should serialize");
+        let decoded: JsonRpcRequest =
+            serde_json::from_str(&encoded).expect("request should deserialize");
+
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn jsonrpc_response_roundtrip_supports_numeric_id() {
+        let resp = JsonRpcResponse::success(JsonRpcId::Number(42), serde_json::json!({"ok": true}));
+        let encoded = serde_json::to_string(&resp).expect("response should serialize");
+        let decoded: JsonRpcResponse =
+            serde_json::from_str(&encoded).expect("response should deserialize");
+        assert_eq!(decoded, resp);
+    }
+}
