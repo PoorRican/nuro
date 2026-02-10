@@ -248,12 +248,23 @@ mod tests {
     }
 
     fn test_ctx(agent_id: &str) -> AgentContext {
+        test_ctx_with_caps(agent_id, vec![], vec![])
+    }
+
+    fn test_ctx_with_caps(
+        agent_id: &str,
+        allowed_secrets: Vec<&str>,
+        allowed_mcp_servers: Vec<&str>,
+    ) -> AgentContext {
         AgentContext {
             agent_id: agent_id.to_string(),
             task_id: uuid::Uuid::new_v4(),
             allowed_tools: vec![],
-            allowed_mcp_servers: vec![],
-            allowed_secrets: vec![],
+            allowed_mcp_servers: allowed_mcp_servers
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            allowed_secrets: allowed_secrets.into_iter().map(str::to_string).collect(),
             allowed_memory_partitions: vec![],
         }
     }
@@ -279,7 +290,7 @@ mod tests {
 
         broker.store("my-api-key", "super-secret-value", acl).await.unwrap();
 
-        let ctx = test_ctx("browser");
+        let ctx = test_ctx_with_caps("browser", vec!["my-api-key"], vec!["http-client"]);
         let usage = SecretUsage {
             tool_id: "http-client".into(),
             purpose: "API call".into(),
@@ -321,6 +332,81 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_secret_in_agent_context_allowlist() {
+        let pool = test_pool().await;
+        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+
+        broker
+            .store(
+                "context-guarded",
+                "secret-val",
+                SecretAcl {
+                    secret_id: "context-guarded".into(),
+                    allowed_agents: vec!["browser".into()],
+                    allowed_skills: vec![],
+                    allowed_mcp_servers: vec![],
+                    injection_modes: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        // Agent identity is allowed by ACL, but runtime context did not grant this secret.
+        let ctx = test_ctx_with_caps("browser", vec![], vec!["http-client"]);
+        let usage = SecretUsage {
+            tool_id: "http-client".into(),
+            purpose: "test".into(),
+        };
+
+        let err = broker
+            .resolve_handle_for_tool(&ctx, "context-guarded".into(), usage)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_honors_secret_acl_allowed_mcp_servers() {
+        let pool = test_pool().await;
+        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+
+        broker
+            .store(
+                "mcp-guarded",
+                "secret-val",
+                SecretAcl {
+                    secret_id: "mcp-guarded".into(),
+                    allowed_agents: vec!["browser".into()],
+                    allowed_skills: vec![],
+                    allowed_mcp_servers: vec!["playwright".into()],
+                    injection_modes: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = test_ctx_with_caps("browser", vec!["mcp-guarded"], vec!["filesystem"]);
+        let usage = SecretUsage {
+            tool_id: "filesystem".into(),
+            purpose: "test".into(),
+        };
+
+        let err = broker
+            .resolve_handle_for_tool(&ctx, "mcp-guarded".into(), usage)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
     }
 
     #[tokio::test]
@@ -414,7 +500,7 @@ mod tests {
         broker.store("key", "old-val", acl.clone()).await.unwrap();
         broker.store("key", "new-val", acl).await.unwrap();
 
-        let ctx = test_ctx("browser");
+        let ctx = test_ctx_with_caps("browser", vec!["key"], vec!["t"]);
         let usage = SecretUsage {
             tool_id: "t".into(),
             purpose: "t".into(),

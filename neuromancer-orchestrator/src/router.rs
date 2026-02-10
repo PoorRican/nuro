@@ -263,6 +263,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_route_hint_falls_back_to_safe_resolution() {
+        let config = RoutingConfig {
+            default_agent: "planner".into(),
+            classifier_model: None,
+            rules: vec![],
+        };
+        let router = Router::new(&config);
+        let registry = make_registry();
+
+        let mut event = make_event("general", "do something");
+        event.route_hint = Some("ghost-agent".into());
+
+        // Regression guard: route hints should not bypass agent existence checks.
+        // Unknown hints should fall back to deterministic/default routing.
+        let result = router.resolve(&event, &registry).await.unwrap();
+        assert_eq!(result, "planner");
+    }
+
+    #[tokio::test]
     async fn deterministic_rule_match() {
         let config = RoutingConfig {
             default_agent: "planner".into(),

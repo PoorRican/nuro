@@ -429,4 +429,31 @@ mod tests {
         let task = orch.task_queue.get(&task_id).unwrap();
         assert_eq!(task.state, TaskState::Queued);
     }
+
+    #[tokio::test]
+    async fn retry_path_requeues_task_for_future_dispatch() {
+        let mut orch = setup();
+        let event = make_event("general", "task");
+        let task_id = orch.route(event).await.unwrap();
+
+        // Simulate the orchestrator dispatch loop taking the task.
+        let dispatched = orch.task_queue.dequeue().unwrap();
+        assert_eq!(dispatched.id, task_id);
+        assert_eq!(orch.task_queue.queue_len(), 0);
+
+        let report = SubAgentReport::ToolFailure {
+            task_id,
+            tool_id: "search".into(),
+            error: "timeout".into(),
+            retry_eligible: true,
+            attempted_count: 1,
+        };
+        orch.handle_report(report).await;
+
+        // Regression guard: retry should put the task back into the dispatch queue.
+        // This currently fails because only task state is updated, without queue insertion.
+        assert_eq!(orch.task_queue.queue_len(), 1);
+        let retried = orch.task_queue.dequeue().unwrap();
+        assert_eq!(retried.id, task_id);
+    }
 }

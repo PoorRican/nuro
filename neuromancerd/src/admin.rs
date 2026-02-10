@@ -260,3 +260,63 @@ async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.config_reload_tx.send(());
     Json(serde_json::json!({ "status": "reload triggered" }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use neuromancer_core::config::{A2aConfig, GlobalConfig, MemoryConfig, OtelConfig, SecretsConfig, TriggersConfig};
+    use neuromancer_core::routing::RoutingConfig;
+
+    fn test_config() -> NeuromancerConfig {
+        NeuromancerConfig {
+            global: GlobalConfig {
+                instance_id: "test-instance".into(),
+                workspace_dir: "/tmp".into(),
+                data_dir: "/tmp".into(),
+            },
+            otel: OtelConfig::default(),
+            secrets: SecretsConfig::default(),
+            memory: MemoryConfig::default(),
+            models: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            a2a: A2aConfig::default(),
+            routing: RoutingConfig {
+                default_agent: "planner".into(),
+                classifier_model: None,
+                rules: vec![],
+            },
+            agents: HashMap::new(),
+            triggers: TriggersConfig::default(),
+            admin_api: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn submitted_task_is_visible_in_task_listing() {
+        let (reload_tx, _reload_rx) = watch::channel(());
+        let state = AppState {
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_reload_tx: reload_tx,
+        };
+
+        let _resp = submit_task(
+            State(state.clone()),
+            Json(SubmitTaskRequest {
+                instruction: "run task".into(),
+                agent: "planner".into(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let Json(tasks) = list_tasks(State(state)).await;
+
+        // Regression guard: manual task submission must be reflected in /admin/tasks.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].assigned_agent, "planner");
+        assert_eq!(tasks[0].instruction, "run task");
+    }
+}
