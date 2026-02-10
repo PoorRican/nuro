@@ -6,6 +6,7 @@ mod telemetry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Parser;
@@ -80,6 +81,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
+        submitted_tasks: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let admin_router = admin::admin_router(admin_state);

@@ -67,8 +67,11 @@ impl Router {
     ) -> Result<AgentId, NeuromancerError> {
         // Check route hint first
         if let Some(hint) = &event.route_hint {
-            tracing::debug!(agent = %hint, "using route hint");
-            return Ok(hint.clone());
+            if registry.contains(hint) {
+                tracing::debug!(agent = %hint, "using route hint");
+                return Ok(hint.clone());
+            }
+            tracing::warn!(agent = %hint, "ignoring unknown route hint");
         }
 
         // Deterministic rules

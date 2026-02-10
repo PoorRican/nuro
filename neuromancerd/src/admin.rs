@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashMap;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -17,6 +18,7 @@ pub struct AppState {
     pub config: Arc<RwLock<NeuromancerConfig>>,
     pub start_time: Instant,
     pub config_reload_tx: watch::Sender<()>,
+    pub submitted_tasks: Arc<RwLock<HashMap<String, TaskSummary>>>,
 }
 
 /// Build the admin API axum router.
@@ -61,8 +63,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 // Tasks (stubs — real task queue will be integrated via orchestrator crate)
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct TaskSummary {
+#[derive(Serialize, Clone)]
+pub struct TaskSummary {
     id: String,
     instruction: String,
     assigned_agent: String,
@@ -70,16 +72,31 @@ struct TaskSummary {
     created_at: String,
 }
 
-async fn list_tasks(State(_state): State<AppState>) -> Json<Vec<TaskSummary>> {
-    // Stub: returns empty list until orchestrator task queue is integrated.
-    Json(vec![])
+async fn list_tasks(State(state): State<AppState>) -> Json<Vec<TaskSummary>> {
+    let tasks: Vec<TaskSummary> = state
+        .submitted_tasks
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    Json(tasks)
 }
 
 async fn get_task(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // Stub: no task store yet.
+    let tasks = state.submitted_tasks.read().await;
+    if let Some(task) = tasks.get(&id) {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "id": task.id,
+            "instruction": task.instruction,
+            "assigned_agent": task.assigned_agent,
+            "state": task.state,
+            "created_at": task.created_at,
+        })));
+    }
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": format!("task '{id}' not found") })),
@@ -98,16 +115,28 @@ struct SubmitTaskResponse {
 }
 
 async fn submit_task(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<SubmitTaskRequest>,
 ) -> impl IntoResponse {
-    // Stub: create a task id but don't actually enqueue (no orchestrator yet).
     let task_id = uuid::Uuid::new_v4();
+    let task = TaskSummary {
+        id: task_id.to_string(),
+        instruction: req.instruction.clone(),
+        assigned_agent: req.agent.clone(),
+        state: "queued".into(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state
+        .submitted_tasks
+        .write()
+        .await
+        .insert(task.id.clone(), task);
+
     tracing::info!(
         task_id = %task_id,
         agent = %req.agent,
         instruction = %req.instruction,
-        "manual task submitted (stub)"
+        "manual task submitted"
     );
     (
         StatusCode::ACCEPTED,
@@ -118,10 +147,14 @@ async fn submit_task(
 }
 
 async fn cancel_task(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    tracing::info!(task_id = %id, "cancel task requested (stub)");
+    let mut tasks = state.submitted_tasks.write().await;
+    if let Some(task) = tasks.get_mut(&id) {
+        task.state = "cancelled".into();
+    }
+    tracing::info!(task_id = %id, "cancel task requested");
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "status": "cancel requested", "task_id": id })),
@@ -300,6 +333,7 @@ mod tests {
             config: Arc::new(RwLock::new(test_config())),
             start_time: Instant::now(),
             config_reload_tx: reload_tx,
+            submitted_tasks: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let _resp = submit_task(

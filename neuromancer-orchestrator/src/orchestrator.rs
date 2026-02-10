@@ -124,9 +124,11 @@ impl Orchestrator {
     async fn apply_remediation(&mut self, task_id: TaskId, action: RemediationAction) {
         match action {
             RemediationAction::Retry { .. } => {
-                // Re-enqueue the task
-                self.task_queue.update_state(task_id, TaskState::Queued);
-                tracing::info!(task_id = %task_id, "re-enqueuing task for retry");
+                if self.task_queue.requeue(task_id) {
+                    tracing::info!(task_id = %task_id, "re-enqueuing task for retry");
+                } else {
+                    tracing::warn!(task_id = %task_id, "retry requested but task was not re-queued");
+                }
             }
 
             RemediationAction::Abort { reason } => {
@@ -148,11 +150,16 @@ impl Orchestrator {
                     reason = %reason,
                     "reassigning task"
                 );
+                let mut reassigned = false;
                 if let Some(task) = self.task_queue.get_mut(&task_id) {
                     let old_agent = task.assigned_agent.clone();
                     task.assigned_agent = new_agent_id;
                     task.state = TaskState::Queued;
                     self.registry.set_current_task(&old_agent, None);
+                    reassigned = true;
+                }
+                if reassigned && !self.task_queue.requeue(task_id) {
+                    tracing::warn!(task_id = %task_id, "reassign requested but task was not re-queued");
                 }
             }
 
@@ -177,7 +184,9 @@ impl Orchestrator {
                 );
                 // In production, this would issue a scoped grant.
                 // Re-enqueue to retry with the grant.
-                self.task_queue.update_state(task_id, TaskState::Queued);
+                if !self.task_queue.requeue(task_id) {
+                    tracing::warn!(task_id = %task_id, "temporary grant requested but task was not re-queued");
+                }
             }
 
             RemediationAction::Clarify {
@@ -188,10 +197,15 @@ impl Orchestrator {
                     "injecting clarification context"
                 );
                 // Re-enqueue with additional context appended to instruction
+                let mut clarified = false;
                 if let Some(task) = self.task_queue.get_mut(&task_id) {
                     task.instruction
                         .push_str(&format!("\n\nAdditional context: {additional_context}"));
                     task.state = TaskState::Queued;
+                    clarified = true;
+                }
+                if clarified && !self.task_queue.requeue(task_id) {
+                    tracing::warn!(task_id = %task_id, "clarify requested but task was not re-queued");
                 }
             }
         }

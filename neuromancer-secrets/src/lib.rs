@@ -67,6 +67,13 @@ impl SecretsBroker for SqliteSecretsBroker {
         secret_ref: SecretRef,
         usage: SecretUsage,
     ) -> Result<ResolvedSecret, NeuromancerError> {
+        if !ctx.allowed_secrets.contains(&secret_ref) {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: ctx.agent_id.clone(),
+                secret_ref,
+            }));
+        }
+
         // Fetch the secret row
         let row = sqlx::query_as::<_, SecretRow>(
             "SELECT id, encrypted_value, nonce, allowed_agents, allowed_skills, allowed_mcp_servers, injection_modes FROM secrets WHERE id = ?",
@@ -88,6 +95,21 @@ impl SecretsBroker for SqliteSecretsBroker {
 
         // Check ACL
         self.check_acl(ctx, &acl)?;
+
+        if !ctx.allowed_mcp_servers.is_empty() && !ctx.allowed_mcp_servers.contains(&usage.tool_id) {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: ctx.agent_id.clone(),
+                secret_ref: acl.secret_id.clone(),
+            }));
+        }
+
+        if !acl.allowed_mcp_servers.is_empty() && !acl.allowed_mcp_servers.contains(&usage.tool_id)
+        {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: ctx.agent_id.clone(),
+                secret_ref: acl.secret_id.clone(),
+            }));
+        }
 
         // Decrypt value
         let mut plaintext = crypto::decrypt(
@@ -138,6 +160,7 @@ impl SecretsBroker for SqliteSecretsBroker {
             .filter(|row| {
                 let acl = row.to_acl();
                 acl.allowed_agents.contains(&ctx.agent_id)
+                    && (ctx.allowed_secrets.is_empty() || ctx.allowed_secrets.contains(&row.id))
             })
             .map(|row| row.id.clone())
             .collect();

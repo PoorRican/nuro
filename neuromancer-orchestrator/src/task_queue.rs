@@ -84,6 +84,29 @@ impl TaskQueue {
         }
     }
 
+    /// Requeue an existing task by ID.
+    ///
+    /// Returns true if the task exists and is now queued.
+    pub fn requeue(&mut self, task_id: TaskId) -> bool {
+        let Some(task) = self.tasks.get_mut(&task_id) else {
+            return false;
+        };
+
+        if task.state.is_terminal() {
+            return false;
+        }
+
+        task.state = TaskState::Queued;
+        task.updated_at = chrono::Utc::now();
+
+        if !self.queue.iter().any(|t| t.id == task_id) {
+            self.queue.push(task.clone());
+            self.sort_queue();
+        }
+
+        true
+    }
+
     /// Get a task by ID.
     pub fn get(&self, task_id: &TaskId) -> Option<&Task> {
         self.tasks.get(task_id)
