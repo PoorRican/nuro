@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use neuromancer_core::task::{Task, TaskId, TaskPriority, TaskState};
+use neuromancer_core::task::{Task, TaskId, TaskState};
 
 /// In-memory task queue with priority ordering and idempotency dedup.
 pub struct TaskQueue {
@@ -134,7 +134,7 @@ impl Default for TaskQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neuromancer_core::task::Task;
+    use neuromancer_core::task::{Task, TaskPriority};
     use neuromancer_core::trigger::TriggerSource;
 
     fn make_task(instruction: &str, priority: TaskPriority) -> Task {

@@ -82,8 +82,8 @@ bollard = "0.18"
 
 # Observability
 opentelemetry = "0.28"
-opentelemetry-otlp = "0.28"
-opentelemetry_sdk = "0.28"
+opentelemetry-otlp = { version = "0.28", features = ["trace", "http-proto"] }
+opentelemetry_sdk = { version = "0.28", features = ["trace", "rt-tokio"] }
 tracing-opentelemetry = "0.29"
 
 # Skills parsing

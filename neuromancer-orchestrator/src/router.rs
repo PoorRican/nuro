@@ -153,7 +153,7 @@ where
 
         let request = self
             .model
-            .completion_request(&prompt)
+            .completion_request(prompt.clone())
             .preamble("You are a routing classifier. Respond with only an agent name.".into())
             .build();
 
