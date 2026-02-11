@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use neuromancer_core::agent::{RemediationAction, SubAgentReport};
 use neuromancer_core::error::NeuromancerError;
 use neuromancer_core::task::{Task, TaskId, TaskState};
-use neuromancer_core::trigger::TriggerEvent;
+use neuromancer_core::trigger::{TriggerEvent, TriggerPayload, TriggerSource};
 
 use crate::registry::AgentRegistry;
 use crate::remediation::{self, RemediationPolicy};
@@ -37,31 +37,31 @@ impl Orchestrator {
         let agent_id = self.router.resolve(&event, &self.registry).await?;
 
         let instruction = match &event.payload {
-            neuromancer_core::trigger::TriggerPayload::Message { text, .. } => text.clone(),
-            neuromancer_core::trigger::TriggerPayload::CronFire {
+            TriggerPayload::Message { text, .. } => text.clone(),
+            TriggerPayload::CronFire {
                 rendered_instruction,
                 ..
             } => rendered_instruction.clone(),
-            neuromancer_core::trigger::TriggerPayload::AdminCommand { instruction } => {
+            TriggerPayload::AdminCommand { instruction } => {
                 instruction.clone()
             }
-            neuromancer_core::trigger::TriggerPayload::A2aRequest { content, .. } => {
+            TriggerPayload::A2aRequest { content, .. } => {
                 content.to_string()
             }
         };
 
         let trigger_source = match &event.payload {
-            neuromancer_core::trigger::TriggerPayload::Message { .. } => {
-                neuromancer_core::trigger::TriggerSource::Discord
+            TriggerPayload::Message { .. } => {
+                TriggerSource::Discord
             }
-            neuromancer_core::trigger::TriggerPayload::CronFire { .. } => {
-                neuromancer_core::trigger::TriggerSource::Cron
+            TriggerPayload::CronFire { .. } => {
+                TriggerSource::Cron
             }
-            neuromancer_core::trigger::TriggerPayload::AdminCommand { .. } => {
-                neuromancer_core::trigger::TriggerSource::AdminApi
+            TriggerPayload::AdminCommand { .. } => {
+                TriggerSource::AdminApi
             }
-            neuromancer_core::trigger::TriggerPayload::A2aRequest { .. } => {
-                neuromancer_core::trigger::TriggerSource::A2a
+            TriggerPayload::A2aRequest { .. } => {
+                TriggerSource::A2a
             }
         };
 
