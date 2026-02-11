@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use gray_matter::engine::YAML;
 use gray_matter::Matter;
+use gray_matter::engine::YAML;
 
 use crate::SkillError;
 
@@ -17,6 +17,8 @@ pub struct SkillMetadata {
     pub execution: SkillExecution,
     /// Model preferences.
     pub models: SkillModels,
+    /// Local data sources consumed by the skill.
+    pub data_sources: SkillDataSources,
     /// Safeguard rules.
     pub safeguards: SkillSafeguards,
     /// Raw extra fields not captured above.
@@ -51,6 +53,12 @@ pub struct SkillModels {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct SkillDataSources {
+    pub markdown: Vec<String>,
+    pub csv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SkillSafeguards {
     pub human_approval: Vec<String>,
 }
@@ -74,11 +82,9 @@ fn extract_metadata(pod: &gray_matter::Pod) -> Result<SkillMetadata, SkillError>
         .as_hashmap()
         .map_err(|_| SkillError::ParseError("frontmatter is not a mapping".into()))?;
 
-    let name = get_string(&hash, "name")
-        .ok_or_else(|| SkillError::MissingField("name".into()))?;
+    let name = get_string(&hash, "name").ok_or_else(|| SkillError::MissingField("name".into()))?;
     let version = get_string(&hash, "version").unwrap_or_else(|| "0.0.0".into());
-    let description =
-        get_string(&hash, "description").unwrap_or_default();
+    let description = get_string(&hash, "description").unwrap_or_default();
 
     // Parse metadata.neuromancer section.
     let neuromancer = hash
@@ -87,11 +93,12 @@ fn extract_metadata(pod: &gray_matter::Pod) -> Result<SkillMetadata, SkillError>
         .and_then(|m| m.get("neuromancer").cloned())
         .and_then(|n| n.as_hashmap().ok());
 
-    let (requires, execution, models, safeguards) = if let Some(nm) = neuromancer {
+    let (requires, execution, models, data_sources, safeguards) = if let Some(nm) = neuromancer {
         (
             parse_requires(&nm),
             parse_execution(&nm),
             parse_models(&nm),
+            parse_data_sources(&nm),
             parse_safeguards(&nm),
         )
     } else {
@@ -99,6 +106,7 @@ fn extract_metadata(pod: &gray_matter::Pod) -> Result<SkillMetadata, SkillError>
             SkillRequires::default(),
             SkillExecution::default(),
             SkillModels::default(),
+            SkillDataSources::default(),
             SkillSafeguards::default(),
         )
     };
@@ -110,15 +118,14 @@ fn extract_metadata(pod: &gray_matter::Pod) -> Result<SkillMetadata, SkillError>
         requires,
         execution,
         models,
+        data_sources,
         safeguards,
         extra: HashMap::new(),
     })
 }
 
 fn parse_requires(nm: &HashMap<String, gray_matter::Pod>) -> SkillRequires {
-    let req = nm
-        .get("requires")
-        .and_then(|r| r.as_hashmap().ok());
+    let req = nm.get("requires").and_then(|r| r.as_hashmap().ok());
 
     match req {
         Some(r) => SkillRequires {
@@ -131,9 +138,7 @@ fn parse_requires(nm: &HashMap<String, gray_matter::Pod>) -> SkillRequires {
 }
 
 fn parse_execution(nm: &HashMap<String, gray_matter::Pod>) -> SkillExecution {
-    let exec = nm
-        .get("execution")
-        .and_then(|e| e.as_hashmap().ok());
+    let exec = nm.get("execution").and_then(|e| e.as_hashmap().ok());
 
     match exec {
         Some(e) => SkillExecution {
@@ -145,9 +150,7 @@ fn parse_execution(nm: &HashMap<String, gray_matter::Pod>) -> SkillExecution {
 }
 
 fn parse_models(nm: &HashMap<String, gray_matter::Pod>) -> SkillModels {
-    let m = nm
-        .get("models")
-        .and_then(|m| m.as_hashmap().ok());
+    let m = nm.get("models").and_then(|m| m.as_hashmap().ok());
 
     match m {
         Some(m) => SkillModels {
@@ -157,10 +160,20 @@ fn parse_models(nm: &HashMap<String, gray_matter::Pod>) -> SkillModels {
     }
 }
 
+fn parse_data_sources(nm: &HashMap<String, gray_matter::Pod>) -> SkillDataSources {
+    let ds = nm.get("data_sources").and_then(|m| m.as_hashmap().ok());
+
+    match ds {
+        Some(ds) => SkillDataSources {
+            markdown: get_string_vec(&ds, "markdown"),
+            csv: get_string_vec(&ds, "csv"),
+        },
+        None => SkillDataSources::default(),
+    }
+}
+
 fn parse_safeguards(nm: &HashMap<String, gray_matter::Pod>) -> SkillSafeguards {
-    let s = nm
-        .get("safeguards")
-        .and_then(|s| s.as_hashmap().ok());
+    let s = nm.get("safeguards").and_then(|s| s.as_hashmap().ok());
 
     match s {
         Some(s) => SkillSafeguards {
@@ -206,6 +219,9 @@ metadata:
       network: "egress-web"
     models:
       preferred: "browser_model"
+    data_sources:
+      markdown: ["data/bills.md"]
+      csv: ["data/accounts.csv"]
     safeguards:
       human_approval:
         - "purchase"
@@ -224,13 +240,12 @@ Instructions for the agent to browse and summarize a page.
         assert_eq!(meta.description, "Browse a page and summarize it");
         assert_eq!(meta.requires.mcp_servers, vec!["playwright"]);
         assert!(meta.requires.secrets.is_empty());
-        assert_eq!(
-            meta.requires.memory_partitions,
-            vec!["workspace:default"]
-        );
+        assert_eq!(meta.requires.memory_partitions, vec!["workspace:default"]);
         assert_eq!(meta.execution.mode, "isolated");
         assert_eq!(meta.execution.network.as_deref(), Some("egress-web"));
         assert_eq!(meta.models.preferred.as_deref(), Some("browser_model"));
+        assert_eq!(meta.data_sources.markdown, vec!["data/bills.md"]);
+        assert_eq!(meta.data_sources.csv, vec!["data/accounts.csv"]);
         assert_eq!(
             meta.safeguards.human_approval,
             vec!["purchase", "file_write_outside_workspace"]
@@ -250,6 +265,8 @@ Do something simple.
         assert_eq!(meta.version, "0.0.0");
         assert!(meta.requires.mcp_servers.is_empty());
         assert_eq!(meta.execution.mode, "isolated");
+        assert!(meta.data_sources.markdown.is_empty());
+        assert!(meta.data_sources.csv.is_empty());
         assert!(body.contains("Do something simple."));
     }
 

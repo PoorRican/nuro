@@ -9,7 +9,7 @@ use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, RpcCommand, TaskCommand};
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
-use neuromancer_core::rpc::{TaskCancelParams, TaskGetParams, TaskSubmitParams};
+use neuromancer_core::rpc::{MessageSendParams, TaskCancelParams, TaskGetParams, TaskSubmitParams};
 use rpc_client::RpcClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +171,15 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                 Ok(serde_json::json!(result))
             }
         },
+        Command::Message(args) => {
+            let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
+            let response = rpc
+                .message_send(MessageSendParams {
+                    message: args.message,
+                })
+                .await?;
+            Ok(serde_json::json!(response))
+        }
     }
 }
 

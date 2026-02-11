@@ -11,13 +11,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, watch};
 
+use crate::message_runtime::{MessageRuntime, MessageRuntimeError};
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    TaskCancelParams, TaskCancelResult, TaskGetParams, TaskGetResult, TaskListResult,
-    TaskSubmitParams, TaskSubmitResult, TaskSummaryDto,
+    MessageSendParams, TaskCancelParams, TaskCancelResult, TaskGetParams, TaskGetResult,
+    TaskListResult, TaskSubmitParams, TaskSubmitResult, TaskSummaryDto,
 };
 
 /// Shared application state accessible by all admin API handlers.
@@ -27,6 +28,7 @@ pub struct AppState {
     pub start_time: Instant,
     pub config_reload_tx: watch::Sender<()>,
     pub submitted_tasks: Arc<RwLock<HashMap<String, TaskSummary>>>,
+    pub message_runtime: Option<Arc<MessageRuntime>>,
 }
 
 /// Build the admin API axum router.
@@ -320,6 +322,13 @@ async fn dispatch_rpc(
                 }
             }
         }
+        "message.send" => match parse_params::<MessageSendParams>(params) {
+            Ok(req) => match op_message_send(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
         _ => Err(RpcMethodError::method_not_found(format!(
             "Method '{}' not found",
             method
@@ -358,6 +367,33 @@ fn require_no_params_or_empty_object(
 fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, RpcMethodError> {
     serde_json::to_value(value)
         .map_err(|e| RpcMethodError::generic(format!("serialization error: {e}")))
+}
+
+async fn op_message_send(
+    state: &AppState,
+    params: MessageSendParams,
+) -> Result<neuromancer_core::rpc::MessageSendResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .send_message(params.message)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+fn map_message_runtime_error(err: MessageRuntimeError) -> RpcMethodError {
+    if err.is_invalid_request() {
+        return RpcMethodError::invalid_params(err.to_string());
+    }
+    if err.is_resource_not_found() {
+        return RpcMethodError::resource_not_found(err.to_string());
+    }
+
+    RpcMethodError::internal(err.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +601,7 @@ mod tests {
             start_time: Instant::now(),
             config_reload_tx: reload_tx,
             submitted_tasks: Arc::new(RwLock::new(HashMap::new())),
+            message_runtime: None,
         }
     }
 
@@ -823,5 +860,22 @@ mod tests {
         )
         .expect("valid post-cancel get result");
         assert_eq!(after_cancel.task.state, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn rpc_message_send_requires_runtime() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "message.send",
+                "params": {"message": "hello"}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
     }
 }

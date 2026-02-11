@@ -130,6 +130,21 @@ pub struct ConfigReloadResult {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendParams {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendResult {
+    pub task_id: String,
+    pub assigned_agent: String,
+    pub state: String,
+    pub summary: String,
+    pub response: String,
+    pub tool_usage: std::collections::HashMap<String, u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +172,25 @@ mod tests {
         let decoded: JsonRpcResponse =
             serde_json::from_str(&encoded).expect("response should deserialize");
         assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn message_send_result_roundtrip() {
+        let result = MessageSendResult {
+            task_id: "task-1".to_string(),
+            assigned_agent: "finance_manager".to_string(),
+            state: "completed".to_string(),
+            summary: "summary".to_string(),
+            response: "response".to_string(),
+            tool_usage: std::collections::HashMap::from([
+                ("manage-bills".to_string(), 1),
+                ("manage-accounts".to_string(), 1),
+            ]),
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: MessageSendResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
     }
 }

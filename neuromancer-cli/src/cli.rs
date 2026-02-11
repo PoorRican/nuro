@@ -49,6 +49,7 @@ pub enum Command {
         #[command(subcommand)]
         command: E2eCommand,
     },
+    Message(MessageArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +147,12 @@ pub struct E2eSmokeArgs {
     pub pid_file: PathBuf,
 }
 
+#[derive(Debug, Args)]
+pub struct MessageArgs {
+    /// Single user message routed via daemon orchestrator.
+    pub message: String,
+}
+
 fn parse_duration(input: &str) -> Result<Duration, String> {
     humantime::parse_duration(input).map_err(|err| err.to_string())
 }
@@ -208,5 +215,18 @@ mod tests {
         let cli =
             Cli::try_parse_from(["neuroctl", "--timeout", "3s", "health"]).expect("cli parse");
         assert_eq!(cli.timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn parses_message_command() {
+        let cli = Cli::try_parse_from(["neuroctl", "message", "what should I pay?"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Message(args) => {
+                assert_eq!(args.message, "what should I pay?");
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

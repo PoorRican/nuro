@@ -90,6 +90,96 @@ enabled = true
     config_path
 }
 
+fn write_finance_config(dir: &Path, bind_addr: &str) -> PathBuf {
+    let config_path = dir.join("neuromancer-finance.toml");
+    let config = format!(
+        r#"
+[global]
+instance_id = "finance-test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[routing]
+default_agent = "finance_manager"
+rules = []
+
+[agents.finance_manager]
+models.executor = "executor"
+capabilities.skills = ["manage-bills", "manage-accounts"]
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+        bind_addr
+    );
+
+    fs::write(&config_path, config).expect("finance config should be written");
+    config_path
+}
+
+fn write_finance_xdg_files(home: &Path) {
+    let skills_root = home.join(".config/neuromancer/skills");
+    let bills_skill = skills_root.join("manage-bills");
+    let accounts_skill = skills_root.join("manage-accounts");
+    fs::create_dir_all(&bills_skill).expect("create bills skill dir");
+    fs::create_dir_all(&accounts_skill).expect("create accounts skill dir");
+
+    fs::write(
+        bills_skill.join("SKILL.md"),
+        r#"---
+name: "manage-bills"
+version: "0.1.0"
+description: "Read personal bills markdown"
+metadata:
+  neuromancer:
+    data_sources:
+      markdown: ["data/bills.md"]
+---
+Read bills markdown and summarize due items.
+"#,
+    )
+    .expect("write manage-bills skill");
+
+    fs::write(
+        accounts_skill.join("SKILL.md"),
+        r#"---
+name: "manage-accounts"
+version: "0.1.0"
+description: "Read account balances from CSV"
+metadata:
+  neuromancer:
+    data_sources:
+      csv: ["data/accounts.csv"]
+---
+Read accounts csv and report available balances.
+"#,
+    )
+    .expect("write manage-accounts skill");
+
+    let data_dir = home.join(".local/neuromancer/data");
+    fs::create_dir_all(&data_dir).expect("create local data dir");
+    fs::write(
+        data_dir.join("bills.md"),
+        "# Bills\n- rent: $1200 due 2026-03-01\n- internet: $80 due 2026-02-20\n",
+    )
+    .expect("write bills markdown");
+    fs::write(
+        data_dir.join("accounts.csv"),
+        "account,balance\nchecking,3400.50\nsavings,1200.00\n",
+    )
+    .expect("write accounts csv");
+}
+
 fn parse_json_output(output: &[u8]) -> Value {
     serde_json::from_slice(output).expect("command output should be valid json")
 }
@@ -408,4 +498,76 @@ fn usage_errors_use_exit_code_2() {
         .arg("not-json")
         .assert()
         .code(2);
+}
+
+#[test]
+fn message_command_routes_via_orchestrator_and_skills() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    write_finance_xdg_files(&home);
+
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_finance_config(temp.path(), &bind_addr);
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+
+    neuroctl()
+        .env("HOME", &home)
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .assert()
+        .success();
+
+    let output = neuroctl()
+        .env("HOME", &home)
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("message")
+        .arg("What bills should I pay first and do I have enough cash?")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert_eq!(
+        json["result"]["assigned_agent"],
+        Value::String("finance_manager".to_string())
+    );
+    assert_eq!(
+        json["result"]["tool_usage"]["manage-bills"],
+        Value::Number(1_u64.into())
+    );
+    assert_eq!(
+        json["result"]["tool_usage"]["manage-accounts"],
+        Value::Number(1_u64.into())
+    );
+
+    neuroctl()
+        .env("HOME", &home)
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("stop")
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .assert()
+        .success();
 }

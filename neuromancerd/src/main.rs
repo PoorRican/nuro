@@ -1,17 +1,19 @@
 mod admin;
 mod config;
+mod message_runtime;
 mod shutdown;
 mod telemetry;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
+use tracing::warn;
 use tracing::{error, info};
 
 /// Neuromancer daemon — deterministic orchestrator for rig-powered sub-agents.
@@ -72,16 +74,27 @@ async fn main() -> Result<()> {
     // 4. (Stub) Open databases, init secrets broker, MCP pool, agent registry,
     //    triggers. These will be integrated as sibling crates are completed.
     // -----------------------------------------------------------------------
-    info!("stub: databases, secrets broker, MCP pool, agent registry, triggers not yet initialized");
+    info!(
+        "stub: databases, secrets broker, MCP pool, agent registry, triggers not yet initialized"
+    );
 
     // -----------------------------------------------------------------------
     // 5. Start admin API server
     // -----------------------------------------------------------------------
+    let message_runtime = match message_runtime::MessageRuntime::new(&initial_config).await {
+        Ok(runtime) => Some(Arc::new(runtime)),
+        Err(err) => {
+            warn!(error = %err, "message runtime unavailable; message.send RPC will fail");
+            None
+        }
+    };
+
     let admin_state = admin::AppState {
         config: config.clone(),
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
         submitted_tasks: Arc::new(RwLock::new(HashMap::new())),
+        message_runtime,
     };
 
     let admin_router = admin::admin_router(admin_state);

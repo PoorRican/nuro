@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    TaskCancelParams, TaskCancelResult, TaskGetParams, TaskGetResult, TaskListResult,
-    TaskSubmitParams, TaskSubmitResult,
+    MessageSendParams, MessageSendResult, TaskCancelParams, TaskCancelResult, TaskGetParams,
+    TaskGetResult, TaskListResult, TaskSubmitParams, TaskSubmitResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -157,6 +157,20 @@ impl RpcClient {
 
     pub async fn config_reload(&self) -> Result<ConfigReloadResult, RpcClientError> {
         self.call_typed("admin.config.reload", None).await
+    }
+
+    pub async fn message_send(
+        &self,
+        params: MessageSendParams,
+    ) -> Result<MessageSendResult, RpcClientError> {
+        self.call_typed(
+            "message.send",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
     }
 }
 
