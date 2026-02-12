@@ -12,6 +12,7 @@ pub struct RoutingRule {
 }
 
 /// Criteria for matching a trigger event to a routing rule.
+// NOTE: this contains discord-specific data which should not be present
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoutingMatch {
     pub channel_id: Option<String>,

@@ -106,6 +106,7 @@ impl AgentRegistry {
     }
 
     /// Dispatch a task to an agent via its channel.
+    // NOTE: errors should be typed
     pub async fn dispatch(
         &mut self,
         agent_id: &AgentId,
@@ -117,6 +118,7 @@ impl AgentRegistry {
             .ok_or_else(|| format!("agent '{agent_id}' not found"))?;
 
         // Check circuit breaker
+        // NOTE: what opens the circuit_breaker?
         if let Some(cb) = &entry.circuit_breaker {
             if cb.is_open() {
                 return Err(format!("agent '{agent_id}' circuit breaker is open"));

@@ -33,6 +33,8 @@ impl Orchestrator {
     }
 
     /// Route a trigger event: determine the target agent and create a task.
+    // NOTE: router should be a model by default. `event.route_hint` is implied to be a suggestion,
+    // but it seems to be a command
     pub async fn route(&mut self, event: TriggerEvent) -> Result<TaskId, NeuromancerError> {
         let agent_id = self.router.resolve(&event, &self.registry).await?;
 
@@ -171,6 +173,7 @@ impl Orchestrator {
                 );
                 // In production, this would send a message via the trigger channel.
                 // For now, log and suspend the task.
+                // TODO: [low pri] implement escalation
                 self.task_queue.update_state(task_id, TaskState::Suspended);
             }
 
@@ -183,12 +186,13 @@ impl Orchestrator {
                     "granting temporary capability"
                 );
                 // In production, this would issue a scoped grant.
-                // Re-enqueue to retry with the grant.
+                // TODO: [low pri] Re-enqueue to retry with the grant.
                 if !self.task_queue.requeue(task_id) {
                     tracing::warn!(task_id = %task_id, "temporary grant requested but task was not re-queued");
                 }
             }
 
+            // NOTE: where does this come from? This implies a model-based router
             RemediationAction::Clarify {
                 additional_context,
             } => {

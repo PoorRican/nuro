@@ -8,6 +8,7 @@ use neuromancer_core::trigger::TriggerEvent;
 use crate::registry::AgentRegistry;
 
 /// Extracts message text from a trigger event payload for LLM classification.
+// NOTE: message text should be extracted from all payloads
 fn extract_message_text(event: &TriggerEvent) -> Option<String> {
     match &event.payload {
         neuromancer_core::trigger::TriggerPayload::Message { text, .. } => Some(text.clone()),
@@ -27,6 +28,7 @@ pub struct Router {
 }
 
 /// Trait for the LLM-based intent classifier used as routing fallback.
+// NOTE: this is a good trait, but should be named to `LlmDynamicRouter`
 #[async_trait::async_trait]
 pub trait LlmClassifier: Send + Sync {
     /// Given a message and a list of (agent_id, description) pairs,

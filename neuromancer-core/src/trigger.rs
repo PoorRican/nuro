@@ -6,6 +6,7 @@ use crate::agent::AgentId;
 /// Identity of the entity that produced a trigger event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Principal {
+    // NOTE: DiscordUser should be more generic. And what is the distinction from `Admin`?
     DiscordUser { user_id: String, guild_id: Option<String> },
     System,
     Cron { job_id: String },
@@ -17,6 +18,7 @@ pub enum Principal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerSource {
+    // NOTE: make generic
     Discord,
     Cron,
     A2a,

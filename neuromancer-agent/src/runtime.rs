@@ -61,12 +61,15 @@ impl AgentRuntime {
         };
 
         // Build initial conversation context
+        // NOTE: [med pri] this is good. See if there are conventions which may be borrowed from OpenClaw
         let mut conversation = ConversationContext::new(
             128_000, // default token budget
             TruncationStrategy::SlidingWindow { keep_last: 50 },
         );
 
         // Add system prompt
+        // NOTE: [med pri] additional Markdown stack (eg: SOUL.md, USER.md, etc) would be compiled here.
+        // Ideally, these would be part of the config and included in `agent_ctx`
         let system_prompt = self.build_system_prompt();
         conversation.add_message(ChatMessage::system(&system_prompt));
 
@@ -75,6 +78,7 @@ impl AgentRuntime {
 
         // Gather available tool definitions
         let tool_specs = self.tool_broker.list_tools(&agent_ctx).await;
+        // NOTE: [low pri] shouldn't this be done in advance?
         let tool_defs = specs_to_rig_definitions(&tool_specs);
 
         let max_iterations = self.config.max_iterations;
@@ -104,6 +108,7 @@ impl AgentRuntime {
             );
 
             // Thinking: call LLM
+            // NOTE: [low pri] should this log something?
             conversation.maybe_truncate();
             let rig_messages = conversation.to_rig_messages();
 
@@ -270,6 +275,7 @@ fn specs_to_rig_definitions(specs: &[ToolSpec]) -> Vec<rig::completion::ToolDefi
 }
 
 /// Truncate text to at most `max_len` characters for summaries.
+// NOTE: [low pri] ideally this would use another utility LLM
 fn truncate_summary(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()

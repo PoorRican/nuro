@@ -78,6 +78,7 @@ impl MessageRuntimeError {
 }
 
 pub struct MessageRuntime {
+    // NOTE: add a description as to what `inner` is
     inner: AsyncMutex<RuntimeInner>,
 }
 
@@ -194,6 +195,8 @@ impl MessageRuntime {
         }
 
         let mut inner = self.inner.lock().await;
+        // NOTE: this is a valid error. However, this indicates that configuration is not valid.
+        // this is an edge case that reflects a larger problem
         if inner.orchestrator.registry.is_empty() {
             return Err(MessageRuntimeError::Unavailable(
                 "no agents are registered in runtime".to_string(),
@@ -204,6 +207,7 @@ impl MessageRuntime {
             trigger_id: uuid::Uuid::new_v4().to_string(),
             occurred_at: Utc::now(),
             principal: Principal::Admin,
+            // NOTE: does this have to be an AdminCommand? What are the alternatives?
             payload: TriggerPayload::AdminCommand {
                 instruction: message,
             },
@@ -217,6 +221,13 @@ impl MessageRuntime {
             .await
             .map_err(|err| MessageRuntimeError::Routing(err.to_string()))?;
 
+        // NOTE: the current task queue execution loop has significant problems:
+        // - The task execution loop should be independent of `send_message`. Task execution should
+        // be independent of `send_message`. eg: there might have been tasks being executed before
+        // ththis specific invocation of `send_message`. Adding a task to the queue should provide
+        // a guarantee that it will be executed.
+        // - It prevents parallel operations. For example, another might be operating in the
+        // background (eg: from a cron-trigger, or long-running task)
         let mut assigned_agent: Option<String> = None;
         while let Some(task) = inner.orchestrator.task_queue.dequeue() {
             let agent_id = task.assigned_agent.clone();
@@ -257,6 +268,8 @@ impl MessageRuntime {
             usage_guard.remove(&task_id).unwrap_or_default()
         };
 
+        // NOTE: "required skills" is supposed to be the skills the sub-agent is _allowed_ to have,
+        // not skills that _must_ be used by the agent
         if let Some(required_skills) = inner.required_skills_by_agent.get(&assigned_agent) {
             for skill in required_skills {
                 if usage.get(skill).copied().unwrap_or(0) == 0 {
@@ -268,6 +281,8 @@ impl MessageRuntime {
             }
         }
 
+        // TODO: think about steering, and in what instances would it make sense to send interim
+        // messages back to the caller? Interim messages only make sense in user / chat contexts.
         Ok(MessageSendResult {
             task_id: task_id.to_string(),
             assigned_agent,
