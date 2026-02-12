@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Neuromancer is a deterministic orchestrator daemon that supervises isolated rig-powered sub-agents. It uses a hybrid control plane (deterministic routing + LLM-assisted fallback) with explicit security boundaries, encrypted secrets, partitioned memory, and OpenTelemetry observability.
+Neuromancer v0.1-alpha runs a CLI-first System0 orchestrator runtime in `neuromancerd`. System0 is an LLM agent instance (built with `neuromancer-agent`) that mediates user/admin turns, config/policy context, and delegation to sub-agents.
 
-**Key principle**: The orchestrator is a supervisor, not a planner. Sub-agents (via `rig`) perform all reasoning. The orchestrator routes, supervises, and remediates.
+**Key principle**: System0 is the single ingress orchestrator and conversation owner. Public ingress is turn-based (`orchestrator.turn`), while delegated runs are tracked internally.
 
 ## Build Commands
 
@@ -29,27 +29,29 @@ cargo run -p neuromancerd -- -c neuromancer.toml
 | Crate | Role |
 |-------|------|
 | `neuromancer-core` | Shared traits and types only (no implementations) |
-| `neuromancer-orchestrator` | Supervisor: routing, task queue, agent registry, remediation |
+| `neuromancer-orchestrator` | Routing/classification utilities used by orchestrator workflows |
 | `neuromancer-agent` | Rig-based agent runtime with state machine execution |
+| `neuromancer-cli` | `neuroctl` admin/ops CLI over JSON-RPC |
+| `neuromancerd` | Daemon binary: config, admin API, System0 runtime, telemetry, shutdown |
 | `neuromancer-a2a` | Agent-to-Agent HTTP protocol (Agent Card, tasks, SSE streaming) |
 | `neuromancer-mcp` | MCP client pool — manages MCP server lifecycle and tool caching |
 | `neuromancer-skills` | Skill loading from SKILL.md files with frontmatter metadata |
 | `neuromancer-triggers` | Event sources: Discord gateway + cron scheduling |
 | `neuromancer-memory-simple` | SQLite-backed `MemoryStore` implementation |
 | `neuromancer-secrets` | AES-encrypted SQLite `SecretsBroker` with ACL enforcement |
-| `neuromancerd` | Daemon binary: config, admin API, telemetry, shutdown |
 
 ## Architecture
 
 ### Control Flow
 ```
-Triggers (Discord/Cron/A2A/Admin)
-  → Orchestrator (TaskQueue → Router → AgentRegistry)
-    → AgentRuntime (state machine: Initializing→Thinking→Acting→Evaluating)
-      → ToolBroker (Skills/MCP/A2A tools, policy-gated)
-      → SecretsBroker (handle-based, never in LLM context)
-      → MemoryStore (partition-scoped)
-    ← SubAgentReport (back to orchestrator for remediation)
+CLI (`neuroctl orchestrator turn`)
+  → Admin JSON-RPC (`orchestrator.turn`)
+    → System0 input-message queue (`neuromancerd::message_runtime`)
+      → System0 `AgentRuntime::execute_turn(...)` (`neuromancer-agent`)
+        → System0ToolBroker allowlisted tools (policy/trigger gated)
+          → Delegation to sub-agent runtimes (internal task execution)
+        ← Delegated run updates (`running` → `completed`/`failed`)
+      ← `OrchestratorTurnResult { turn_id, response, delegated_runs }`
 ```
 
 ### Core Traits (in `neuromancer-core`)
@@ -61,18 +63,31 @@ These define the system's extension points — all in `neuromancer-core/src/`:
 - **`SecretsBroker`** (`secrets.rs`) — ACL-gated secret resolution. Agents reference secrets by handle; plaintext is injected (EnvVar/Header/FileMount) and zeroized after use.
 - **`PolicyEngine`** (`policy.rs`) — Stacked pre/post gates on tool calls and LLM calls.
 
-### Key Design Decisions
+### v0.1-alpha Runtime Decisions
 
-- **Three protocol standards, no custom ones**: MCP (tools), A2A (agent delegation), Skills (instructions as SKILL.md).
-- **Secrets never enter LLM context** — handle-based injection only, zeroized in memory via `secrecy`/`zeroize`.
-- **Deterministic routing first** — LLM classifier is fallback only, for ambiguous inputs.
-- **Circuit breaker pattern** in `AgentRegistry` prevents cascading agent failures.
-- **Partitioned memory** — agents only access explicitly granted partitions.
-- **Remediation policies** — orchestrator handles agent failures (retry, reassign, escalate, abort).
+- **No backward compatibility** for old message/task APIs and CLI command shapes.
+- **Public ingress is turn-based only**: `orchestrator.turn`.
+- **Public task APIs were removed**: `message.send`, `task.submit`, `task.list`, and `task.get`.
+- **Single conversation history is owned by `neuromancer-agent`** via in-memory session store.
+- **System0 uses allowlisted control-plane tools** and policy-gates actions by trigger type/capabilities.
+- **Queue split**: one public input-message queue plus internal delegated-run tracking.
+
+### RPC and CLI Surface
+
+- JSON-RPC methods:
+  - `orchestrator.turn`
+  - `orchestrator.runs.list`
+  - `orchestrator.runs.get`
+- CLI commands:
+  - `neuroctl orchestrator turn "<message>"`
+  - `neuroctl orchestrator runs list`
+  - `neuroctl orchestrator runs get <run_id>`
+
+Removed methods should return JSON-RPC method-not-found.
 
 ### State Machines
 
-**Task lifecycle** (`core/task.rs`): Queued → Dispatched → Running → Completed/Failed/Cancelled/Suspended
+**Delegated sub-agent task lifecycle** (`core/task.rs`): Queued → Dispatched → Running → Completed/Failed/Cancelled/Suspended
 
 **Agent execution** (`core/agent.rs`): Initializing → Thinking → Acting → WaitingForInput → Evaluating → Completed/Failed/Suspended
 
@@ -82,7 +97,16 @@ These define the system's extension points — all in `neuromancer-core/src/`:
 
 ## Configuration
 
-Single TOML file (`neuromancer.toml`) with sections: `[global]`, `[otel]`, `[secrets]`, `[memory]`, `[models.*]`, `[mcp_servers.*]`, `[a2a]`, `[routing]`, `[agents.*]`, `[triggers]`, `[admin_api]`. Config structs are in `neuromancer-core/src/config.rs` and `neuromancerd/src/config.rs`.
+Single TOML file (`neuromancer.toml`) with sections: `[global]`, `[otel]`, `[secrets]`, `[memory]`, `[models.*]`, `[mcp_servers.*]`, `[a2a]`, `[routing]`, `[orchestrator]`, `[agents.*]`, `[triggers]`, `[admin_api]`.
+
+For System0, `[orchestrator]` config controls:
+- executor model slot
+- allowlisted capabilities
+- orchestrator preamble
+- max iterations
+
+Canonical example: `docs/v0_1_alpha_config_example.toml`.
+Migration guide: `docs/v0_1_alpha_migration.md`.
 
 ## Key Dependencies
 
