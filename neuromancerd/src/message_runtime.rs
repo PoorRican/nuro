@@ -57,6 +57,7 @@ impl MessageRuntimeError {
 
 pub struct MessageRuntime {
     turn_tx: mpsc::Sender<TurnRequest>,
+    system0_broker: System0ToolBroker,
     _turn_worker: tokio::task::JoinHandle<()>,
     _report_worker: tokio::task::JoinHandle<()>,
 }
@@ -160,6 +161,7 @@ impl MessageRuntime {
             config_snapshot,
             &config.orchestrator.capabilities.skills,
         );
+        let runtime_broker = system0_broker.clone();
 
         let orchestrator_config = build_orchestrator_config(config);
         let orchestrator_llm = build_llm_client(config, &orchestrator_config)?;
@@ -192,6 +194,7 @@ impl MessageRuntime {
 
         Ok(Self {
             turn_tx,
+            system0_broker: runtime_broker,
             _turn_worker: turn_worker,
             _report_worker: report_worker,
         })
@@ -224,6 +227,26 @@ impl MessageRuntime {
             })?;
 
         received.map_err(|_| MessageRuntimeError::Unavailable("turn worker stopped".to_string()))?
+    }
+
+    pub async fn orchestrator_runs_list(&self) -> Result<Vec<DelegatedRun>, MessageRuntimeError> {
+        Ok(self.system0_broker.list_runs().await)
+    }
+
+    pub async fn orchestrator_run_get(
+        &self,
+        run_id: String,
+    ) -> Result<DelegatedRun, MessageRuntimeError> {
+        if run_id.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "run_id must not be empty".to_string(),
+            ));
+        }
+
+        self.system0_broker
+            .get_run(&run_id)
+            .await
+            .ok_or_else(|| MessageRuntimeError::ResourceNotFound(format!("run '{run_id}'")))
     }
 }
 
@@ -268,6 +291,8 @@ struct System0BrokerInner {
     current_trigger_type: TriggerType,
     current_turn_id: uuid::Uuid,
     runs_by_turn: HashMap<uuid::Uuid, Vec<DelegatedRun>>,
+    runs_index: HashMap<String, DelegatedRun>,
+    runs_order: Vec<String>,
     running_agents: HashMap<String, String>,
 }
 
@@ -298,6 +323,8 @@ impl System0ToolBroker {
                 current_trigger_type: TriggerType::Admin,
                 current_turn_id: uuid::Uuid::nil(),
                 runs_by_turn: HashMap::new(),
+                runs_index: HashMap::new(),
+                runs_order: Vec::new(),
                 running_agents: HashMap::new(),
             })),
         }
@@ -313,6 +340,20 @@ impl System0ToolBroker {
     async fn take_runs(&self, turn_id: uuid::Uuid) -> Vec<DelegatedRun> {
         let mut inner = self.inner.lock().await;
         inner.runs_by_turn.remove(&turn_id).unwrap_or_default()
+    }
+
+    async fn list_runs(&self) -> Vec<DelegatedRun> {
+        let inner = self.inner.lock().await;
+        inner
+            .runs_order
+            .iter()
+            .filter_map(|run_id| inner.runs_index.get(run_id).cloned())
+            .collect()
+    }
+
+    async fn get_run(&self, run_id: &str) -> Option<DelegatedRun> {
+        let inner = self.inner.lock().await;
+        inner.runs_index.get(run_id).cloned()
     }
 
     fn build_tool_specs() -> Vec<ToolSpec> {
@@ -482,6 +523,16 @@ impl ToolBroker for System0ToolBroker {
                 inner
                     .running_agents
                     .insert(agent_id.clone(), run_id.clone());
+                inner.runs_index.insert(
+                    run_id.clone(),
+                    DelegatedRun {
+                        run_id: run_id.clone(),
+                        agent_id: agent_id.clone(),
+                        state: "running".to_string(),
+                        summary: None,
+                    },
+                );
+                inner.runs_order.push(run_id.clone());
                 drop(inner);
 
                 let mut task = Task::new(TriggerSource::Internal, instruction, agent_id.clone());
@@ -510,6 +561,7 @@ impl ToolBroker for System0ToolBroker {
                     .entry(turn_id)
                     .or_default()
                     .push(run.clone());
+                inner.runs_index.insert(run.run_id.clone(), run.clone());
 
                 Ok(ToolResult {
                     call_id: call.id,

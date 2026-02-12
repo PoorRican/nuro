@@ -15,6 +15,7 @@ use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
     OrchestratorTurnParams, OrchestratorTurnResult,
 };
 
@@ -67,6 +68,39 @@ async fn op_orchestrator_turn(
         .orchestrator_turn(params.message)
         .await
         .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_runs_list(
+    state: &AppState,
+) -> Result<OrchestratorRunsListResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    let runs = runtime
+        .orchestrator_runs_list()
+        .await
+        .map_err(map_message_runtime_error)?;
+    Ok(OrchestratorRunsListResult { runs })
+}
+
+async fn op_orchestrator_run_get(
+    state: &AppState,
+    params: OrchestratorRunGetParams,
+) -> Result<OrchestratorRunGetResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    let run = runtime
+        .orchestrator_run_get(params.run_id)
+        .await
+        .map_err(map_message_runtime_error)?;
+    Ok(OrchestratorRunGetResult { run })
 }
 
 #[derive(Debug)]
@@ -203,6 +237,23 @@ async fn dispatch_rpc(
             },
             Err(err) => Err(err),
         },
+        "orchestrator.runs.list" => {
+            if let Err(err) = require_no_params_or_empty_object(params.as_ref()) {
+                Err(err)
+            } else {
+                match op_orchestrator_runs_list(state).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                }
+            }
+        }
+        "orchestrator.runs.get" => match parse_params::<OrchestratorRunGetParams>(params) {
+            Ok(req) => match op_orchestrator_run_get(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
         _ => Err(RpcMethodError::method_not_found(format!(
             "Method '{}' not found",
             method
@@ -325,9 +376,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_task_methods_return_method_not_found() {
+    async fn rpc_orchestrator_runs_list_requires_runtime() {
         let state = test_state();
         let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "orchestrator.runs.list"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn rpc_orchestrator_runs_get_requires_run_id_param() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "orchestrator.runs.get",
+                "params": {}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn removed_legacy_methods_return_method_not_found() {
+        let state = test_state();
+        let (_status, task_response) = rpc_json(
             &state,
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -339,7 +423,23 @@ mod tests {
         .await;
 
         assert_eq!(
-            response.error.expect("error").code,
+            task_response.error.expect("error").code,
+            JSON_RPC_METHOD_NOT_FOUND
+        );
+
+        let (_status, message_response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "message.send",
+                "params": {"message": "legacy"}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            message_response.error.expect("error").code,
             JSON_RPC_METHOD_NOT_FOUND
         );
     }
