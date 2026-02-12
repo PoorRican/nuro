@@ -227,6 +227,49 @@ fn orchestrator_turn_command_routes_via_rpc() {
             .is_empty()
     );
 
+    let runs_output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("orchestrator")
+        .arg("runs")
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let runs_json = parse_json_output(&runs_output);
+    assert_eq!(runs_json["ok"], Value::Bool(true));
+    let run_id = runs_json["result"]["runs"]
+        .as_array()
+        .and_then(|runs| runs.first())
+        .and_then(|run| run["run_id"].as_str())
+        .expect("at least one delegated run should be tracked")
+        .to_string();
+
+    let run_get_output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("orchestrator")
+        .arg("runs")
+        .arg("get")
+        .arg(&run_id)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let run_get_json = parse_json_output(&run_get_output);
+    assert_eq!(run_get_json["ok"], Value::Bool(true));
+    assert_eq!(
+        run_get_json["result"]["run"]["run_id"].as_str(),
+        Some(run_id.as_str())
+    );
+
     neuroctl()
         .arg("--json")
         .arg("--addr")

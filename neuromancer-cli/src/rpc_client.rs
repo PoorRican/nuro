@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
     OrchestratorTurnParams, OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
@@ -121,6 +122,24 @@ impl RpcClient {
     ) -> Result<OrchestratorTurnResult, RpcClientError> {
         self.call_typed(
             "orchestrator.turn",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_runs_list(&self) -> Result<OrchestratorRunsListResult, RpcClientError> {
+        self.call_typed("orchestrator.runs.list", None).await
+    }
+
+    pub async fn orchestrator_run_get(
+        &self,
+        params: OrchestratorRunGetParams,
+    ) -> Result<OrchestratorRunGetResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.runs.get",
             Some(
                 serde_json::to_value(params)
                     .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,

@@ -7,11 +7,12 @@ mod rpc_client;
 use clap::Parser;
 
 use cli::{
-    Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand, RpcCommand,
+    Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
+    OrchestratorRunsCommand, RpcCommand,
 };
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
-use neuromancer_core::rpc::OrchestratorTurnParams;
+use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
 use rpc_client::RpcClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +151,20 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                         .await?;
                     Ok(serde_json::json!(response))
                 }
+                OrchestratorCommand::Runs { command } => match command {
+                    OrchestratorRunsCommand::List => {
+                        let response = rpc.orchestrator_runs_list().await?;
+                        Ok(serde_json::json!(response))
+                    }
+                    OrchestratorRunsCommand::Get(args) => {
+                        let response = rpc
+                            .orchestrator_run_get(OrchestratorRunGetParams {
+                                run_id: args.run_id,
+                            })
+                            .await?;
+                        Ok(serde_json::json!(response))
+                    }
+                },
             }
         }
     }

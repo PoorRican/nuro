@@ -127,12 +127,28 @@ pub struct E2eSmokeArgs {
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorCommand {
     Turn(OrchestratorTurnArgs),
+    Runs {
+        #[command(subcommand)]
+        command: OrchestratorRunsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorRunsCommand {
+    List,
+    Get(OrchestratorRunGetArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct OrchestratorTurnArgs {
     /// Execute one System0 orchestrator turn.
     pub message: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorRunGetArgs {
+    /// Delegated run id returned by `orchestrator turn`.
+    pub run_id: String,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -189,6 +205,38 @@ mod tests {
             } => {
                 assert_eq!(args.message, "what should I pay first?");
             }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_runs_get_command() {
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "runs", "get", "run-123"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Runs { command },
+            } => match command {
+                OrchestratorRunsCommand::Get(args) => assert_eq!(args.run_id, "run-123"),
+                other => panic!("unexpected runs command parsed: {other:?}"),
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_runs_list_command() {
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "runs", "list"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Runs { command },
+            } => match command {
+                OrchestratorRunsCommand::List => {}
+                other => panic!("unexpected runs command parsed: {other:?}"),
+            },
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }
