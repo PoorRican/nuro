@@ -80,69 +80,28 @@ pub struct HealthResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSummaryDto {
-    pub id: String,
-    pub instruction: String,
-    pub assigned_agent: String,
-    pub state: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSubmitParams {
-    pub instruction: String,
-    pub agent: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSubmitResult {
-    pub task_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskListResult {
-    pub tasks: Vec<TaskSummaryDto>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskGetParams {
-    pub task_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskGetResult {
-    pub task: TaskSummaryDto,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskCancelParams {
-    pub task_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskCancelResult {
-    pub status: String,
-    pub task_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigReloadResult {
     pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageSendParams {
+pub struct OrchestratorTurnParams {
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageSendResult {
-    pub task_id: String,
-    pub assigned_agent: String,
+pub struct DelegatedRun {
+    pub run_id: String,
+    pub agent_id: String,
     pub state: String,
-    pub summary: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorTurnResult {
+    pub turn_id: String,
     pub response: String,
-    pub tool_usage: std::collections::HashMap<String, u32>,
+    pub delegated_runs: Vec<DelegatedRun>,
 }
 
 #[cfg(test)]
@@ -153,8 +112,8 @@ mod tests {
     fn jsonrpc_request_roundtrip_supports_string_id() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
-            method: "task.get".to_string(),
-            params: Some(serde_json::json!({ "task_id": "abc" })),
+            method: "orchestrator.turn".to_string(),
+            params: Some(serde_json::json!({ "message": "hello" })),
             id: Some(JsonRpcId::String("req-1".to_string())),
         };
 
@@ -175,21 +134,20 @@ mod tests {
     }
 
     #[test]
-    fn message_send_result_roundtrip() {
-        let result = MessageSendResult {
-            task_id: "task-1".to_string(),
-            assigned_agent: "finance_manager".to_string(),
-            state: "completed".to_string(),
-            summary: "summary".to_string(),
+    fn orchestrator_turn_result_roundtrip() {
+        let result = OrchestratorTurnResult {
+            turn_id: "turn-1".to_string(),
             response: "response".to_string(),
-            tool_usage: std::collections::HashMap::from([
-                ("manage-bills".to_string(), 1),
-                ("manage-accounts".to_string(), 1),
-            ]),
+            delegated_runs: vec![DelegatedRun {
+                run_id: "run-1".to_string(),
+                agent_id: "finance_manager".to_string(),
+                state: "completed".to_string(),
+                summary: Some("delegation summary".to_string()),
+            }],
         };
 
         let encoded = serde_json::to_string(&result).expect("result should serialize");
-        let decoded: MessageSendResult =
+        let decoded: OrchestratorTurnResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }

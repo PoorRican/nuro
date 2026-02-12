@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    MessageSendParams, MessageSendResult, TaskCancelParams, TaskCancelResult, TaskGetParams,
-    TaskGetResult, TaskListResult, TaskSubmitParams, TaskSubmitResult,
+    OrchestratorTurnParams, OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -112,59 +111,16 @@ impl RpcClient {
         self.call_typed("admin.health", None).await
     }
 
-    pub async fn task_submit(
-        &self,
-        params: TaskSubmitParams,
-    ) -> Result<TaskSubmitResult, RpcClientError> {
-        self.call_typed(
-            "task.submit",
-            Some(
-                serde_json::to_value(params)
-                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
-            ),
-        )
-        .await
-    }
-
-    pub async fn task_list(&self) -> Result<TaskListResult, RpcClientError> {
-        self.call_typed("task.list", None).await
-    }
-
-    pub async fn task_get(&self, params: TaskGetParams) -> Result<TaskGetResult, RpcClientError> {
-        self.call_typed(
-            "task.get",
-            Some(
-                serde_json::to_value(params)
-                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
-            ),
-        )
-        .await
-    }
-
-    pub async fn task_cancel(
-        &self,
-        params: TaskCancelParams,
-    ) -> Result<TaskCancelResult, RpcClientError> {
-        self.call_typed(
-            "task.cancel",
-            Some(
-                serde_json::to_value(params)
-                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
-            ),
-        )
-        .await
-    }
-
     pub async fn config_reload(&self) -> Result<ConfigReloadResult, RpcClientError> {
         self.call_typed("admin.config.reload", None).await
     }
 
-    pub async fn message_send(
+    pub async fn orchestrator_turn(
         &self,
-        params: MessageSendParams,
-    ) -> Result<MessageSendResult, RpcClientError> {
+        params: OrchestratorTurnParams,
+    ) -> Result<OrchestratorTurnResult, RpcClientError> {
         self.call_typed(
-            "message.send",
+            "orchestrator.turn",
             Some(
                 serde_json::to_value(params)
                     .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,

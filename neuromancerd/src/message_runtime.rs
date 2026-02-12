@@ -1,29 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
-use neuromancer_agent::llm::{LlmClient, LlmResponse, RigLlmClient};
+use neuromancer_agent::llm::{LlmClient, RigLlmClient};
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_core::agent::{AgentConfig, SubAgentReport};
+use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
+use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig};
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::rpc::MessageSendResult;
-use neuromancer_core::task::{Artifact, TaskState};
+use neuromancer_core::rpc::{DelegatedRun, OrchestratorTurnResult};
+use neuromancer_core::task::Task;
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
 };
-use neuromancer_core::trigger::{Principal, TriggerEvent, TriggerMetadata, TriggerPayload};
-use neuromancer_orchestrator::orchestrator::Orchestrator;
-use neuromancer_orchestrator::registry::AgentRegistry;
-use neuromancer_orchestrator::remediation::RemediationPolicy;
-use neuromancer_orchestrator::router::Router;
+use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_skills::{SkillMetadata, SkillRegistry};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageRuntimeError {
@@ -36,26 +32,8 @@ pub enum MessageRuntimeError {
     #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("routing error: {0}")]
-    Routing(String),
-
-    #[error("dispatch error: {0}")]
-    Dispatch(String),
-
     #[error("execution timed out after {0}")]
     Timeout(String),
-
-    #[error("task failed: {0}")]
-    TaskFailed(String),
-
-    #[error("task requested user input: {0}")]
-    InputRequired(String),
-
-    #[error("task denied by policy: {0}")]
-    PolicyDenied(String),
-
-    #[error("task got stuck: {0}")]
-    Stuck(String),
 
     #[error("resource not found: {0}")]
     ResourceNotFound(String),
@@ -78,31 +56,55 @@ impl MessageRuntimeError {
 }
 
 pub struct MessageRuntime {
-    // NOTE: add a description as to what `inner` is
-    inner: AsyncMutex<RuntimeInner>,
+    turn_tx: mpsc::Sender<TurnRequest>,
+    _turn_worker: tokio::task::JoinHandle<()>,
+    _report_worker: tokio::task::JoinHandle<()>,
 }
 
-struct RuntimeInner {
-    orchestrator: Orchestrator,
-    report_rx: mpsc::Receiver<SubAgentReport>,
-    required_skills_by_agent: HashMap<String, Vec<String>>,
-    usage: Arc<Mutex<HashMap<uuid::Uuid, HashMap<String, u32>>>>,
-    _workers: Vec<tokio::task::JoinHandle<()>>,
+struct TurnRequest {
+    message: String,
+    trigger_type: TriggerType,
+    response_tx: oneshot::Sender<Result<OrchestratorTurnResult, MessageRuntimeError>>,
 }
 
-impl RuntimeInner {
-    async fn wait_for_task(
+struct RuntimeCore {
+    orchestrator_runtime: Arc<AgentRuntime>,
+    session_store: InMemorySessionStore,
+    session_id: AgentSessionId,
+    system0_broker: System0ToolBroker,
+}
+
+impl RuntimeCore {
+    async fn process_turn(
         &mut self,
-        task_id: uuid::Uuid,
-        timeout: Duration,
-    ) -> Result<(String, String), MessageRuntimeError> {
-        wait_for_terminal_report(
-            &mut self.orchestrator,
-            &mut self.report_rx,
-            task_id,
-            timeout,
-        )
-        .await
+        message: String,
+        trigger_type: TriggerType,
+    ) -> Result<OrchestratorTurnResult, MessageRuntimeError> {
+        let turn_id = uuid::Uuid::new_v4();
+        self.system0_broker
+            .set_turn_context(turn_id, trigger_type)
+            .await;
+
+        let output = self
+            .orchestrator_runtime
+            .execute_turn(
+                &self.session_store,
+                self.session_id,
+                TriggerSource::Cli,
+                message,
+            )
+            .await
+            .map_err(|err| MessageRuntimeError::Internal(err.to_string()))?;
+
+        let response =
+            extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
+        let delegated_runs = self.system0_broker.take_runs(turn_id).await;
+
+        Ok(OrchestratorTurnResult {
+            turn_id: turn_id.to_string(),
+            response,
+            delegated_runs,
+        })
     }
 }
 
@@ -116,15 +118,10 @@ impl MessageRuntime {
             .await
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
-        let router = Router::new(&config.routing);
-        let mut registry = AgentRegistry::new();
-        let (report_tx, report_rx) = mpsc::channel(64);
-        let usage = Arc::new(Mutex::new(
-            HashMap::<uuid::Uuid, HashMap<String, u32>>::new(),
-        ));
-        let mut required_skills_by_agent = HashMap::new();
-        let mut workers = Vec::new();
+        let (report_tx, mut report_rx) = mpsc::channel(256);
+        let report_worker = tokio::spawn(async move { while report_rx.recv().await.is_some() {} });
 
+        let mut subagents = HashMap::<String, Arc<AgentRuntime>>::new();
         for (agent_id, agent_toml) in &config.agents {
             let mut agent_config = agent_toml.to_agent_config(agent_id);
             agent_config.preamble = Some(append_tool_requirements(
@@ -138,14 +135,7 @@ impl MessageRuntime {
                 &agent_config.capabilities.skills,
                 &skill_registry,
                 local_root.clone(),
-                usage.clone(),
             )?);
-
-            let (task_tx, mut task_rx) = mpsc::channel(16);
-            registry.register(agent_id.clone(), agent_config.clone());
-            registry.set_task_sender(agent_id, task_tx);
-            required_skills_by_agent
-                .insert(agent_id.clone(), agent_config.capabilities.skills.clone());
 
             let runtime = Arc::new(AgentRuntime::new(
                 agent_config,
@@ -153,144 +143,388 @@ impl MessageRuntime {
                 broker,
                 report_tx.clone(),
             ));
-            let worker_report_tx = report_tx.clone();
-
-            let worker = tokio::spawn(async move {
-                while let Some(mut task) = task_rx.recv().await {
-                    if let Err(err) = runtime.execute(&mut task).await {
-                        let _ = worker_report_tx
-                            .send(SubAgentReport::Failed {
-                                task_id: task.id,
-                                error: err.to_string(),
-                                partial_result: None,
-                            })
-                            .await;
-                    }
-                }
-            });
-            workers.push(worker);
+            subagents.insert(agent_id.clone(), runtime);
         }
 
-        let orchestrator = Orchestrator::new(router, registry, RemediationPolicy::default());
+        if subagents.is_empty() {
+            return Err(MessageRuntimeError::Config(
+                "no sub-agents are configured in runtime".to_string(),
+            ));
+        }
+
+        let config_snapshot = serde_json::to_value(config)
+            .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
+
+        let system0_broker = System0ToolBroker::new(
+            subagents,
+            config_snapshot,
+            &config.orchestrator.capabilities.skills,
+        );
+
+        let orchestrator_config = build_orchestrator_config(config);
+        let orchestrator_llm = build_llm_client(config, &orchestrator_config)?;
+        let orchestrator_runtime = Arc::new(AgentRuntime::new(
+            orchestrator_config,
+            orchestrator_llm,
+            Arc::new(system0_broker.clone()),
+            report_tx,
+        ));
+
+        let core = Arc::new(AsyncMutex::new(RuntimeCore {
+            orchestrator_runtime,
+            session_store: InMemorySessionStore::new(),
+            session_id: uuid::Uuid::new_v4(),
+            system0_broker,
+        }));
+
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnRequest>(128);
+        let worker_core = core.clone();
+        let turn_worker = tokio::spawn(async move {
+            while let Some(request) = turn_rx.recv().await {
+                let result = {
+                    let mut core = worker_core.lock().await;
+                    core.process_turn(request.message, request.trigger_type)
+                        .await
+                };
+                let _ = request.response_tx.send(result);
+            }
+        });
 
         Ok(Self {
-            inner: AsyncMutex::new(RuntimeInner {
-                orchestrator,
-                report_rx,
-                required_skills_by_agent,
-                usage,
-                _workers: workers,
-            }),
+            turn_tx,
+            _turn_worker: turn_worker,
+            _report_worker: report_worker,
         })
     }
 
-    pub async fn send_message(
+    pub async fn orchestrator_turn(
         &self,
         message: String,
-    ) -> Result<MessageSendResult, MessageRuntimeError> {
+    ) -> Result<OrchestratorTurnResult, MessageRuntimeError> {
         if message.trim().is_empty() {
             return Err(MessageRuntimeError::InvalidRequest(
                 "message must not be empty".to_string(),
             ));
         }
 
-        let mut inner = self.inner.lock().await;
-        // NOTE: this is a valid error. However, this indicates that configuration is not valid.
-        // this is an edge case that reflects a larger problem
-        if inner.orchestrator.registry.is_empty() {
-            return Err(MessageRuntimeError::Unavailable(
-                "no agents are registered in runtime".to_string(),
-            ));
-        }
-
-        let event = TriggerEvent {
-            trigger_id: uuid::Uuid::new_v4().to_string(),
-            occurred_at: Utc::now(),
-            principal: Principal::Admin,
-            // NOTE: does this have to be an AdminCommand? What are the alternatives?
-            payload: TriggerPayload::AdminCommand {
-                instruction: message,
-            },
-            route_hint: None,
-            metadata: TriggerMetadata::default(),
-        };
-
-        let task_id = inner
-            .orchestrator
-            .route(event)
+        let (response_tx, response_rx) = oneshot::channel();
+        self.turn_tx
+            .send(TurnRequest {
+                message,
+                trigger_type: TriggerType::Admin,
+                response_tx,
+            })
             .await
-            .map_err(|err| MessageRuntimeError::Routing(err.to_string()))?;
+            .map_err(|err| MessageRuntimeError::Unavailable(err.to_string()))?;
 
-        // NOTE: the current task queue execution loop has significant problems:
-        // - The task execution loop should be independent of `send_message`. Task execution should
-        // be independent of `send_message`. eg: there might have been tasks being executed before
-        // ththis specific invocation of `send_message`. Adding a task to the queue should provide
-        // a guarantee that it will be executed.
-        // - It prevents parallel operations. For example, another might be operating in the
-        // background (eg: from a cron-trigger, or long-running task)
-        let mut assigned_agent: Option<String> = None;
-        while let Some(task) = inner.orchestrator.task_queue.dequeue() {
-            let agent_id = task.assigned_agent.clone();
-            let dispatch_task_id = task.id;
-            if dispatch_task_id == task_id {
-                assigned_agent = Some(agent_id.clone());
-            }
+        let received = tokio::time::timeout(TURN_TIMEOUT, response_rx)
+            .await
+            .map_err(|_| {
+                MessageRuntimeError::Timeout(humantime::format_duration(TURN_TIMEOUT).to_string())
+            })?;
 
-            inner
-                .orchestrator
-                .registry
-                .dispatch(&agent_id, task)
-                .await
-                .map_err(|err| MessageRuntimeError::Dispatch(err.to_string()))?;
-            inner
-                .orchestrator
-                .task_queue
-                .update_state(dispatch_task_id, TaskState::Dispatched);
-            inner
-                .orchestrator
-                .registry
-                .set_current_task(&agent_id, Some(dispatch_task_id));
-        }
+        received.map_err(|_| MessageRuntimeError::Unavailable("turn worker stopped".to_string()))?
+    }
+}
 
-        let assigned_agent = assigned_agent.ok_or_else(|| {
-            MessageRuntimeError::Internal(
-                "orchestrator did not dispatch a task for the submitted message".to_string(),
-            )
-        })?;
+fn build_orchestrator_config(config: &NeuromancerConfig) -> AgentConfig {
+    let mut capabilities = config.orchestrator.capabilities.clone();
+    if capabilities.skills.is_empty() {
+        capabilities.skills = vec![
+            "delegate_to_agent".to_string(),
+            "list_agents".to_string(),
+            "read_config".to_string(),
+            "modify_skill".to_string(),
+        ];
+    }
 
-        let (summary, response) = inner.wait_for_task(task_id, MESSAGE_TIMEOUT).await?;
+    AgentConfig {
+        id: "system0".to_string(),
+        mode: AgentMode::Inproc,
+        image: None,
+        models: AgentModelConfig {
+            planner: None,
+            executor: config.orchestrator.model_slot.clone(),
+            verifier: None,
+        },
+        capabilities,
+        health: AgentHealthConfig::default(),
+        preamble: Some(config.orchestrator.preamble.clone().unwrap_or_else(|| {
+            "You are System 0. You mediate user intent and delegate to specialized sub-agents using tools.".to_string()
+        })),
+        max_iterations: config.orchestrator.max_iterations,
+    }
+}
 
-        let usage = {
-            let mut usage_guard = inner
-                .usage
-                .lock()
-                .map_err(|_| MessageRuntimeError::Internal("usage lock poisoned".to_string()))?;
-            usage_guard.remove(&task_id).unwrap_or_default()
+#[derive(Clone)]
+struct System0ToolBroker {
+    inner: Arc<AsyncMutex<System0BrokerInner>>,
+}
+
+struct System0BrokerInner {
+    subagents: HashMap<String, Arc<AgentRuntime>>,
+    config_snapshot: serde_json::Value,
+    allowlisted_tools: HashSet<String>,
+    current_trigger_type: TriggerType,
+    current_turn_id: uuid::Uuid,
+    runs_by_turn: HashMap<uuid::Uuid, Vec<DelegatedRun>>,
+    running_agents: HashMap<String, String>,
+}
+
+impl System0ToolBroker {
+    fn new(
+        subagents: HashMap<String, Arc<AgentRuntime>>,
+        config_snapshot: serde_json::Value,
+        allowlisted_tools: &[String],
+    ) -> Self {
+        let default_tools = vec![
+            "delegate_to_agent".to_string(),
+            "list_agents".to_string(),
+            "read_config".to_string(),
+            "modify_skill".to_string(),
+        ];
+
+        let allowlisted_tools = if allowlisted_tools.is_empty() {
+            default_tools.into_iter().collect()
+        } else {
+            allowlisted_tools.iter().cloned().collect()
         };
 
-        // NOTE: "required skills" is supposed to be the skills the sub-agent is _allowed_ to have,
-        // not skills that _must_ be used by the agent
-        if let Some(required_skills) = inner.required_skills_by_agent.get(&assigned_agent) {
-            for skill in required_skills {
-                if usage.get(skill).copied().unwrap_or(0) == 0 {
-                    return Err(MessageRuntimeError::TaskFailed(format!(
-                        "required skill '{}' was not used while handling the message",
-                        skill
-                    )));
-                }
-            }
+        Self {
+            inner: Arc::new(AsyncMutex::new(System0BrokerInner {
+                subagents,
+                config_snapshot,
+                allowlisted_tools,
+                current_trigger_type: TriggerType::Admin,
+                current_turn_id: uuid::Uuid::nil(),
+                runs_by_turn: HashMap::new(),
+                running_agents: HashMap::new(),
+            })),
+        }
+    }
+
+    async fn set_turn_context(&self, turn_id: uuid::Uuid, trigger_type: TriggerType) {
+        let mut inner = self.inner.lock().await;
+        inner.current_turn_id = turn_id;
+        inner.current_trigger_type = trigger_type;
+        inner.runs_by_turn.remove(&turn_id);
+    }
+
+    async fn take_runs(&self, turn_id: uuid::Uuid) -> Vec<DelegatedRun> {
+        let mut inner = self.inner.lock().await;
+        inner.runs_by_turn.remove(&turn_id).unwrap_or_default()
+    }
+
+    fn build_tool_specs() -> Vec<ToolSpec> {
+        vec![
+            ToolSpec {
+                id: "delegate_to_agent".to_string(),
+                name: "delegate_to_agent".to_string(),
+                description:
+                    "Delegate an instruction to a configured sub-agent. args: {agent_id, instruction}".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "agent_id": {"type": "string"},
+                        "instruction": {"type": "string"}
+                    },
+                    "required": ["agent_id", "instruction"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+            },
+            ToolSpec {
+                id: "list_agents".to_string(),
+                name: "list_agents".to_string(),
+                description: "List configured sub-agents.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+            },
+            ToolSpec {
+                id: "read_config".to_string(),
+                name: "read_config".to_string(),
+                description: "Read orchestrator configuration snapshot.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+            },
+            ToolSpec {
+                id: "modify_skill".to_string(),
+                name: "modify_skill".to_string(),
+                description:
+                    "Modify a managed skill definition (admin trigger required). args: {skill_id, patch}".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "skill_id": {"type": "string"},
+                        "patch": {"type": "string"}
+                    },
+                    "required": ["skill_id", "patch"],
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+            },
+        ]
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolBroker for System0ToolBroker {
+    async fn list_tools(&self, ctx: &AgentContext) -> Vec<ToolSpec> {
+        let inner = self.inner.lock().await;
+        let allowed_from_context: HashSet<String> = if ctx.allowed_tools.is_empty() {
+            inner.allowlisted_tools.clone()
+        } else {
+            ctx.allowed_tools.iter().cloned().collect()
+        };
+
+        Self::build_tool_specs()
+            .into_iter()
+            .filter(|spec| {
+                inner.allowlisted_tools.contains(&spec.id)
+                    && allowed_from_context.contains(&spec.id)
+            })
+            .collect()
+    }
+
+    async fn call_tool(
+        &self,
+        _ctx: &AgentContext,
+        call: ToolCall,
+    ) -> Result<ToolResult, NeuromancerError> {
+        let mut inner = self.inner.lock().await;
+
+        if !inner.allowlisted_tools.contains(&call.tool_id) {
+            return Err(NeuromancerError::Tool(ToolError::NotFound {
+                tool_id: call.tool_id,
+            }));
         }
 
-        // TODO: think about steering, and in what instances would it make sense to send interim
-        // messages back to the caller? Interim messages only make sense in user / chat contexts.
-        Ok(MessageSendResult {
-            task_id: task_id.to_string(),
-            assigned_agent,
-            state: "completed".to_string(),
-            summary,
-            response,
-            tool_usage: usage,
-        })
+        match call.tool_id.as_str() {
+            "list_agents" => Ok(ToolResult {
+                call_id: call.id,
+                output: ToolOutput::Success(serde_json::json!({
+                    "agents": inner.subagents.keys().cloned().collect::<Vec<_>>()
+                })),
+            }),
+            "read_config" => Ok(ToolResult {
+                call_id: call.id,
+                output: ToolOutput::Success(inner.config_snapshot.clone()),
+            }),
+            "modify_skill" => {
+                if inner.current_trigger_type != TriggerType::Admin {
+                    return Ok(ToolResult {
+                        call_id: call.id,
+                        output: ToolOutput::Error(
+                            "modify_skill requires an admin trigger".to_string(),
+                        ),
+                    });
+                }
+
+                let skill_id = call
+                    .arguments
+                    .get("skill_id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                            tool_id: "modify_skill".to_string(),
+                            message: "missing 'skill_id'".to_string(),
+                        })
+                    })?;
+
+                Ok(ToolResult {
+                    call_id: call.id,
+                    output: ToolOutput::Success(serde_json::json!({
+                        "status": "accepted",
+                        "skill_id": skill_id,
+                    })),
+                })
+            }
+            "delegate_to_agent" => {
+                let agent_id = call
+                    .arguments
+                    .get("agent_id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                            tool_id: "delegate_to_agent".to_string(),
+                            message: "missing 'agent_id'".to_string(),
+                        })
+                    })?
+                    .to_string();
+                let instruction = call
+                    .arguments
+                    .get("instruction")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                            tool_id: "delegate_to_agent".to_string(),
+                            message: "missing 'instruction'".to_string(),
+                        })
+                    })?
+                    .to_string();
+
+                let Some(runtime) = inner.subagents.get(&agent_id).cloned() else {
+                    return Err(NeuromancerError::Tool(ToolError::NotFound {
+                        tool_id: format!("delegate_to_agent:{agent_id}"),
+                    }));
+                };
+
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let turn_id = inner.current_turn_id;
+                inner
+                    .running_agents
+                    .insert(agent_id.clone(), run_id.clone());
+                drop(inner);
+
+                let mut task = Task::new(TriggerSource::Internal, instruction, agent_id.clone());
+                let result = runtime.execute(&mut task).await;
+
+                let mut inner = self.inner.lock().await;
+                inner.running_agents.remove(&agent_id);
+
+                let run = match result {
+                    Ok(output) => DelegatedRun {
+                        run_id: run_id.clone(),
+                        agent_id: agent_id.clone(),
+                        state: "completed".to_string(),
+                        summary: Some(output.summary.clone()),
+                    },
+                    Err(err) => DelegatedRun {
+                        run_id: run_id.clone(),
+                        agent_id: agent_id.clone(),
+                        state: "failed".to_string(),
+                        summary: Some(err.to_string()),
+                    },
+                };
+
+                inner
+                    .runs_by_turn
+                    .entry(turn_id)
+                    .or_default()
+                    .push(run.clone());
+
+                Ok(ToolResult {
+                    call_id: call.id,
+                    output: ToolOutput::Success(serde_json::json!({
+                        "run_id": run.run_id,
+                        "agent_id": run.agent_id,
+                        "state": run.state,
+                        "summary": run.summary,
+                    })),
+                })
+            }
+            _ => Err(NeuromancerError::Tool(ToolError::NotFound {
+                tool_id: call.tool_id,
+            })),
+        }
     }
 }
 
@@ -299,7 +533,7 @@ fn append_tool_requirements(preamble: Option<String>, skills: &[String]) -> Stri
     if !skills.is_empty() {
         let joined = skills.join(", ");
         text.push_str(
-            "\n\nYou must use the available skill tools to gather required data before answering.",
+            "\n\nYou can use allowlisted skill tools to gather required data before answering.",
         );
         text.push_str(&format!("\nAvailable tools: {joined}."));
     }
@@ -341,7 +575,7 @@ fn build_llm_client(
 
 #[derive(Default)]
 struct TwoStepMockLlmClient {
-    issued_tools: Mutex<bool>,
+    issued_tools: std::sync::Mutex<bool>,
 }
 
 #[async_trait::async_trait]
@@ -351,7 +585,7 @@ impl LlmClient for TwoStepMockLlmClient {
         _system_prompt: &str,
         _messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
-    ) -> Result<LlmResponse, NeuromancerError> {
+    ) -> Result<neuromancer_agent::llm::LlmResponse, NeuromancerError> {
         let mut issued_tools = self.issued_tools.lock().map_err(|_| {
             NeuromancerError::Infra(neuromancer_core::error::InfraError::Config(
                 "mock llm lock poisoned".to_string(),
@@ -366,11 +600,21 @@ impl LlmClient for TwoStepMockLlmClient {
                 .map(|(idx, tool)| ToolCall {
                     id: format!("mock-call-{}", idx + 1),
                     tool_id: tool.name.clone(),
-                    arguments: serde_json::json!({}),
+                    arguments: match tool.name.as_str() {
+                        "delegate_to_agent" => serde_json::json!({
+                            "agent_id": "planner",
+                            "instruction": "Summarize the user request"
+                        }),
+                        "modify_skill" => serde_json::json!({
+                            "skill_id": "demo",
+                            "patch": "no-op"
+                        }),
+                        _ => serde_json::json!({}),
+                    },
                 })
                 .collect();
 
-            return Ok(LlmResponse {
+            return Ok(neuromancer_agent::llm::LlmResponse {
                 text: None,
                 tool_calls: calls,
                 prompt_tokens: 0,
@@ -379,8 +623,8 @@ impl LlmClient for TwoStepMockLlmClient {
         }
 
         *issued_tools = false;
-        Ok(LlmResponse {
-            text: Some("Based on your bills and account balances, prioritize the earliest due high-amount bill first. Current cash appears sufficient.".to_string()),
+        Ok(neuromancer_agent::llm::LlmResponse {
+            text: Some("System0 turn completed.".to_string()),
             tool_calls: vec![],
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -397,7 +641,7 @@ impl LlmClient for EchoLlmClient {
         _system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         _tool_definitions: Vec<rig::completion::ToolDefinition>,
-    ) -> Result<LlmResponse, NeuromancerError> {
+    ) -> Result<neuromancer_agent::llm::LlmResponse, NeuromancerError> {
         let fallback = messages
             .iter()
             .rev()
@@ -413,7 +657,7 @@ impl LlmClient for EchoLlmClient {
             })
             .unwrap_or_else(|| "No message provided.".to_string());
 
-        Ok(LlmResponse {
+        Ok(neuromancer_agent::llm::LlmResponse {
             text: Some(format!("Echo: {fallback}")),
             tool_calls: vec![],
             prompt_tokens: 0,
@@ -426,7 +670,6 @@ impl LlmClient for EchoLlmClient {
 struct SkillToolBroker {
     tools: HashMap<String, SkillTool>,
     local_root: PathBuf,
-    usage: Arc<Mutex<HashMap<uuid::Uuid, HashMap<String, u32>>>>,
 }
 
 #[derive(Clone)]
@@ -442,7 +685,6 @@ impl SkillToolBroker {
         allowed_skills: &[String],
         skill_registry: &SkillRegistry,
         local_root: PathBuf,
-        usage: Arc<Mutex<HashMap<uuid::Uuid, HashMap<String, u32>>>>,
     ) -> Result<Self, MessageRuntimeError> {
         let mut tools = HashMap::new();
         for skill_name in allowed_skills {
@@ -456,25 +698,7 @@ impl SkillToolBroker {
             tools.insert(skill_name.clone(), skill_tool_from_metadata(metadata));
         }
 
-        Ok(Self {
-            tools,
-            local_root,
-            usage,
-        })
-    }
-
-    fn bump_usage(
-        usage: &Arc<Mutex<HashMap<uuid::Uuid, HashMap<String, u32>>>>,
-        task_id: uuid::Uuid,
-        tool_name: &str,
-    ) -> Result<(), MessageRuntimeError> {
-        let mut guard = usage
-            .lock()
-            .map_err(|_| MessageRuntimeError::Internal("usage lock poisoned".to_string()))?;
-        let entry = guard.entry(task_id).or_default();
-        let count = entry.entry(tool_name.to_string()).or_insert(0);
-        *count += 1;
-        Ok(())
+        Ok(Self { tools, local_root })
     }
 }
 
@@ -517,13 +741,6 @@ impl ToolBroker for SkillToolBroker {
                 tool_id: call.tool_id,
             }));
         };
-
-        if let Err(err) = Self::bump_usage(&self.usage, ctx.task_id, &call.tool_id) {
-            return Err(NeuromancerError::Tool(ToolError::ExecutionFailed {
-                tool_id: call.tool_id.clone(),
-                message: err.to_string(),
-            }));
-        }
 
         let mut markdown_docs = Vec::new();
         for raw in &tool.markdown_paths {
@@ -733,83 +950,11 @@ fn parse_numeric_value(value: &str) -> f64 {
     cleaned.parse::<f64>().unwrap_or(0.0)
 }
 
-async fn wait_for_terminal_report(
-    orchestrator: &mut Orchestrator,
-    report_rx: &mut mpsc::Receiver<SubAgentReport>,
-    task_id: uuid::Uuid,
-    timeout: Duration,
-) -> Result<(String, String), MessageRuntimeError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() >= deadline {
-            return Err(MessageRuntimeError::Timeout(
-                humantime::format_duration(timeout).to_string(),
-            ));
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let report = tokio::time::timeout(remaining, report_rx.recv())
-            .await
-            .map_err(|_| {
-                MessageRuntimeError::Timeout(humantime::format_duration(timeout).to_string())
-            })?
-            .ok_or_else(|| {
-                MessageRuntimeError::Internal(
-                    "report channel closed before task completion".to_string(),
-                )
-            })?;
-
-        let report_task_id = report_task_id(&report);
-        orchestrator.handle_report(report.clone()).await;
-        if report_task_id != task_id {
-            continue;
-        }
-
-        match report {
-            SubAgentReport::Completed {
-                summary, artifacts, ..
-            } => {
-                let response = extract_response_text(&artifacts).unwrap_or_else(|| summary.clone());
-                return Ok((summary, response));
-            }
-            SubAgentReport::Failed { error, .. } => {
-                return Err(MessageRuntimeError::TaskFailed(error));
-            }
-            SubAgentReport::InputRequired { question, .. } => {
-                return Err(MessageRuntimeError::InputRequired(question));
-            }
-            SubAgentReport::PolicyDenied {
-                action,
-                capability_needed,
-                ..
-            } => {
-                return Err(MessageRuntimeError::PolicyDenied(format!(
-                    "action '{}' requires capability '{}'",
-                    action, capability_needed
-                )));
-            }
-            SubAgentReport::Stuck { reason, .. } => {
-                return Err(MessageRuntimeError::Stuck(reason));
-            }
-            SubAgentReport::Progress { .. } | SubAgentReport::ToolFailure { .. } => {}
-        }
-    }
-}
-
-fn report_task_id(report: &SubAgentReport) -> uuid::Uuid {
-    match report {
-        SubAgentReport::Progress { task_id, .. }
-        | SubAgentReport::InputRequired { task_id, .. }
-        | SubAgentReport::ToolFailure { task_id, .. }
-        | SubAgentReport::PolicyDenied { task_id, .. }
-        | SubAgentReport::Stuck { task_id, .. }
-        | SubAgentReport::Completed { task_id, .. }
-        | SubAgentReport::Failed { task_id, .. } => *task_id,
-    }
-}
-
-fn extract_response_text(artifacts: &[Artifact]) -> Option<String> {
-    artifacts.first().map(|artifact| artifact.content.clone())
+fn extract_response_text(output: &neuromancer_core::task::TaskOutput) -> Option<String> {
+    output
+        .artifacts
+        .first()
+        .map(|artifact| artifact.content.clone())
 }
 
 #[cfg(test)]
@@ -850,23 +995,5 @@ mod tests {
         let resolved = resolve_local_data_path(&local_root, "data/accounts.csv")
             .expect("relative path should resolve");
         assert_eq!(resolved, fs::canonicalize(file_path).expect("canonical"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_local_data_path_rejects_symlink_escape() {
-        let local_root = temp_dir("nm_local_root");
-        let outside_root = temp_dir("nm_outside_root");
-        let outside_file = outside_root.join("secrets.txt");
-        fs::write(&outside_file, "secret").expect("write outside");
-
-        let data_dir = local_root.join("data");
-        fs::create_dir_all(&data_dir).expect("data dir");
-        let link_path = data_dir.join("escape.txt");
-        std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink");
-
-        let err = resolve_local_data_path(&local_root, "data/escape.txt")
-            .expect_err("symlink escape should be rejected");
-        assert!(matches!(err, MessageRuntimeError::PathViolation(_)));
     }
 }

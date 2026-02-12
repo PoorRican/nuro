@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use neuromancer_core::rpc::{TaskCancelParams, TaskGetParams, TaskSubmitParams};
+use neuromancer_core::rpc::OrchestratorTurnParams;
 
 use crate::CliError;
 use crate::daemon::{DaemonStartOptions, DaemonStopOptions, start_daemon, stop_daemon};
@@ -20,8 +20,8 @@ pub struct SmokeOptions {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SmokeResult {
-    pub task_id: String,
-    pub cancelled: bool,
+    pub turn_id: String,
+    pub response: String,
 }
 
 pub async fn run_smoke(options: &SmokeOptions) -> Result<SmokeResult, CliError> {
@@ -41,59 +41,27 @@ pub async fn run_smoke(options: &SmokeOptions) -> Result<SmokeResult, CliError> 
     let smoke_result = async {
         let _health = rpc.health().await?;
 
-        let submit = rpc
-            .task_submit(TaskSubmitParams {
-                instruction: "e2e smoke task".to_string(),
-                agent: "planner".to_string(),
+        let turn = rpc
+            .orchestrator_turn(OrchestratorTurnParams {
+                message: "e2e smoke turn".to_string(),
             })
             .await?;
 
-        let list = rpc.task_list().await?;
-        if !list.tasks.iter().any(|task| task.id == submit.task_id) {
+        if turn.turn_id.trim().is_empty() {
             return Err(CliError::Smoke(
-                "submitted task was not returned by task.list".to_string(),
+                "orchestrator.turn returned an empty turn_id".to_string(),
             ));
         }
 
-        let fetched = rpc
-            .task_get(TaskGetParams {
-                task_id: submit.task_id.clone(),
-            })
-            .await?;
-
-        if fetched.task.instruction != "e2e smoke task" {
+        if turn.response.trim().is_empty() {
             return Err(CliError::Smoke(
-                "task.get instruction does not match submitted instruction".to_string(),
-            ));
-        }
-
-        if fetched.task.assigned_agent != "planner" {
-            return Err(CliError::Smoke(
-                "task.get assigned_agent does not match submitted agent".to_string(),
-            ));
-        }
-
-        let _cancel = rpc
-            .task_cancel(TaskCancelParams {
-                task_id: submit.task_id.clone(),
-            })
-            .await?;
-
-        let cancelled = rpc
-            .task_get(TaskGetParams {
-                task_id: submit.task_id.clone(),
-            })
-            .await?;
-
-        if cancelled.task.state != "cancelled" {
-            return Err(CliError::Smoke(
-                "task.cancel did not transition task state to cancelled".to_string(),
+                "orchestrator.turn returned an empty response".to_string(),
             ));
         }
 
         Ok(SmokeResult {
-            task_id: submit.task_id,
-            cancelled: true,
+            turn_id: turn.turn_id,
+            response: turn.response,
         })
     }
     .await;

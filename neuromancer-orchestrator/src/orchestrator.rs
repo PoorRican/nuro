@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use neuromancer_core::agent::{RemediationAction, SubAgentReport};
 use neuromancer_core::error::NeuromancerError;
 use neuromancer_core::task::{Task, TaskId, TaskState};
-use neuromancer_core::trigger::{TriggerEvent, TriggerPayload, TriggerSource};
+use neuromancer_core::trigger::{TriggerEvent, TriggerPayload};
 
 use crate::registry::AgentRegistry;
 use crate::remediation::{self, RemediationPolicy};
@@ -33,29 +33,19 @@ impl Orchestrator {
     }
 
     /// Route a trigger event: determine the target agent and create a task.
-    // NOTE: router should be a model by default. `event.route_hint` is implied to be a suggestion,
-    // but it seems to be a command
     pub async fn route(&mut self, event: TriggerEvent) -> Result<TaskId, NeuromancerError> {
         let agent_id = self.router.resolve(&event, &self.registry).await?;
 
         let instruction = match &event.payload {
-            TriggerPayload::Message { text, .. } => text.clone(),
+            TriggerPayload::Message { text } => text.clone(),
             TriggerPayload::CronFire {
                 rendered_instruction,
                 ..
             } => rendered_instruction.clone(),
-            TriggerPayload::AdminCommand { instruction } => instruction.clone(),
             TriggerPayload::A2aRequest { content, .. } => content.to_string(),
         };
 
-        let trigger_source = match &event.payload {
-            TriggerPayload::Message { .. } => TriggerSource::Discord,
-            TriggerPayload::CronFire { .. } => TriggerSource::Cron,
-            TriggerPayload::AdminCommand { .. } => TriggerSource::AdminApi,
-            TriggerPayload::A2aRequest { .. } => TriggerSource::A2a,
-        };
-
-        let task = Task::new(trigger_source, instruction, agent_id);
+        let task = Task::new(event.source, instruction, agent_id);
         let task_id = self.task_queue.enqueue(task);
 
         tracing::info!(task_id = %task_id, "task enqueued");
@@ -182,7 +172,6 @@ impl Orchestrator {
                 }
             }
 
-            // NOTE: where does this come from? This implies a model-based router
             RemediationAction::Clarify { additional_context } => {
                 tracing::info!(
                     task_id = %task_id,
@@ -344,14 +333,12 @@ mod tests {
         TriggerEvent {
             trigger_id: "test".into(),
             occurred_at: chrono::Utc::now(),
-            principal: Principal::DiscordUser {
-                user_id: "u1".into(),
-                guild_id: None,
+            actor: Actor::User {
+                actor_id: "u1".into(),
             },
-            payload: TriggerPayload::Message {
-                text: text.into(),
-                attachments: vec![],
-            },
+            trigger_type: TriggerType::User,
+            source: TriggerSource::Chat,
+            payload: TriggerPayload::Message { text: text.into() },
             route_hint: None,
             metadata: TriggerMetadata {
                 channel_id: Some(channel.into()),

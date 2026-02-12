@@ -8,14 +8,16 @@ use neuromancer_core::trigger::TriggerEvent;
 use crate::registry::AgentRegistry;
 
 /// Extracts message text from a trigger event payload for LLM classification.
-// NOTE: message text should be extracted from all payloads
 fn extract_message_text(event: &TriggerEvent) -> Option<String> {
     match &event.payload {
-        neuromancer_core::trigger::TriggerPayload::Message { text, .. } => Some(text.clone()),
-        neuromancer_core::trigger::TriggerPayload::AdminCommand { instruction } => {
-            Some(instruction.clone())
+        neuromancer_core::trigger::TriggerPayload::Message { text } => Some(text.clone()),
+        neuromancer_core::trigger::TriggerPayload::CronFire {
+            rendered_instruction,
+            ..
+        } => Some(rendered_instruction.clone()),
+        neuromancer_core::trigger::TriggerPayload::A2aRequest { content, .. } => {
+            Some(content.to_string())
         }
-        _ => None,
     }
 }
 
@@ -28,7 +30,6 @@ pub struct Router {
 }
 
 /// Trait for the LLM-based intent classifier used as routing fallback.
-// NOTE: this is a good trait, but should be named to `LlmDynamicRouter`
 #[async_trait::async_trait]
 pub trait LlmClassifier: Send + Sync {
     /// Given a message and a list of (agent_id, description) pairs,
@@ -58,24 +59,15 @@ impl Router {
 
     /// Resolve a trigger event to a target agent.
     ///
-    /// 1. If the event has a route_hint, use it.
-    /// 2. Evaluate deterministic rules top-to-bottom; first match wins.
-    /// 3. If no rule matches and an LLM classifier is configured, call it.
+    /// 1. Evaluate deterministic rules top-to-bottom; first match wins.
+    /// 2. If no rule matches and an LLM classifier is configured, call it.
+    /// 3. If still unresolved and route_hint is valid, use it as a suggestion.
     /// 4. Fall back to default_agent.
     pub async fn resolve(
         &self,
         event: &TriggerEvent,
         registry: &AgentRegistry,
     ) -> Result<AgentId, NeuromancerError> {
-        // Check route hint first
-        if let Some(hint) = &event.route_hint {
-            if registry.contains(hint) {
-                tracing::debug!(agent = %hint, "using route hint");
-                return Ok(hint.clone());
-            }
-            tracing::warn!(agent = %hint, "ignoring unknown route hint");
-        }
-
         // Deterministic rules
         for rule in &self.rules {
             if rule.match_criteria.matches(event) {
@@ -102,6 +94,14 @@ impl Router {
                     tracing::warn!(error = %e, "LLM classifier failed, using default");
                 }
             }
+        }
+
+        if let Some(hint) = &event.route_hint {
+            if registry.contains(hint) {
+                tracing::debug!(agent = %hint, "using route hint as fallback suggestion");
+                return Ok(hint.clone());
+            }
+            tracing::warn!(agent = %hint, "ignoring unknown route hint");
         }
 
         // Default fallback
@@ -201,14 +201,12 @@ mod tests {
         TriggerEvent {
             trigger_id: "test".into(),
             occurred_at: chrono::Utc::now(),
-            principal: Principal::DiscordUser {
-                user_id: "u1".into(),
-                guild_id: None,
+            actor: Actor::User {
+                actor_id: "u1".into(),
             },
-            payload: TriggerPayload::Message {
-                text: text.into(),
-                attachments: vec![],
-            },
+            trigger_type: TriggerType::User,
+            source: TriggerSource::Chat,
+            payload: TriggerPayload::Message { text: text.into() },
             route_hint: None,
             metadata: TriggerMetadata {
                 channel_id: Some(channel.into()),

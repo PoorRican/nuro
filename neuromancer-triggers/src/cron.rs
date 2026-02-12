@@ -6,7 +6,9 @@ use tracing::{error, info, instrument, warn};
 
 use neuromancer_core::agent::AgentId;
 use neuromancer_core::config::CronTriggerConfig;
-use neuromancer_core::trigger::{Principal, TriggerEvent, TriggerMetadata, TriggerPayload};
+use neuromancer_core::trigger::{
+    Actor, TriggerEvent, TriggerMetadata, TriggerPayload, TriggerSource, TriggerType,
+};
 
 /// Manages all cron trigger jobs.
 pub struct CronTrigger {
@@ -22,7 +24,7 @@ impl CronTrigger {
         }
     }
 
-    /// Start all enabled cron jobs and send TriggerEvents to the provided channel.
+    /// Start all enabled cron jobs and send [`TriggerEvents`] to the provided channel.
     #[instrument(skip(self, tx))]
     pub async fn start(&mut self, tx: mpsc::Sender<TriggerEvent>) -> Result<(), CronError> {
         let scheduler = JobScheduler::new()
@@ -109,9 +111,11 @@ fn build_cron_job(
             let event = TriggerEvent {
                 trigger_id,
                 occurred_at: now,
-                principal: Principal::Cron {
+                actor: Actor::CronJob {
                     job_id: job_id.clone(),
                 },
+                trigger_type: TriggerType::Internal,
+                source: TriggerSource::Cron,
                 payload: TriggerPayload::CronFire {
                     job_id: job_id.clone(),
                     rendered_instruction,

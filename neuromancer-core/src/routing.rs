@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentId;
-use crate::trigger::TriggerEvent;
+use crate::trigger::{Actor, TriggerEvent, TriggerPayload, TriggerSource, TriggerType};
 
 /// A deterministic routing rule: match criteria → target agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,51 +12,47 @@ pub struct RoutingRule {
 }
 
 /// Criteria for matching a trigger event to a routing rule.
-// NOTE: this contains discord-specific data which should not be present
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoutingMatch {
+    pub source: Option<TriggerSource>,
+    pub trigger_type: Option<TriggerType>,
     pub channel_id: Option<String>,
-    pub trigger: Option<String>,
-    pub id: Option<String>,
-    pub guild_id: Option<String>,
-    pub user_id: Option<String>,
+    pub actor_id: Option<String>,
     pub prefix: Option<String>,
 }
 
 impl RoutingMatch {
     /// Check if this match criteria applies to the given event.
     pub fn matches(&self, event: &TriggerEvent) -> bool {
+        if let Some(source) = &self.source {
+            if event.source != *source {
+                return false;
+            }
+        }
+        if let Some(trigger_type) = &self.trigger_type {
+            if event.trigger_type != *trigger_type {
+                return false;
+            }
+        }
         if let Some(ref ch) = self.channel_id {
             if event.metadata.channel_id.as_deref() != Some(ch.as_str()) {
                 return false;
             }
         }
-        if let Some(ref trig) = self.trigger {
-            let source_str = match &event.payload {
-                crate::trigger::TriggerPayload::Message { .. } => "discord",
-                crate::trigger::TriggerPayload::CronFire { .. } => "cron",
-                crate::trigger::TriggerPayload::A2aRequest { .. } => "a2a",
-                crate::trigger::TriggerPayload::AdminCommand { .. } => "admin",
+        if let Some(ref actor_id) = self.actor_id {
+            let current_actor_id = match &event.actor {
+                Actor::User { actor_id } => Some(actor_id.as_str()),
+                Actor::Service { service_id } => Some(service_id.as_str()),
+                Actor::CronJob { job_id } => Some(job_id.as_str()),
+                Actor::A2aPeer { agent_id } => Some(agent_id.as_str()),
             };
-            if trig != source_str {
+            if current_actor_id != Some(actor_id.as_str()) {
                 return false;
             }
         }
-        if let Some(ref match_id) = self.id {
-            if let crate::trigger::TriggerPayload::CronFire { ref job_id, .. } = event.payload {
-                if match_id != job_id {
-                    return false;
-                }
-            }
-        }
-        if let Some(ref gid) = self.guild_id {
-            if event.metadata.guild_id.as_deref() != Some(gid.as_str()) {
-                return false;
-            }
-        }
-        if let Some(ref prefix) = self.prefix {
+        if let Some(prefix) = &self.prefix {
             let text = match &event.payload {
-                crate::trigger::TriggerPayload::Message { text, .. } => text.as_str(),
+                TriggerPayload::Message { text } => text.as_str(),
                 _ => "",
             };
             if !text.starts_with(prefix.as_str()) {
@@ -85,14 +81,12 @@ mod tests {
         TriggerEvent {
             trigger_id: "test".into(),
             occurred_at: Utc::now(),
-            principal: Principal::DiscordUser {
-                user_id: "user1".into(),
-                guild_id: None,
+            actor: Actor::User {
+                actor_id: "user1".into(),
             },
-            payload: TriggerPayload::Message {
-                text: text.into(),
-                attachments: vec![],
-            },
+            trigger_type: TriggerType::User,
+            source: TriggerSource::Chat,
+            payload: TriggerPayload::Message { text: text.into() },
             route_hint: None,
             metadata: TriggerMetadata {
                 channel_id: Some(channel.into()),

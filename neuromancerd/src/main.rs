@@ -4,7 +4,6 @@ mod message_runtime;
 mod shutdown;
 mod telemetry;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -84,16 +83,14 @@ async fn main() -> Result<()> {
     let message_runtime = match message_runtime::MessageRuntime::new(&initial_config).await {
         Ok(runtime) => Some(Arc::new(runtime)),
         Err(err) => {
-            warn!(error = %err, "message runtime unavailable; message.send RPC will fail");
+            warn!(error = %err, "message runtime unavailable; orchestrator.turn RPC will fail");
             None
         }
     };
 
     let admin_state = admin::AppState {
-        config: config.clone(),
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        submitted_tasks: Arc::new(RwLock::new(HashMap::new())),
         message_runtime,
     };
 

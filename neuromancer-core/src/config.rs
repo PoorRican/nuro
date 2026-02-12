@@ -25,6 +25,8 @@ pub struct NeuromancerConfig {
     pub a2a: A2aConfig,
     pub routing: RoutingConfig,
     #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
+    #[serde(default)]
     pub agents: HashMap<String, AgentTomlConfig>,
     #[serde(default)]
     pub triggers: TriggersConfig,
@@ -106,6 +108,31 @@ pub enum McpServerKind {
 pub struct A2aConfig {
     pub bind_addr: Option<String>,
     pub agent_card_signing: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorConfig {
+    pub model_slot: Option<String>,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    pub preamble: Option<String>,
+    #[serde(default = "default_orchestrator_max_iterations")]
+    pub max_iterations: u32,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            model_slot: None,
+            capabilities: AgentCapabilities::default(),
+            preamble: None,
+            max_iterations: default_orchestrator_max_iterations(),
+        }
+    }
+}
+
+fn default_orchestrator_max_iterations() -> u32 {
+    30
 }
 
 /// Per-agent config as it appears in TOML (slightly different shape from runtime AgentConfig).

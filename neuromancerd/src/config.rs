@@ -50,6 +50,15 @@ pub fn validate_config(config: &NeuromancerConfig) -> Result<()> {
         }
     }
 
+    if let Some(ref slot_name) = config.orchestrator.model_slot {
+        if !config.models.contains_key(slot_name) {
+            anyhow::bail!(
+                "orchestrator.model_slot '{}' not found in [models]",
+                slot_name
+            );
+        }
+    }
+
     // Check agent model slot references
     for (name, agent) in &config.agents {
         for slot in [

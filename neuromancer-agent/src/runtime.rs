@@ -9,9 +9,17 @@ use neuromancer_core::task::{
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSpec,
 };
+use neuromancer_core::trigger::TriggerSource;
 
 use crate::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use crate::llm::LlmClient;
+use crate::session::{AgentSessionId, InMemorySessionStore};
+
+#[derive(Debug, Clone)]
+pub struct TurnExecutionResult {
+    pub task_id: uuid::Uuid,
+    pub output: TaskOutput,
+}
 
 /// Agent runtime that manages a single task execution through the state machine.
 pub struct AgentRuntime {
@@ -224,6 +232,171 @@ impl AgentRuntime {
 
             return Ok(output);
         }
+    }
+
+    /// Execute a single conversational turn using persistent agent-owned session history.
+    pub async fn execute_turn(
+        &self,
+        session_store: &InMemorySessionStore,
+        session_id: AgentSessionId,
+        source: TriggerSource,
+        user_message: String,
+    ) -> Result<TurnExecutionResult, NeuromancerError> {
+        let mut task = Task::new(source, user_message.clone(), self.config.id.clone());
+        let start = Instant::now();
+        let mut total_usage = TokenUsage::default();
+
+        task.state = TaskState::Running;
+        tracing::info!(
+            task_id = %task.id,
+            agent_id = %self.config.id,
+            "agent runtime turn execution starting"
+        );
+
+        let agent_ctx = AgentContext {
+            agent_id: self.config.id.clone(),
+            task_id: task.id,
+            allowed_tools: self.config.capabilities.skills.clone(),
+            allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
+            allowed_secrets: self.config.capabilities.secrets.clone(),
+            allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
+        };
+
+        let system_prompt = self.build_system_prompt();
+        let default_conversation = {
+            let mut conversation = ConversationContext::new(
+                u32::MAX,
+                TruncationStrategy::SlidingWindow { keep_last: 50 },
+            );
+            conversation.add_message(ChatMessage::system(&system_prompt));
+            conversation
+        };
+
+        let session = session_store
+            .load_or_create(session_id, default_conversation)
+            .await;
+        let mut conversation = session.conversation.clone();
+        conversation.add_message(ChatMessage::user(user_message));
+
+        let tool_specs = self.tool_broker.list_tools(&agent_ctx).await;
+        let tool_defs = specs_to_rig_definitions(&tool_specs);
+        let max_iterations = self.config.max_iterations;
+        let mut iteration: u32 = 0;
+
+        let run_result = loop {
+            iteration += 1;
+            if iteration > max_iterations {
+                let err = AgentError::MaxIterationsExceeded {
+                    task_id: task.id,
+                    iterations: iteration,
+                };
+                self.send_report(SubAgentReport::Stuck {
+                    task_id: task.id,
+                    reason: format!("max iterations ({max_iterations}) exceeded"),
+                    partial_result: None,
+                })
+                .await;
+                break Err(NeuromancerError::Agent(err));
+            }
+
+            tracing::debug!(
+                task_id = %task.id,
+                iteration,
+                "thinking: calling LLM (session turn)"
+            );
+
+            let rig_messages = conversation.to_rig_messages();
+            let response = match self
+                .llm_client
+                .complete(&system_prompt, rig_messages, tool_defs.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => break Err(err),
+            };
+
+            total_usage.prompt_tokens += response.prompt_tokens;
+            total_usage.completion_tokens += response.completion_tokens;
+            total_usage.total_tokens += response.prompt_tokens + response.completion_tokens;
+
+            if iteration % 5 == 0 {
+                self.send_report(SubAgentReport::Progress {
+                    task_id: task.id,
+                    step: iteration,
+                    description: format!("iteration {iteration}/{max_iterations}"),
+                    artifacts_so_far: vec![],
+                })
+                .await;
+            }
+
+            if response.has_tool_calls() {
+                conversation.add_message(ChatMessage::assistant_tool_calls(
+                    response.tool_calls.clone(),
+                ));
+
+                for call in &response.tool_calls {
+                    let result = self.execute_tool_call(&agent_ctx, call).await;
+
+                    if let ToolOutput::Error(err) = &result.output {
+                        self.send_report(SubAgentReport::ToolFailure {
+                            task_id: task.id,
+                            tool_id: call.tool_id.clone(),
+                            error: err.clone(),
+                            retry_eligible: true,
+                            attempted_count: 1,
+                        })
+                        .await;
+                    }
+
+                    conversation.add_message(ChatMessage::tool_result(result));
+                }
+
+                continue;
+            }
+
+            let output_text = response.text.unwrap_or_default();
+            conversation.add_message(ChatMessage::assistant_text(output_text.clone()));
+
+            let output = TaskOutput {
+                artifacts: vec![Artifact {
+                    kind: ArtifactKind::Text,
+                    name: "response".into(),
+                    content: output_text.clone(),
+                    mime_type: Some("text/plain".into()),
+                }],
+                summary: truncate_summary(&output_text, 200),
+                token_usage: total_usage,
+                duration: start.elapsed(),
+            };
+
+            let checkpoint = Checkpoint {
+                task_id: task.id,
+                state_data: serde_json::to_value(&TaskExecutionState::Completed {
+                    output: output.clone(),
+                })
+                .unwrap_or_default(),
+                created_at: chrono::Utc::now(),
+            };
+            task.checkpoints.push(checkpoint);
+
+            self.send_report(SubAgentReport::Completed {
+                task_id: task.id,
+                artifacts: output.artifacts.clone(),
+                summary: output.summary.clone(),
+            })
+            .await;
+
+            break Ok(output);
+        };
+
+        session_store
+            .save_conversation(session_id, conversation)
+            .await;
+
+        run_result.map(|output| TurnExecutionResult {
+            task_id: task.id,
+            output,
+        })
     }
 
     fn build_system_prompt(&self) -> String {

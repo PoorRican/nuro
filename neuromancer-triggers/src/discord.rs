@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use neuromancer_core::config::{DiscordResponseConfig, DiscordTriggerConfig, RateLimitConfig};
-use neuromancer_core::trigger::{Principal, TriggerEvent, TriggerMetadata, TriggerPayload};
+use neuromancer_core::trigger::{
+    Actor, TriggerEvent, TriggerMetadata, TriggerPayload, TriggerSource, TriggerType,
+};
 
 /// Configuration types for the Discord trigger, parsed from core config.
 
@@ -337,13 +339,13 @@ pub fn process_discord_message(
     Some(TriggerEvent {
         trigger_id,
         occurred_at: now,
-        principal: Principal::DiscordUser {
-            user_id: user_id.to_string(),
-            guild_id: guild_id.map(|s| s.to_string()),
+        actor: Actor::User {
+            actor_id: user_id.to_string(),
         },
+        trigger_type: TriggerType::User,
+        source: TriggerSource::Chat,
         payload: TriggerPayload::Message {
             text: message_text.to_string(),
-            attachments: vec![],
         },
         route_hint: Some(route.agent.clone()),
         metadata: TriggerMetadata {

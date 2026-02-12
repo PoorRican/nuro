@@ -5,31 +5,30 @@ use crate::agent::AgentId;
 
 /// Identity of the entity that produced a trigger event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Principal {
-    // NOTE: DiscordUser should be more generic. And what is the distinction from `Admin`?
-    DiscordUser {
-        user_id: String,
-        guild_id: Option<String>,
-    },
-    System,
-    Cron {
-        job_id: String,
-    },
-    A2aPeer {
-        agent_id: AgentId,
-    },
+pub enum Actor {
+    User { actor_id: String },
+    Service { service_id: String },
+    CronJob { job_id: String },
+    A2aPeer { agent_id: AgentId },
+}
+
+/// Privilege level attached to the trigger event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerType {
+    User,
     Admin,
+    Internal,
 }
 
 /// Source of a trigger event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerSource {
-    // NOTE: make generic
-    Discord,
+    Chat,
     Cron,
     A2a,
-    AdminApi,
+    Cli,
     Internal,
 }
 
@@ -38,7 +37,6 @@ pub enum TriggerSource {
 pub enum TriggerPayload {
     Message {
         text: String,
-        attachments: Vec<String>,
     },
     CronFire {
         job_id: String,
@@ -48,9 +46,6 @@ pub enum TriggerPayload {
     A2aRequest {
         from_agent: AgentId,
         content: serde_json::Value,
-    },
-    AdminCommand {
-        instruction: String,
     },
 }
 
@@ -68,7 +63,9 @@ pub struct TriggerMetadata {
 pub struct TriggerEvent {
     pub trigger_id: String,
     pub occurred_at: DateTime<Utc>,
-    pub principal: Principal,
+    pub actor: Actor,
+    pub trigger_type: TriggerType,
+    pub source: TriggerSource,
     pub payload: TriggerPayload,
     pub route_hint: Option<AgentId>,
     pub metadata: TriggerMetadata,

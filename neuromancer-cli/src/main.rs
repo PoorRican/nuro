@@ -6,10 +6,12 @@ mod rpc_client;
 
 use clap::Parser;
 
-use cli::{Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, RpcCommand, TaskCommand};
+use cli::{
+    Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand, RpcCommand,
+};
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
-use neuromancer_core::rpc::{MessageSendParams, TaskCancelParams, TaskGetParams, TaskSubmitParams};
+use neuromancer_core::rpc::OrchestratorTurnParams;
 use rpc_client::RpcClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -101,40 +103,6 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
             let health = rpc.health().await?;
             Ok(serde_json::json!(health))
         }
-        Command::Task { command } => {
-            let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
-            match command {
-                TaskCommand::Submit(args) => {
-                    let response = rpc
-                        .task_submit(TaskSubmitParams {
-                            instruction: args.instruction,
-                            agent: args.agent,
-                        })
-                        .await?;
-                    Ok(serde_json::json!(response))
-                }
-                TaskCommand::List => {
-                    let response = rpc.task_list().await?;
-                    Ok(serde_json::json!(response))
-                }
-                TaskCommand::Get(args) => {
-                    let response = rpc
-                        .task_get(TaskGetParams {
-                            task_id: args.task_id,
-                        })
-                        .await?;
-                    Ok(serde_json::json!(response))
-                }
-                TaskCommand::Cancel(args) => {
-                    let response = rpc
-                        .task_cancel(TaskCancelParams {
-                            task_id: args.task_id,
-                        })
-                        .await?;
-                    Ok(serde_json::json!(response))
-                }
-            }
-        }
         Command::Config { command } => {
             let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
             match command {
@@ -171,14 +139,18 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                 Ok(serde_json::json!(result))
             }
         },
-        Command::Message(args) => {
+        Command::Orchestrator { command } => {
             let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
-            let response = rpc
-                .message_send(MessageSendParams {
-                    message: args.message,
-                })
-                .await?;
-            Ok(serde_json::json!(response))
+            match command {
+                OrchestratorCommand::Turn(args) => {
+                    let response = rpc
+                        .orchestrator_turn(OrchestratorTurnParams {
+                            message: args.message,
+                        })
+                        .await?;
+                    Ok(serde_json::json!(response))
+                }
+            }
         }
     }
 }

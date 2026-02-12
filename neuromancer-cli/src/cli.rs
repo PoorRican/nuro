@@ -33,10 +33,6 @@ pub enum Command {
         command: DaemonCommand,
     },
     Health,
-    Task {
-        #[command(subcommand)]
-        command: TaskCommand,
-    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -49,7 +45,10 @@ pub enum Command {
         #[command(subcommand)]
         command: E2eCommand,
     },
-    Message(MessageArgs),
+    Orchestrator {
+        #[command(subcommand)]
+        command: OrchestratorCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,28 +89,6 @@ pub struct DaemonStatusArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum TaskCommand {
-    Submit(TaskSubmitArgs),
-    List,
-    Get(TaskIdArg),
-    Cancel(TaskIdArg),
-}
-
-#[derive(Debug, Args)]
-pub struct TaskSubmitArgs {
-    #[arg(long)]
-    pub agent: String,
-
-    #[arg(long)]
-    pub instruction: String,
-}
-
-#[derive(Debug, Args)]
-pub struct TaskIdArg {
-    pub task_id: String,
-}
-
-#[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     Reload,
 }
@@ -147,9 +124,14 @@ pub struct E2eSmokeArgs {
     pub pid_file: PathBuf,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorCommand {
+    Turn(OrchestratorTurnArgs),
+}
+
 #[derive(Debug, Args)]
-pub struct MessageArgs {
-    /// Single user message routed via daemon orchestrator.
+pub struct OrchestratorTurnArgs {
+    /// Execute one System0 orchestrator turn.
     pub message: String,
 }
 
@@ -160,32 +142,6 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_task_submit_matrix() {
-        let cli = Cli::try_parse_from([
-            "neuroctl",
-            "--addr",
-            "http://127.0.0.1:9191",
-            "task",
-            "submit",
-            "--agent",
-            "planner",
-            "--instruction",
-            "test",
-        ])
-        .expect("cli should parse");
-
-        match cli.command {
-            Command::Task {
-                command: TaskCommand::Submit(args),
-            } => {
-                assert_eq!(args.agent, "planner");
-                assert_eq!(args.instruction, "test");
-            }
-            other => panic!("unexpected command parsed: {other:?}"),
-        }
-    }
 
     #[test]
     fn parses_daemon_start_wait_healthy() {
@@ -218,13 +174,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_message_command() {
-        let cli = Cli::try_parse_from(["neuroctl", "message", "what should I pay?"])
-            .expect("cli should parse");
+    fn parses_orchestrator_turn_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "turn",
+            "what should I pay first?",
+        ])
+        .expect("cli should parse");
 
         match cli.command {
-            Command::Message(args) => {
-                assert_eq!(args.message, "what should I pay?");
+            Command::Orchestrator {
+                command: OrchestratorCommand::Turn(args),
+            } => {
+                assert_eq!(args.message, "what should I pay first?");
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
