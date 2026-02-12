@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use neuromancer_core::agent::{
-    AgentConfig, AgentId, CircuitBreakerState,
-};
+use neuromancer_core::agent::{AgentConfig, AgentId, CircuitBreakerState};
 use neuromancer_core::task::Task;
 
 /// Health status of a registered agent.
@@ -60,11 +58,7 @@ impl AgentRegistry {
     }
 
     /// Set the task dispatch channel for an agent.
-    pub fn set_task_sender(
-        &mut self,
-        agent_id: &AgentId,
-        tx: tokio::sync::mpsc::Sender<Task>,
-    ) {
+    pub fn set_task_sender(&mut self, agent_id: &AgentId, tx: tokio::sync::mpsc::Sender<Task>) {
         if let Some(entry) = self.agents.get_mut(agent_id) {
             entry.task_tx = Some(tx);
         }
@@ -107,11 +101,7 @@ impl AgentRegistry {
 
     /// Dispatch a task to an agent via its channel.
     // NOTE: errors should be typed
-    pub async fn dispatch(
-        &mut self,
-        agent_id: &AgentId,
-        task: Task,
-    ) -> Result<(), String> {
+    pub async fn dispatch(&mut self, agent_id: &AgentId, task: Task) -> Result<(), String> {
         let entry = self
             .agents
             .get_mut(agent_id)

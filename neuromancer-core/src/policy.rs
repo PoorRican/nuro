@@ -36,21 +36,9 @@ pub enum MessageRole {
 /// Stacked policy gates evaluated before/after tool and LLM calls.
 #[async_trait]
 pub trait PolicyEngine: Send + Sync {
-    async fn pre_tool_call(
-        &self,
-        ctx: &AgentContext,
-        call: &ToolCall,
-    ) -> PolicyDecision;
+    async fn pre_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> PolicyDecision;
 
-    async fn pre_llm_call(
-        &self,
-        ctx: &AgentContext,
-        messages: &[ChatMessage],
-    ) -> PolicyDecision;
+    async fn pre_llm_call(&self, ctx: &AgentContext, messages: &[ChatMessage]) -> PolicyDecision;
 
-    async fn post_tool_call(
-        &self,
-        ctx: &AgentContext,
-        result: &ToolResult,
-    ) -> PolicyDecision;
+    async fn post_tool_call(&self, ctx: &AgentContext, result: &ToolResult) -> PolicyDecision;
 }

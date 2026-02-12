@@ -6,9 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use neuromancer_core::config::{DiscordResponseConfig, DiscordTriggerConfig, RateLimitConfig};
-use neuromancer_core::trigger::{
-    Principal, TriggerEvent, TriggerMetadata, TriggerPayload,
-};
+use neuromancer_core::trigger::{Principal, TriggerEvent, TriggerMetadata, TriggerPayload};
 
 /// Configuration types for the Discord trigger, parsed from core config.
 

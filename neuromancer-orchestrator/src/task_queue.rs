@@ -134,7 +134,10 @@ impl TaskQueue {
 
     /// Reload tasks in active states (for crash recovery).
     pub fn active_tasks(&self) -> Vec<&Task> {
-        self.tasks.values().filter(|t| t.state.is_active()).collect()
+        self.tasks
+            .values()
+            .filter(|t| t.state.is_active())
+            .collect()
     }
 
     fn sort_queue(&mut self) {
@@ -195,12 +198,11 @@ mod tests {
     fn idempotency_dedup() {
         let mut queue = TaskQueue::new();
 
-        let task1 = make_task("task-a", TaskPriority::Normal)
-            .with_idempotency_key("key-1".into());
+        let task1 = make_task("task-a", TaskPriority::Normal).with_idempotency_key("key-1".into());
         let id1 = queue.enqueue(task1);
 
-        let task2 = make_task("task-a-dup", TaskPriority::Normal)
-            .with_idempotency_key("key-1".into());
+        let task2 =
+            make_task("task-a-dup", TaskPriority::Normal).with_idempotency_key("key-1".into());
         let id2 = queue.enqueue(task2);
 
         // Same ID returned, deduped
@@ -212,16 +214,15 @@ mod tests {
     fn idempotency_allows_after_terminal() {
         let mut queue = TaskQueue::new();
 
-        let task1 = make_task("task-a", TaskPriority::Normal)
-            .with_idempotency_key("key-1".into());
+        let task1 = make_task("task-a", TaskPriority::Normal).with_idempotency_key("key-1".into());
         let id1 = queue.enqueue(task1);
 
         // Mark as completed
         queue.update_state(id1, TaskState::Completed);
 
         // Now a new task with the same key should be allowed
-        let task2 = make_task("task-a-new", TaskPriority::Normal)
-            .with_idempotency_key("key-1".into());
+        let task2 =
+            make_task("task-a-new", TaskPriority::Normal).with_idempotency_key("key-1".into());
         let id2 = queue.enqueue(task2);
 
         assert_ne!(id1, id2);

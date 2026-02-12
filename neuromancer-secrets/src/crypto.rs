@@ -20,9 +20,7 @@ impl std::error::Error for CryptoError {}
 /// Encrypt plaintext with a master key. Returns (ciphertext, nonce).
 pub fn encrypt(plaintext: &[u8], master_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
     // Generate 16-byte random nonce
-    let nonce: Vec<u8> = (0..16)
-        .map(|_| rand_byte())
-        .collect();
+    let nonce: Vec<u8> = (0..16).map(|_| rand_byte()).collect();
 
     let keystream = derive_keystream(master_key, &nonce, plaintext.len());
     let ciphertext: Vec<u8> = plaintext
@@ -35,11 +33,7 @@ pub fn encrypt(plaintext: &[u8], master_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)
 }
 
 /// Decrypt ciphertext with a master key and nonce.
-pub fn decrypt(
-    ciphertext: &[u8],
-    nonce: &[u8],
-    master_key: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt(ciphertext: &[u8], nonce: &[u8], master_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let keystream = derive_keystream(master_key, nonce, ciphertext.len());
     let plaintext: Vec<u8> = ciphertext
         .iter()

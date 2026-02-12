@@ -70,15 +70,13 @@ where
         let current_prompt = messages
             .last()
             .and_then(|m| match m {
-                rig::completion::Message::User { content } => {
-                    content.iter().find_map(|c| {
-                        if let rig::message::UserContent::Text(t) = c {
-                            Some(t.text.clone())
-                        } else {
-                            None
-                        }
-                    })
-                }
+                rig::completion::Message::User { content } => content.iter().find_map(|c| {
+                    if let rig::message::UserContent::Text(t) = c {
+                        Some(t.text.clone())
+                    } else {
+                        None
+                    }
+                }),
                 _ => None,
             })
             .unwrap_or_default();
@@ -98,15 +96,11 @@ where
             .tools(tool_definitions)
             .build();
 
-        let response = self
-            .model
-            .completion(request)
-            .await
-            .map_err(|e| {
-                NeuromancerError::Llm(neuromancer_core::error::LlmError::InvalidResponse {
-                    reason: e.to_string(),
-                })
-            })?;
+        let response = self.model.completion(request).await.map_err(|e| {
+            NeuromancerError::Llm(neuromancer_core::error::LlmError::InvalidResponse {
+                reason: e.to_string(),
+            })
+        })?;
 
         // Parse the response into our LlmResponse
         let mut text = None;

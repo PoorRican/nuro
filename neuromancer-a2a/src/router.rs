@@ -1,5 +1,5 @@
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 
 use crate::handlers;
 use crate::state::A2aState;
@@ -15,10 +15,7 @@ pub fn a2a_router(state: A2aState) -> Router {
         .route("/message:stream", post(handlers::message_stream_handler))
         .route("/tasks", get(handlers::list_tasks_handler))
         .route("/tasks/{id}", get(handlers::get_task_handler))
-        .route(
-            "/tasks/{id}:cancel",
-            post(handlers::cancel_task_handler),
-        )
+        .route("/tasks/{id}:cancel", post(handlers::cancel_task_handler))
         .route(
             "/tasks/{id}:subscribe",
             post(handlers::subscribe_task_handler),

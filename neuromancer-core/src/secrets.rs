@@ -59,12 +59,7 @@ pub trait SecretsBroker: Send + Sync {
     async fn list_handles(&self, ctx: &AgentContext) -> Result<Vec<String>, NeuromancerError>;
 
     /// Store a new secret (admin operation).
-    async fn store(
-        &self,
-        id: &str,
-        value: &str,
-        acl: SecretAcl,
-    ) -> Result<(), NeuromancerError>;
+    async fn store(&self, id: &str, value: &str, acl: SecretAcl) -> Result<(), NeuromancerError>;
 
     /// Revoke/delete a secret.
     async fn revoke(&self, id: &str) -> Result<(), NeuromancerError>;

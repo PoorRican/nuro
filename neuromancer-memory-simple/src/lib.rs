@@ -44,36 +44,30 @@ impl SqliteMemoryStore {
         .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
         // Indexes for common query patterns
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memory_partition ON memory_items(partition)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_partition ON memory_items(partition)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory_items(kind)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_kind ON memory_items(kind)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memory_expires ON memory_items(expires_at)",
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memory_expires ON memory_items(expires_at)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
         Ok(())
     }
 
     /// Check that the agent is allowed to access the given partition.
-    fn check_partition_access(
-        ctx: &AgentContext,
-        partition: &str,
-    ) -> Result<(), NeuromancerError> {
-        if ctx.allowed_memory_partitions.contains(&partition.to_string()) {
+    fn check_partition_access(ctx: &AgentContext, partition: &str) -> Result<(), NeuromancerError> {
+        if ctx
+            .allowed_memory_partitions
+            .contains(&partition.to_string())
+        {
             return Ok(());
         }
         Err(NeuromancerError::Policy(
@@ -158,11 +152,8 @@ impl MemoryStore for SqliteMemoryStore {
             bind_values.push(partition.clone());
         } else {
             // Filter to agent's allowed partitions
-            let placeholders: Vec<&str> = ctx
-                .allowed_memory_partitions
-                .iter()
-                .map(|_| "?")
-                .collect();
+            let placeholders: Vec<&str> =
+                ctx.allowed_memory_partitions.iter().map(|_| "?").collect();
             if placeholders.is_empty() {
                 return Ok(MemoryPage {
                     items: vec![],
@@ -271,19 +262,14 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     #[instrument(skip(self, ctx), fields(agent_id = %ctx.agent_id, memory_id = %id))]
-    async fn delete(
-        &self,
-        ctx: &AgentContext,
-        id: MemoryId,
-    ) -> Result<(), NeuromancerError> {
+    async fn delete(&self, ctx: &AgentContext, id: MemoryId) -> Result<(), NeuromancerError> {
         // First check access by fetching the partition
-        let partition: Option<String> = sqlx::query_scalar(
-            "SELECT partition FROM memory_items WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        let partition: Option<String> =
+            sqlx::query_scalar("SELECT partition FROM memory_items WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
         if let Some(ref partition) = partition {
             Self::check_partition_access(ctx, partition)?;
@@ -302,13 +288,12 @@ impl MemoryStore for SqliteMemoryStore {
     #[instrument(skip(self))]
     async fn gc(&self) -> Result<u64, NeuromancerError> {
         let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            "DELETE FROM memory_items WHERE expires_at IS NOT NULL AND expires_at < ?",
-        )
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        let result =
+            sqlx::query("DELETE FROM memory_items WHERE expires_at IS NOT NULL AND expires_at < ?")
+                .bind(&now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
 
         let removed = result.rows_affected();
         if removed > 0 {
@@ -335,10 +320,7 @@ struct MemoryRow {
 
 impl MemoryRow {
     fn to_memory_item(&self) -> Result<MemoryItem, String> {
-        let id: MemoryId = self
-            .id
-            .parse()
-            .map_err(|e| format!("invalid uuid: {e}"))?;
+        let id: MemoryId = self.id.parse().map_err(|e| format!("invalid uuid: {e}"))?;
 
         let kind: MemoryKind = serde_json::from_str(&format!("\"{}\"", self.kind))
             .map_err(|e| format!("invalid kind '{}': {e}", self.kind))?;
@@ -464,7 +446,11 @@ mod tests {
         store
             .put(
                 &ctx,
-                MemoryItem::new("workspace:default".into(), MemoryKind::Summary, "sum 1".into()),
+                MemoryItem::new(
+                    "workspace:default".into(),
+                    MemoryKind::Summary,
+                    "sum 1".into(),
+                ),
             )
             .await
             .unwrap();
@@ -535,14 +521,22 @@ mod tests {
         store
             .put(
                 &ctx,
-                MemoryItem::new("agent:browser".into(), MemoryKind::Fact, "dark mode is preferred".into()),
+                MemoryItem::new(
+                    "agent:browser".into(),
+                    MemoryKind::Fact,
+                    "dark mode is preferred".into(),
+                ),
             )
             .await
             .unwrap();
         store
             .put(
                 &ctx,
-                MemoryItem::new("agent:browser".into(), MemoryKind::Fact, "light theme selected".into()),
+                MemoryItem::new(
+                    "agent:browser".into(),
+                    MemoryKind::Fact,
+                    "light theme selected".into(),
+                ),
             )
             .await
             .unwrap();
@@ -572,8 +566,12 @@ mod tests {
         store
             .put(
                 &ctx,
-                MemoryItem::new("agent:browser".into(), MemoryKind::Fact, "tagged item".into())
-                    .with_tags(vec!["preference".into(), "ui".into()]),
+                MemoryItem::new(
+                    "agent:browser".into(),
+                    MemoryKind::Fact,
+                    "tagged item".into(),
+                )
+                .with_tags(vec!["preference".into(), "ui".into()]),
             )
             .await
             .unwrap();
@@ -705,14 +703,22 @@ mod tests {
         store
             .put(
                 &admin_ctx,
-                MemoryItem::new("agent:browser".into(), MemoryKind::Fact, "browser fact".into()),
+                MemoryItem::new(
+                    "agent:browser".into(),
+                    MemoryKind::Fact,
+                    "browser fact".into(),
+                ),
             )
             .await
             .unwrap();
         store
             .put(
                 &admin_ctx,
-                MemoryItem::new("agent:planner".into(), MemoryKind::Fact, "planner fact".into()),
+                MemoryItem::new(
+                    "agent:planner".into(),
+                    MemoryKind::Fact,
+                    "planner fact".into(),
+                ),
             )
             .await
             .unwrap();

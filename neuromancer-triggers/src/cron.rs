@@ -6,9 +6,7 @@ use tracing::{error, info, instrument, warn};
 
 use neuromancer_core::agent::AgentId;
 use neuromancer_core::config::CronTriggerConfig;
-use neuromancer_core::trigger::{
-    Principal, TriggerEvent, TriggerMetadata, TriggerPayload,
-};
+use neuromancer_core::trigger::{Principal, TriggerEvent, TriggerMetadata, TriggerPayload};
 
 /// Manages all cron trigger jobs.
 pub struct CronTrigger {
@@ -200,9 +198,12 @@ mod tests {
         let params = serde_json::json!({
             "repos": ["org/repo-a", "org/repo-b"]
         });
-        let result =
-            render_template("Summarize issues for repos: {{repos}}.", &params, "test-job")
-                .unwrap();
+        let result = render_template(
+            "Summarize issues for repos: {{repos}}.",
+            &params,
+            "test-job",
+        )
+        .unwrap();
         assert!(result.contains("org/repo-a"));
         assert!(result.contains("org/repo-b"));
     }
@@ -210,8 +211,7 @@ mod tests {
     #[test]
     fn render_builtin_variables() {
         let params = serde_json::json!({});
-        let result =
-            render_template("Job {{job_id}} on {{date}}", &params, "my-job").unwrap();
+        let result = render_template("Job {{job_id}} on {{date}}", &params, "my-job").unwrap();
         assert!(result.contains("my-job"));
         // Date should be YYYY-MM-DD format.
         assert!(result.contains(&Utc::now().format("%Y-%m-%d").to_string()));

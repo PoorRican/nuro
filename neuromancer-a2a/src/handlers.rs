@@ -1,11 +1,11 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use std::convert::Infallible;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::instrument;
 
 use crate::state::{A2aState, A2aTaskRequest};
@@ -54,7 +54,9 @@ pub async fn message_send_handler(
         // Append to existing task.
         match state.get_task(existing_id).await {
             Some(_) => existing_id.clone(),
-            None => return error_response(StatusCode::NOT_FOUND, "task_not_found", "task not found"),
+            None => {
+                return error_response(StatusCode::NOT_FOUND, "task_not_found", "task not found");
+            }
         }
     } else {
         state.create_task(body.message.clone()).await
@@ -67,11 +69,7 @@ pub async fn message_send_handler(
     };
 
     if let Err(e) = state.submit_task(request).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "submit_failed",
-            &e,
-        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "submit_failed", &e);
     }
 
     // Return current task state.
@@ -85,7 +83,11 @@ pub async fn message_send_handler(
             };
             a2a_json(StatusCode::OK, &resp)
         }
-        None => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", "task vanished"),
+        None => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "task vanished",
+        ),
     }
 }
 
@@ -98,7 +100,9 @@ pub async fn message_stream_handler(
     let a2a_task_id = if let Some(ref existing_id) = body.task_id {
         match state.get_task(existing_id).await {
             Some(_) => existing_id.clone(),
-            None => return error_response(StatusCode::NOT_FOUND, "task_not_found", "task not found"),
+            None => {
+                return error_response(StatusCode::NOT_FOUND, "task_not_found", "task not found");
+            }
         }
     } else {
         state.create_task(body.message.clone()).await
@@ -113,21 +117,15 @@ pub async fn message_stream_handler(
     };
 
     if let Err(e) = state.submit_task(request).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "submit_failed",
-            &e,
-        );
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "submit_failed", &e);
     }
 
-    let stream = BroadcastStream::new(rx).map(|result| {
-        match result {
-            Ok(event) => {
-                let data = serde_json::to_string(&event).unwrap_or_default();
-                Ok::<_, Infallible>(Event::default().data(data))
-            }
-            Err(_) => Ok(Event::default().data("{\"type\":\"error\",\"message\":\"stream error\"}")),
+    let stream = BroadcastStream::new(rx).map(|result| match result {
+        Ok(event) => {
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok::<_, Infallible>(Event::default().data(data))
         }
+        Err(_) => Ok(Event::default().data("{\"type\":\"error\",\"message\":\"stream error\"}")),
     });
 
     Sse::new(stream)
@@ -137,10 +135,7 @@ pub async fn message_stream_handler(
 
 /// GET /tasks/{id} — get task status.
 #[instrument(skip(state))]
-pub async fn get_task_handler(
-    State(state): State<A2aState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn get_task_handler(State(state): State<A2aState>, Path(id): Path<String>) -> Response {
     match state.get_task(&id).await {
         Some(record) => {
             let resp = TaskStatusResponse {
@@ -215,13 +210,13 @@ pub async fn subscribe_task_handler(
     match state.get_task(&id).await {
         Some(_) => {
             let rx = state.subscribe(&id).await;
-            let stream = BroadcastStream::new(rx).map(|result| {
-                match result {
-                    Ok(event) => {
-                        let data = serde_json::to_string(&event).unwrap_or_default();
-                        Ok::<_, Infallible>(Event::default().data(data))
-                    }
-                    Err(_) => Ok(Event::default().data("{\"type\":\"error\",\"message\":\"stream error\"}")),
+            let stream = BroadcastStream::new(rx).map(|result| match result {
+                Ok(event) => {
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    Ok::<_, Infallible>(Event::default().data(data))
+                }
+                Err(_) => {
+                    Ok(Event::default().data("{\"type\":\"error\",\"message\":\"stream error\"}"))
                 }
             });
             Sse::new(stream)

@@ -88,9 +88,7 @@ impl Router {
         }
 
         // LLM classifier fallback
-        if let (Some(classifier), Some(text)) =
-            (&self.classifier, extract_message_text(event))
-        {
+        if let (Some(classifier), Some(text)) = (&self.classifier, extract_message_text(event)) {
             let agent_descriptions = registry.agent_descriptions();
             match classifier.classify(&text, &agent_descriptions).await {
                 Ok(Some(agent_id)) => {

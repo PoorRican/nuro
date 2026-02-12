@@ -5,7 +5,9 @@ use tracing::{info, instrument, warn};
 use zeroize::Zeroize;
 
 use neuromancer_core::error::{InfraError, NeuromancerError, PolicyError};
-use neuromancer_core::secrets::{ResolvedSecret, SecretAcl, SecretInjectionMode, SecretRef, SecretUsage, SecretsBroker};
+use neuromancer_core::secrets::{
+    ResolvedSecret, SecretAcl, SecretInjectionMode, SecretRef, SecretUsage, SecretsBroker,
+};
 use neuromancer_core::tool::AgentContext;
 
 mod crypto;
@@ -96,7 +98,8 @@ impl SecretsBroker for SqliteSecretsBroker {
         // Check ACL
         self.check_acl(ctx, &acl)?;
 
-        if !ctx.allowed_mcp_servers.is_empty() && !ctx.allowed_mcp_servers.contains(&usage.tool_id) {
+        if !ctx.allowed_mcp_servers.is_empty() && !ctx.allowed_mcp_servers.contains(&usage.tool_id)
+        {
             return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
                 agent_id: ctx.agent_id.clone(),
                 secret_ref: acl.secret_id.clone(),
@@ -117,21 +120,24 @@ impl SecretsBroker for SqliteSecretsBroker {
             &row.nonce,
             self.master_key.expose_secret().as_bytes(),
         )
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(format!("decryption failed: {e}"))))?;
+        .map_err(|e| {
+            NeuromancerError::Infra(InfraError::Database(format!("decryption failed: {e}")))
+        })?;
 
-        let value = String::from_utf8(plaintext.clone())
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(format!("invalid utf8: {e}"))))?;
+        let value = String::from_utf8(plaintext.clone()).map_err(|e| {
+            NeuromancerError::Infra(InfraError::Database(format!("invalid utf8: {e}")))
+        })?;
 
         plaintext.zeroize();
 
         // Determine injection mode
-        let injection_mode = acl
-            .injection_modes
-            .first()
-            .cloned()
-            .unwrap_or(SecretInjectionMode::EnvVar {
-                name: secret_ref.clone(),
-            });
+        let injection_mode =
+            acl.injection_modes
+                .first()
+                .cloned()
+                .unwrap_or(SecretInjectionMode::EnvVar {
+                    name: secret_ref.clone(),
+                });
 
         info!(
             secret_ref = %secret_ref,
@@ -169,15 +175,13 @@ impl SecretsBroker for SqliteSecretsBroker {
     }
 
     #[instrument(skip(self, value), fields(secret_id = %id))]
-    async fn store(
-        &self,
-        id: &str,
-        value: &str,
-        acl: SecretAcl,
-    ) -> Result<(), NeuromancerError> {
+    async fn store(&self, id: &str, value: &str, acl: SecretAcl) -> Result<(), NeuromancerError> {
         let (encrypted, nonce) =
-            crypto::encrypt(value.as_bytes(), self.master_key.expose_secret().as_bytes())
-                .map_err(|e| NeuromancerError::Infra(InfraError::Database(format!("encryption failed: {e}"))))?;
+            crypto::encrypt(value.as_bytes(), self.master_key.expose_secret().as_bytes()).map_err(
+                |e| {
+                    NeuromancerError::Infra(InfraError::Database(format!("encryption failed: {e}")))
+                },
+            )?;
 
         let allowed_agents = serde_json::to_string(&acl.allowed_agents)
             .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
@@ -253,7 +257,8 @@ impl SecretRow {
             secret_id: self.id.clone(),
             allowed_agents: serde_json::from_str(&self.allowed_agents).unwrap_or_default(),
             allowed_skills: serde_json::from_str(&self.allowed_skills).unwrap_or_default(),
-            allowed_mcp_servers: serde_json::from_str(&self.allowed_mcp_servers).unwrap_or_default(),
+            allowed_mcp_servers: serde_json::from_str(&self.allowed_mcp_servers)
+                .unwrap_or_default(),
             injection_modes: serde_json::from_str(&self.injection_modes).unwrap_or_default(),
         }
     }
@@ -299,7 +304,9 @@ mod tests {
     #[tokio::test]
     async fn store_and_resolve_secret() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         let acl = SecretAcl {
             secret_id: "my-api-key".into(),
@@ -311,7 +318,10 @@ mod tests {
             }],
         };
 
-        broker.store("my-api-key", "super-secret-value", acl).await.unwrap();
+        broker
+            .store("my-api-key", "super-secret-value", acl)
+            .await
+            .unwrap();
 
         let ctx = test_ctx_with_caps("browser", vec!["my-api-key"], vec!["http-client"]);
         let usage = SecretUsage {
@@ -325,13 +335,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.value, "super-secret-value");
-        assert!(matches!(resolved.injection_mode, SecretInjectionMode::EnvVar { name } if name == "API_KEY"));
+        assert!(
+            matches!(resolved.injection_mode, SecretInjectionMode::EnvVar { name } if name == "API_KEY")
+        );
     }
 
     #[tokio::test]
     async fn acl_denies_unauthorized_agent() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         let acl = SecretAcl {
             secret_id: "restricted".into(),
@@ -354,13 +368,18 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })));
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
     }
 
     #[tokio::test]
     async fn resolve_requires_secret_in_agent_context_allowlist() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         broker
             .store(
@@ -398,7 +417,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_honors_secret_acl_allowed_mcp_servers() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         broker
             .store(
@@ -435,7 +456,9 @@ mod tests {
     #[tokio::test]
     async fn list_handles_filters_by_agent() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         // Secret accessible to browser
         broker
@@ -481,7 +504,9 @@ mod tests {
     #[tokio::test]
     async fn revoke_deletes_secret() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         let acl = SecretAcl {
             secret_id: "temp".into(),
@@ -504,13 +529,18 @@ mod tests {
             .resolve_handle_for_tool(&ctx, "temp".into(), usage)
             .await
             .unwrap_err();
-        assert!(matches!(err, NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })));
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
     }
 
     #[tokio::test]
     async fn store_upserts_existing_secret() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key()).await.unwrap();
+        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
 
         let acl = SecretAcl {
             secret_id: "key".into(),
@@ -528,7 +558,10 @@ mod tests {
             tool_id: "t".into(),
             purpose: "t".into(),
         };
-        let resolved = broker.resolve_handle_for_tool(&ctx, "key".into(), usage).await.unwrap();
+        let resolved = broker
+            .resolve_handle_for_tool(&ctx, "key".into(), usage)
+            .await
+            .unwrap();
         assert_eq!(resolved.value, "new-val");
     }
 }

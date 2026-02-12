@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentCapabilities, AgentModelConfig};
+use crate::agent::{
+    AgentCapabilities, AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig,
+};
 use crate::routing::RoutingConfig;
 
 /// Top-level Neuromancer configuration loaded from TOML.

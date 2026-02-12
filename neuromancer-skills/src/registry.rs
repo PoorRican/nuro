@@ -259,7 +259,13 @@ Do the thing.
         registry.load_instructions("test_skill").await.unwrap();
         let skill = registry.get("test_skill").unwrap();
         assert!(skill.instructions.is_some());
-        assert!(skill.instructions.as_ref().unwrap().contains("Do the thing."));
+        assert!(
+            skill
+                .instructions
+                .as_ref()
+                .unwrap()
+                .contains("Do the thing.")
+        );
     }
 
     #[tokio::test]
@@ -270,9 +276,7 @@ Do the thing.
             fs::create_dir_all(&dir).unwrap();
             fs::write(
                 dir.join("SKILL.md"),
-                format!(
-                    "---\nname: \"{name}\"\n---\nInstructions for {name}.\n"
-                ),
+                format!("---\nname: \"{name}\"\n---\nInstructions for {name}.\n"),
             )
             .unwrap();
         }

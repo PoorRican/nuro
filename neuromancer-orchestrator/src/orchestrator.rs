@@ -44,27 +44,15 @@ impl Orchestrator {
                 rendered_instruction,
                 ..
             } => rendered_instruction.clone(),
-            TriggerPayload::AdminCommand { instruction } => {
-                instruction.clone()
-            }
-            TriggerPayload::A2aRequest { content, .. } => {
-                content.to_string()
-            }
+            TriggerPayload::AdminCommand { instruction } => instruction.clone(),
+            TriggerPayload::A2aRequest { content, .. } => content.to_string(),
         };
 
         let trigger_source = match &event.payload {
-            TriggerPayload::Message { .. } => {
-                TriggerSource::Discord
-            }
-            TriggerPayload::CronFire { .. } => {
-                TriggerSource::Cron
-            }
-            TriggerPayload::AdminCommand { .. } => {
-                TriggerSource::AdminApi
-            }
-            TriggerPayload::A2aRequest { .. } => {
-                TriggerSource::A2a
-            }
+            TriggerPayload::Message { .. } => TriggerSource::Discord,
+            TriggerPayload::CronFire { .. } => TriggerSource::Cron,
+            TriggerPayload::AdminCommand { .. } => TriggerSource::AdminApi,
+            TriggerPayload::A2aRequest { .. } => TriggerSource::A2a,
         };
 
         let task = Task::new(trigger_source, instruction, agent_id);
@@ -178,7 +166,9 @@ impl Orchestrator {
             }
 
             RemediationAction::GrantTemporary {
-                capability, scope: _, ..
+                capability,
+                scope: _,
+                ..
             } => {
                 tracing::info!(
                     task_id = %task_id,
@@ -193,9 +183,7 @@ impl Orchestrator {
             }
 
             // NOTE: where does this come from? This implies a model-based router
-            RemediationAction::Clarify {
-                additional_context,
-            } => {
+            RemediationAction::Clarify { additional_context } => {
                 tracing::info!(
                     task_id = %task_id,
                     "injecting clarification context"

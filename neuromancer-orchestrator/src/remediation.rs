@@ -62,18 +62,11 @@ pub fn remediate(report: &SubAgentReport, policy: &RemediationPolicy) -> Remedia
             }
         }
 
-        SubAgentReport::Stuck {
-            reason, ..
-        } => {
-            RemediationAction::Abort {
-                reason: format!("agent stuck: {reason}"),
-            }
-        }
+        SubAgentReport::Stuck { reason, .. } => RemediationAction::Abort {
+            reason: format!("agent stuck: {reason}"),
+        },
 
-        SubAgentReport::InputRequired {
-            question,
-            ..
-        } => RemediationAction::EscalateToUser {
+        SubAgentReport::InputRequired { question, .. } => RemediationAction::EscalateToUser {
             question: question.clone(),
             channel: policy.default_escalation_channel.clone(),
         },
@@ -85,9 +78,7 @@ pub fn remediate(report: &SubAgentReport, policy: &RemediationPolicy) -> Remedia
             }
         }
 
-        SubAgentReport::Failed {
-            error, ..
-        } => RemediationAction::Abort {
+        SubAgentReport::Failed { error, .. } => RemediationAction::Abort {
             reason: format!("agent failed: {error}"),
         },
 

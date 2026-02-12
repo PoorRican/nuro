@@ -98,9 +98,7 @@ impl ChatMessage {
 
     pub fn tool_result(result: ToolResult) -> Self {
         let estimate = match &result.output {
-            neuromancer_core::tool::ToolOutput::Success(v) => {
-                estimate_tokens(&v.to_string())
-            }
+            neuromancer_core::tool::ToolOutput::Success(v) => estimate_tokens(&v.to_string()),
             neuromancer_core::tool::ToolOutput::Error(e) => estimate_tokens(e),
         };
         Self {
@@ -193,16 +191,14 @@ impl ConversationContext {
                     .collect();
 
                 let keep_count = (*keep_last).min(non_system.len());
-                let kept: Vec<ChatMessage> =
-                    non_system[non_system.len() - keep_count..].to_vec();
+                let kept: Vec<ChatMessage> = non_system[non_system.len() - keep_count..].to_vec();
 
                 self.messages = system_msgs;
                 self.messages.extend(kept);
                 self.recalculate_tokens();
             }
             TruncationStrategy::Summarize { threshold_pct, .. } => {
-                let threshold =
-                    (self.token_budget as f32 * threshold_pct) as u32;
+                let threshold = (self.token_budget as f32 * threshold_pct) as u32;
                 if self.token_used > threshold {
                     // For now, fall back to strict truncation.
                     // Full summarization requires an LLM call and would be async.
@@ -269,14 +265,10 @@ impl ConversationContext {
                         }
                     };
                     out.push(rig::completion::Message::User {
-                        content: rig::OneOrMany::one(
-                            rig::message::UserContent::tool_result(
-                                &result.call_id,
-                                rig::OneOrMany::one(
-                                    rig::message::ToolResultContent::text(text),
-                                ),
-                            ),
-                        ),
+                        content: rig::OneOrMany::one(rig::message::UserContent::tool_result(
+                            &result.call_id,
+                            rig::OneOrMany::one(rig::message::ToolResultContent::text(text)),
+                        )),
                     });
                 }
                 // System messages are handled via preamble, not chat history
@@ -340,10 +332,8 @@ mod tests {
 
     #[test]
     fn sliding_window_keeps_last_n() {
-        let mut ctx = ConversationContext::new(
-            10,
-            TruncationStrategy::SlidingWindow { keep_last: 1 },
-        );
+        let mut ctx =
+            ConversationContext::new(10, TruncationStrategy::SlidingWindow { keep_last: 1 });
         ctx.add_message(ChatMessage::system("sys"));
         ctx.add_message(ChatMessage::user("old".repeat(100)));
         ctx.add_message(ChatMessage::user("new"));

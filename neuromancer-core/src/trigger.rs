@@ -7,10 +7,17 @@ use crate::agent::AgentId;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Principal {
     // NOTE: DiscordUser should be more generic. And what is the distinction from `Admin`?
-    DiscordUser { user_id: String, guild_id: Option<String> },
+    DiscordUser {
+        user_id: String,
+        guild_id: Option<String>,
+    },
     System,
-    Cron { job_id: String },
-    A2aPeer { agent_id: AgentId },
+    Cron {
+        job_id: String,
+    },
+    A2aPeer {
+        agent_id: AgentId,
+    },
     Admin,
 }
 

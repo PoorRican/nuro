@@ -60,16 +60,18 @@ impl StdioMcpServer {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            McpError::SpawnFailed(format!("failed to spawn '{program}': {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| McpError::SpawnFailed(format!("failed to spawn '{program}': {e}")))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpError::SpawnFailed("failed to capture stdin".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpError::SpawnFailed("failed to capture stdout".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| McpError::SpawnFailed("failed to capture stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| McpError::SpawnFailed("failed to capture stdout".into()))?;
 
         let server = Self {
             server_id: server_id.to_string(),
@@ -131,12 +133,10 @@ impl StdioMcpServer {
         }
 
         // Read lines until we get a response with our id.
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.read_response(id),
-        )
-        .await
-        .map_err(|_| McpError::Timeout)??;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.read_response(id))
+                .await
+                .map_err(|_| McpError::Timeout)??;
 
         response.into_result()
     }
@@ -178,9 +178,7 @@ impl StdioMcpServer {
             buf.clear();
             let n = stdout.read_line(&mut buf).await?;
             if n == 0 {
-                return Err(McpError::Transport(
-                    "server closed stdout".into(),
-                ));
+                return Err(McpError::Transport("server closed stdout".into()));
             }
             let trimmed = buf.trim();
             if trimmed.is_empty() {
@@ -221,10 +219,8 @@ impl McpClient for StdioMcpServer {
             .cloned()
             .unwrap_or(serde_json::Value::Array(vec![]));
 
-        let tools: Vec<McpToolDefinition> =
-            serde_json::from_value(tools_value).map_err(|e| {
-                McpError::Protocol(format!("failed to parse tools list: {e}"))
-            })?;
+        let tools: Vec<McpToolDefinition> = serde_json::from_value(tools_value)
+            .map_err(|e| McpError::Protocol(format!("failed to parse tools list: {e}")))?;
 
         Ok(tools)
     }
@@ -321,7 +317,8 @@ mod tests {
 
     #[test]
     fn json_rpc_error_response() {
-        let json = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
         let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
         let err = resp.into_result();
         assert!(err.is_err());

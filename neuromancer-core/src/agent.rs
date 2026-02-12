@@ -180,7 +180,10 @@ pub enum TaskExecutionState {
     },
 
     /// Task suspended (long-running, crash recovery, or resource pressure).
-    Suspended { checkpoint: Checkpoint, reason: String },
+    Suspended {
+        checkpoint: Checkpoint,
+        reason: String,
+    },
 }
 
 /// Report from a sub-agent to the orchestrator.
@@ -273,7 +276,8 @@ impl CircuitBreakerState {
     }
 
     pub fn record_failure(&mut self, now: DateTime<Utc>) {
-        let window = chrono::Duration::from_std(self.config.window).unwrap_or(chrono::Duration::minutes(10));
+        let window =
+            chrono::Duration::from_std(self.config.window).unwrap_or(chrono::Duration::minutes(10));
         self.failure_timestamps.retain(|t| now - *t < window);
         self.failure_timestamps.push(now);
         if self.failure_timestamps.len() >= self.config.failures as usize {

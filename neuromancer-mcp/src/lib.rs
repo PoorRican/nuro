@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use neuromancer_core::config::McpServerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::tool::{AgentContext, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec};
+use neuromancer_core::tool::{
+    AgentContext, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
+};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -117,16 +119,9 @@ impl McpClientPool {
             match config.kind {
                 neuromancer_core::config::McpServerKind::ChildProcess => {
                     let cmd = config.command.as_ref().ok_or_else(|| {
-                        McpError::SpawnFailed(format!(
-                            "child_process server '{id}' has no command"
-                        ))
+                        McpError::SpawnFailed(format!("child_process server '{id}' has no command"))
                     })?;
-                    let server = StdioMcpServer::spawn(
-                        &id,
-                        cmd,
-                        &config.env,
-                    )
-                    .await?;
+                    let server = StdioMcpServer::spawn(&id, cmd, &config.env).await?;
                     let client: Arc<dyn McpClient> = Arc::new(server);
                     let tools = client.list_tools().await.unwrap_or_default();
                     info!(server_id = %id, tool_count = tools.len(), "MCP server started");
@@ -240,7 +235,10 @@ impl McpClientPool {
             .handle
             .as_ref()
             .ok_or_else(|| McpError::ServerNotRunning(server_id.to_string()))?;
-        match handle.call_tool(&call.tool_id, call.arguments.clone()).await {
+        match handle
+            .call_tool(&call.tool_id, call.arguments.clone())
+            .await
+        {
             Ok(value) => Ok(ToolResult {
                 call_id: call.id.clone(),
                 output: ToolOutput::Success(value),

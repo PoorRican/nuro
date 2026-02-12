@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::types::{
-    A2aArtifact, A2aMessage, A2aTaskRecord, A2aTaskStatus, AgentCard, Part,
-};
+use crate::types::{A2aArtifact, A2aMessage, A2aTaskRecord, A2aTaskStatus, AgentCard, Part};
 use neuromancer_core::agent::SubAgentReport;
 use neuromancer_core::task::TaskId;
 
@@ -22,7 +20,8 @@ struct A2aStateInner {
     /// Channel to submit new task requests to the orchestrator.
     task_sender: tokio::sync::mpsc::Sender<A2aTaskRequest>,
     /// SSE subscribers: task_id -> list of broadcast senders.
-    subscribers: RwLock<HashMap<String, Vec<tokio::sync::broadcast::Sender<crate::types::StreamEvent>>>>,
+    subscribers:
+        RwLock<HashMap<String, Vec<tokio::sync::broadcast::Sender<crate::types::StreamEvent>>>>,
 }
 
 /// A request submitted from the A2A layer to the orchestrator.
@@ -207,9 +206,7 @@ fn map_report_to_a2a(report: &SubAgentReport) -> (A2aTaskStatus, Vec<A2aArtifact
                 .collect();
             (A2aTaskStatus::Failed, artifacts)
         }
-        SubAgentReport::ToolFailure {
-            retry_eligible, ..
-        } => {
+        SubAgentReport::ToolFailure { retry_eligible, .. } => {
             if *retry_eligible {
                 (A2aTaskStatus::Working, vec![])
             } else {

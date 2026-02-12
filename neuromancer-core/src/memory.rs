@@ -106,7 +106,8 @@ pub struct MemoryPage {
 /// Persistent, partitioned memory store.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
-    async fn put(&self, ctx: &AgentContext, item: MemoryItem) -> Result<MemoryId, NeuromancerError>;
+    async fn put(&self, ctx: &AgentContext, item: MemoryItem)
+    -> Result<MemoryId, NeuromancerError>;
     async fn query(
         &self,
         ctx: &AgentContext,

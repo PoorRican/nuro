@@ -19,14 +19,11 @@ impl ModelRouter {
     /// Resolve a slot name, applying per-agent overrides.
     /// Agent model config maps roles (planner, executor, verifier) to slot names.
     /// The slot name then resolves to a ModelSlotConfig via the global map.
-    pub fn resolve(
-        &self,
-        slot: &str,
-    ) -> Result<&ModelSlotConfig, NeuromancerError> {
+    pub fn resolve(&self, slot: &str) -> Result<&ModelSlotConfig, NeuromancerError> {
         self.global_slots.get(slot).ok_or_else(|| {
-            NeuromancerError::Infra(neuromancer_core::error::InfraError::Config(
-                format!("model slot '{slot}' not found in global config"),
-            ))
+            NeuromancerError::Infra(neuromancer_core::error::InfraError::Config(format!(
+                "model slot '{slot}' not found in global config"
+            )))
         })
     }
 

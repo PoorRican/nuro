@@ -10,8 +10,8 @@ use neuromancer_core::config::NeuromancerConfig;
 
 /// Load and deserialize config from a TOML file.
 pub fn load_config(path: &Path) -> Result<NeuromancerConfig> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading config: {}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config: {}", path.display()))?;
     let config: NeuromancerConfig =
         toml::from_str(&content).with_context(|| format!("parsing config: {}", path.display()))?;
     Ok(config)
@@ -52,7 +52,11 @@ pub fn validate_config(config: &NeuromancerConfig) -> Result<()> {
 
     // Check agent model slot references
     for (name, agent) in &config.agents {
-        for slot in [&agent.models.planner, &agent.models.executor, &agent.models.verifier] {
+        for slot in [
+            &agent.models.planner,
+            &agent.models.executor,
+            &agent.models.verifier,
+        ] {
             if let Some(slot_name) = slot {
                 if !config.models.contains_key(slot_name) {
                     anyhow::bail!(
@@ -112,13 +116,10 @@ pub fn spawn_config_watcher(
     let (tx, rx) = watch::channel(Arc::new(initial));
 
     let watched_path = path.to_path_buf();
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match res {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
-                if matches!(
-                    event.kind,
-                    EventKind::Modify(_) | EventKind::Create(_)
-                ) {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                     info!("config file changed, reloading");
                     match load_config(&watched_path) {
                         Ok(new_config) => match validate_config(&new_config) {
@@ -141,8 +142,7 @@ pub fn spawn_config_watcher(
             Err(e) => {
                 error!("config file watcher error: {e}");
             }
-        }
-    })?;
+        })?;
 
     watcher.watch(path, RecursiveMode::NonRecursive)?;
 

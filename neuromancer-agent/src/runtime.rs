@@ -1,14 +1,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use neuromancer_core::agent::{
-    AgentConfig, SubAgentReport, TaskExecutionState,
-};
+use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
 use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::task::{
     Artifact, ArtifactKind, Checkpoint, Task, TaskOutput, TaskState, TokenUsage,
 };
-use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSpec};
+use neuromancer_core::tool::{
+    AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSpec,
+};
 
 use crate::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use crate::llm::LlmClient;
@@ -241,11 +241,7 @@ impl AgentRuntime {
         prompt
     }
 
-    async fn execute_tool_call(
-        &self,
-        ctx: &AgentContext,
-        call: &ToolCall,
-    ) -> ToolResult {
+    async fn execute_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> ToolResult {
         match self.tool_broker.call_tool(ctx, call.clone()).await {
             Ok(result) => result,
             Err(e) => ToolResult {
@@ -289,8 +285,7 @@ mod tests {
     use super::*;
     use crate::llm::{LlmResponse, MockLlmClient};
     use neuromancer_core::agent::{
-        AgentCapabilities, AgentHealthConfig, AgentMode,
-        AgentModelConfig,
+        AgentCapabilities, AgentHealthConfig, AgentMode, AgentModelConfig,
     };
     use neuromancer_core::task::Task;
     use neuromancer_core::trigger::TriggerSource;
