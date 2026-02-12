@@ -104,6 +104,21 @@ pub struct OrchestratorTurnResult {
     pub delegated_runs: Vec<DelegatedRun>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorRunsListResult {
+    pub runs: Vec<DelegatedRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorRunGetParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorRunGetResult {
+    pub run: DelegatedRun,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +163,23 @@ mod tests {
 
         let encoded = serde_json::to_string(&result).expect("result should serialize");
         let decoded: OrchestratorTurnResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn orchestrator_runs_list_result_roundtrip() {
+        let result = OrchestratorRunsListResult {
+            runs: vec![DelegatedRun {
+                run_id: "run-1".to_string(),
+                agent_id: "planner".to_string(),
+                state: "completed".to_string(),
+                summary: Some("ok".to_string()),
+            }],
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: OrchestratorRunsListResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }
