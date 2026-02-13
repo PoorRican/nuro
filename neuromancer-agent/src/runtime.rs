@@ -78,7 +78,7 @@ impl AgentRuntime {
         // Add system prompt
         // NOTE: [med pri] additional Markdown stack (eg: SOUL.md, USER.md, etc) would be compiled here.
         // Ideally, these would be part of the config and included in `agent_ctx`
-        let system_prompt = self.build_system_prompt();
+        let system_prompt = self.config.system_prompt.clone();
         conversation.add_message(ChatMessage::system(&system_prompt));
 
         // Add task instruction as user message
@@ -262,7 +262,7 @@ impl AgentRuntime {
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
 
-        let system_prompt = self.build_system_prompt();
+        let system_prompt = self.config.system_prompt.clone();
         let default_conversation = {
             let mut conversation = ConversationContext::new(
                 u32::MAX,
@@ -399,21 +399,6 @@ impl AgentRuntime {
         })
     }
 
-    fn build_system_prompt(&self) -> String {
-        let mut prompt = String::new();
-
-        if let Some(preamble) = &self.config.preamble {
-            prompt.push_str(preamble);
-        } else {
-            prompt.push_str(&format!(
-                "You are agent '{}'. Follow instructions precisely and use available tools when needed.",
-                self.config.id
-            ));
-        }
-
-        prompt
-    }
-
     async fn execute_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> ToolResult {
         match self.tool_broker.call_tool(ctx, call.clone()).await {
             Ok(result) => result,
@@ -490,7 +475,7 @@ mod tests {
             models: AgentModelConfig::default(),
             capabilities: AgentCapabilities::default(),
             health: AgentHealthConfig::default(),
-            preamble: Some("You are a test agent.".into()),
+            system_prompt: "You are a test agent.".into(),
             max_iterations: 5,
         }
     }

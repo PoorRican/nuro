@@ -16,6 +16,7 @@ use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
 };
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
+use neuromancer_core::xdg::{XdgLayout, resolve_path, validate_markdown_prompt_file};
 use neuromancer_skills::{SkillMetadata, SkillRegistry};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -110,8 +111,17 @@ impl RuntimeCore {
 }
 
 impl MessageRuntime {
-    pub async fn new(config: &NeuromancerConfig) -> Result<Self, MessageRuntimeError> {
-        let (skills_dir, local_root) = default_xdg_paths()?;
+    pub async fn new(
+        config: &NeuromancerConfig,
+        config_path: &Path,
+    ) -> Result<Self, MessageRuntimeError> {
+        let layout = XdgLayout::from_env().map_err(map_xdg_err)?;
+        let skills_dir = layout.skills_dir();
+        let local_root = layout.runtime_root();
+        let config_dir = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         let mut skill_registry = SkillRegistry::new(vec![skills_dir.clone()]);
         skill_registry
@@ -129,6 +139,15 @@ impl MessageRuntime {
                 agent_config.preamble,
                 &agent_config.capabilities.skills,
             ));
+            let prompt_path = resolve_path(
+                agent_toml.system_prompt_path.as_deref(),
+                layout.default_agent_system_prompt_path(agent_id),
+                &config_dir,
+                layout.home_dir(),
+            )
+            .map_err(map_xdg_err)?;
+            let system_prompt = load_system_prompt_file(&prompt_path)?;
+            let agent_config = agent_toml.to_agent_config(agent_id, system_prompt);
 
             let llm_client = build_llm_client(config, &agent_config)?;
             let broker: Arc<dyn ToolBroker> = Arc::new(SkillToolBroker::new(
@@ -163,7 +182,22 @@ impl MessageRuntime {
         );
         let runtime_broker = system0_broker.clone();
 
-        let orchestrator_config = build_orchestrator_config(config);
+        let orchestrator_prompt_path = resolve_path(
+            config.orchestrator.system_prompt_path.as_deref(),
+            layout.default_orchestrator_system_prompt_path(),
+            &config_dir,
+            layout.home_dir(),
+        )
+        .map_err(map_xdg_err)?;
+        let orchestrator_prompt_template = load_system_prompt_file(&orchestrator_prompt_path)?;
+        let orchestrator_prompt = render_orchestrator_prompt(
+            &orchestrator_prompt_template,
+            config.agents.keys().cloned().collect(),
+            allowlisted_system0_tools.clone(),
+        );
+
+        let orchestrator_config =
+            build_orchestrator_config(config, allowlisted_system0_tools, orchestrator_prompt);
         let orchestrator_llm = build_llm_client(config, &orchestrator_config)?;
         let orchestrator_runtime = Arc::new(AgentRuntime::new(
             orchestrator_config,
@@ -580,16 +614,40 @@ impl ToolBroker for System0ToolBroker {
     }
 }
 
-fn append_tool_requirements(preamble: Option<String>, skills: &[String]) -> String {
-    let mut text = preamble.unwrap_or_else(|| "You are a helpful sub-agent.".to_string());
-    if !skills.is_empty() {
-        let joined = skills.join(", ");
-        text.push_str(
-            "\n\nYou can use allowlisted skill tools to gather required data before answering.",
-        );
-        text.push_str(&format!("\nAvailable tools: {joined}."));
+fn map_xdg_err(err: neuromancer_core::xdg::XdgError) -> MessageRuntimeError {
+    MessageRuntimeError::Config(err.to_string())
+}
+
+fn default_system0_tools() -> Vec<String> {
+    vec![
+        "delegate_to_agent".to_string(),
+        "list_agents".to_string(),
+        "read_config".to_string(),
+        "modify_skill".to_string(),
+    ]
+}
+
     }
-    text
+}
+
+fn load_system_prompt_file(path: &Path) -> Result<String, MessageRuntimeError> {
+    validate_markdown_prompt_file(path).map_err(map_xdg_err)?;
+    fs::read_to_string(path).map_err(|err| {
+        MessageRuntimeError::Config(format!("failed to read system prompt '{}': {err}", path.display()))
+    })
+}
+
+fn render_orchestrator_prompt(
+    template: &str,
+    mut agents: Vec<String>,
+    mut tools: Vec<String>,
+) -> String {
+    agents.sort();
+    tools.sort();
+    template
+        .replace("{{ORCHESTRATOR_ID}}", SYSTEM0_AGENT_ID)
+        .replace("{{AVAILABLE_AGENTS}}", &agents.join(", "))
+        .replace("{{AVAILABLE_TOOLS}}", &tools.join(", "))
 }
 
 fn build_llm_client(
@@ -864,20 +922,6 @@ fn skill_tool_from_metadata(metadata: &SkillMetadata) -> SkillTool {
     }
 }
 
-fn default_xdg_paths() -> Result<(PathBuf, PathBuf), MessageRuntimeError> {
-    let home = home_dir()?;
-    let skills_dir = home.join(".config/neuromancer/skills");
-    let local_root = home.join(".local/neuromancer");
-    Ok((skills_dir, local_root))
-}
-
-fn home_dir() -> Result<PathBuf, MessageRuntimeError> {
-    let home = std::env::var("HOME").map_err(|_| {
-        MessageRuntimeError::Config("HOME environment variable is not set".to_string())
-    })?;
-    Ok(PathBuf::from(home))
-}
-
 fn resolve_local_data_path(
     local_root: &Path,
     relative: &str,
@@ -1047,5 +1091,17 @@ mod tests {
         let resolved = resolve_local_data_path(&local_root, "data/accounts.csv")
             .expect("relative path should resolve");
         assert_eq!(resolved, fs::canonicalize(file_path).expect("canonical"));
+    }
+
+    #[test]
+    fn render_orchestrator_prompt_expands_placeholders() {
+        let rendered = render_orchestrator_prompt(
+            "id={{ORCHESTRATOR_ID}} agents={{AVAILABLE_AGENTS}} tools={{AVAILABLE_TOOLS}}",
+            vec!["planner".into(), "browser".into()],
+            vec!["read_config".into(), "list_agents".into()],
+        );
+        assert!(rendered.contains("id=system0"));
+        assert!(rendered.contains("agents=browser, planner"));
+        assert!(rendered.contains("tools=list_agents, read_config"));
     }
 }
