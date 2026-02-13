@@ -61,8 +61,9 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Args)]
 pub struct DaemonStartArgs {
+    /// Config file path. Defaults to XDG config location when omitted.
     #[arg(long)]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     #[arg(long)]
     pub daemon_bin: Option<PathBuf>,
@@ -126,8 +127,9 @@ pub enum E2eCommand {
 
 #[derive(Debug, Args)]
 pub struct E2eSmokeArgs {
+    /// Config file path. Defaults to XDG config location when omitted.
     #[arg(long)]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     #[arg(long)]
     pub daemon_bin: Option<PathBuf>,
@@ -177,8 +179,6 @@ mod tests {
             "neuroctl",
             "daemon",
             "start",
-            "--config",
-            "/tmp/config.toml",
             "--wait-healthy",
         ])
         .expect("cli should parse");
@@ -188,7 +188,30 @@ mod tests {
                 command: DaemonCommand::Start(args),
             } => {
                 assert!(args.wait_healthy);
+                assert!(args.config.is_none());
                 assert_eq!(args.pid_file, PathBuf::from("/tmp/neuromancer.pid"));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_daemon_start_with_explicit_config() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "daemon",
+            "start",
+            "--config",
+            "/tmp/config.toml",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Daemon {
+                command: DaemonCommand::Start(args),
+            } => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
+                assert!(!args.wait_healthy);
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
