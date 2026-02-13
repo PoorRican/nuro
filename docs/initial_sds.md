@@ -43,8 +43,8 @@ Neuromancer is explicitly designed around failures we've now repeatedly seen in 
 1. **Daemon-first architecture**
    A resilient, long-running service with explicit lifecycle management and resource controls (no "CLI app that you keep alive with prayers").
 
-2. **Hybrid orchestration, LLM-powered agents**
-   The orchestrator is primarily a deterministic supervisor that routes via config rules. When no rule matches (e.g., arbitrary user messages), it falls back to a lightweight LLM routing call to classify intent and select the target agent. All complex reasoning, planning, and multi-step tool use happens in sub-agents via rig.
+2. **System0 orchestration, LLM-powered agents**
+   The orchestrator is a first-class LLM runtime (System0) that mediates user/admin turns, policy, and delegation. It handles `orchestrator.turn` ingress directly, maintains one ongoing conversation context, and delegates complex execution to sub-agents via controlled tooling.
 
 3. **No new plugin protocol**
 
@@ -65,7 +65,7 @@ Neuromancer is explicitly designed around failures we've now repeatedly seen in 
    * Export via OpenTelemetry OTLP
 
 6. **Admin API for runtime introspection**
-   Localhost HTTP endpoints for task inspection, agent health, cron management, and manual task submission.
+   Localhost HTTP endpoints for orchestrator turns, run inspection, agent health, and cron management.
 
 ### 2.2 Non-goals (v0.1-alpha)
 
@@ -139,11 +139,11 @@ Sub-agents are the **only** components that call LLMs. They are constructed usin
 ```
                         +-------------------------------+
 Discord / Cron -------->|     neuromancerd (control)     |<-------- Admin API
-  Triggers              |  Orchestrator (hybrid routing)  |         (localhost)
-                        |  - rules + LLM classifier      |
+  Triggers              |  Orchestrator (System0 LLM)     |         (localhost)
+                        |  - turn ingress queue          |
+                        |  - delegated run tracking      |
                         |  - secrets broker              |
                         |  - memory store                |
-                        |  - task queue                  |
                         |  - policy engine               |
                         |  - OTEL exporter               |
                         +-------+----------+--------+----+
@@ -163,7 +163,7 @@ Discord / Cron -------->|     neuromancerd (control)     |<-------- Admin API
            [MCP servers...]   [Playwright MCP]    [FS MCP / built-in]
 ```
 
-**Key difference from v0.5-r1:** There is no "Agent: core (planner/router)" that is itself an LLM agent. The orchestrator handles routing via deterministic rules first, falling back to a lightweight LLM classifier for ambiguous inputs. Sub-agents do all complex reasoning. Sub-agents may still delegate to each other via A2A, but the orchestrator is the supervisor, not a peer.
+**Key difference from v0.5-r1:** There is no deterministic global routing layer in v0.1-alpha. System0 handles turns directly as the orchestrator.
 
 ---
 
@@ -226,9 +226,9 @@ Agent Skills as a broader convention emphasizes progressive disclosure: metadata
 * **Sub-agents can run skills, use MCP, and A2A**
   ToolBroker with 3 backends: SkillsExecutor, McpClientPool (via rig `.mcp_tool()`), A2aClient.
 * **Centralized configuration format (TOML)**
-  Single TOML file defines agents, routing rules, triggers, servers, secrets, memory partitions.
+  Single TOML file defines models, orchestrator/agent prompts, triggers, servers, secrets, and memory partitions.
 * **Trigger system to orchestrator**
-  Trigger Manager produces tasks into queue → Orchestrator routes via rules.
+  Trigger Manager emits trigger events into System0 input queue; System0 processes turns and delegates as needed.
 * **Triggers supported: Discord and cron**
   Discord via `twilight`; cron via `tokio-cron-scheduler`.
 * **Secure secrets store with access controls**
@@ -830,11 +830,11 @@ Example config:
 
 ```toml
 [models]
-router = { provider = "openai", model = "gpt-4o-mini" }    # orchestrator intent classifier
-planner = { provider = "openai", model = "gpt-4o" }
-executor = { provider = "openai", model = "gpt-4o" }
-browser = { provider = "anthropic", model = "claude-sonnet-4-5-20250929" }
-verifier = { provider = "openai", model = "gpt-4o-mini" }
+orchestrator = { provider = "groq", model = "openai/gpt-oss-120B" }
+planner = { provider = "groq", model = "openai/gpt-oss-120B" }
+executor = { provider = "groq", model = "openai/gpt-oss-120B" }
+browser = { provider = "groq", model = "openai/gpt-oss-120B" }
+verifier = { provider = "groq", model = "openai/gpt-oss-120B" }
 ```
 
 ### 7.5 Embeddings and RAG (future)
@@ -1490,7 +1490,7 @@ Each task run emits spans:
 
 * `trigger.receive`
 * `task.create`
-* `task.route` (which routing rule matched)
+* `orchestrator.turn`
 * `agent.dispatch`
 * `agent.state_transition` (from → to state, with state machine context)
 * `llm.call` (model id, token counts, latency)
@@ -1657,11 +1657,10 @@ neuromancer/
 6. **`neuromancer-memory-simple`**: partitioned SQLite schema, basic query
 7. **`neuromancer-mcp`**: MCP client pool using rmcp
 8. **`neuromancer-agent`**: rig-based agent runtime, state machine, conversation context
-9. **`neuromancer-orchestrator`**: routing, task queue, supervision loop, remediation
-10. **`neuromancer-a2a`**: A2A HTTP+JSON endpoints
-11. **`neuromancer-triggers`**: cron + Discord
-12. **`neuromancer-skills`**: skill loader + permission declarations + linter MVP
-13. **`neuromancerd`**: daemon lifecycle, admin API, integration
+9. **`neuromancer-a2a`**: A2A HTTP+JSON endpoints
+10. **`neuromancer-triggers`**: cron + Discord
+11. **`neuromancer-skills`**: skill loader + permission declarations + linter MVP
+12. **`neuromancerd`**: daemon lifecycle, admin API, integration
 
 ---
 

@@ -105,7 +105,7 @@ For System0, `[orchestrator]` config controls:
 - max iterations
 
 Canonical example: `samples/v0_1_alpha/neuromancer.toml`.
-Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`. Install always bootstraps missing config/prompt/runtime assets without overwriting existing files.
+Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`. Use `--override-config` to replace the target config file from bootstrap defaults.
 XDG layout defaults resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
 Install bootstraps by copying `defaults/bootstrap/` into the XDG config root (non-overwriting). Per-agent prompt files are then created at `agents/<agent_name>/SYSTEM.md` from `defaults/templates/agent/SYSTEM.md` when agents are configured.
 
