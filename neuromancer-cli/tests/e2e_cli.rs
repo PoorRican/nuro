@@ -382,6 +382,7 @@ fn install_without_config_uses_xdg_config_and_data_home() {
     let orchestrator_prompt = xdg_config_home.join("neuromancer/orchestrator/SYSTEM.md");
     let planner_prompt = xdg_config_home.join("neuromancer/agents/planner/SYSTEM.md");
     let runtime_root = xdg_data_home.join("neuromancer");
+    let provider_keys_root = xdg_data_home.join("neuromancer/provider_keys");
     assert!(
         generated_config.exists(),
         "install should bootstrap blank-slate config under XDG_CONFIG_HOME",
@@ -397,6 +398,10 @@ fn install_without_config_uses_xdg_config_and_data_home() {
     assert!(
         runtime_root.exists(),
         "install should create runtime root under XDG_DATA_HOME",
+    );
+    assert!(
+        provider_keys_root.exists(),
+        "install should create provider key directory under runtime home fallback",
     );
 }
 
@@ -438,6 +443,7 @@ fn install_with_missing_explicit_config_bootstraps() {
     let orchestrator_prompt = xdg_config_home.join("neuromancer/orchestrator/SYSTEM.md");
     let planner_prompt = xdg_config_home.join("neuromancer/agents/planner/SYSTEM.md");
     let runtime_root = xdg_data_home.join("neuromancer");
+    let provider_keys_root = xdg_data_home.join("neuromancer/provider_keys");
     assert!(
         orchestrator_prompt.exists(),
         "install should create orchestrator prompt under XDG_CONFIG_HOME",
@@ -449,6 +455,10 @@ fn install_with_missing_explicit_config_bootstraps() {
     assert!(
         runtime_root.exists(),
         "install should create runtime root under XDG_DATA_HOME",
+    );
+    assert!(
+        provider_keys_root.exists(),
+        "install should create provider key directory under runtime home fallback",
     );
 }
 
