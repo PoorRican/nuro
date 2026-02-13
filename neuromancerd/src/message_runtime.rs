@@ -21,6 +21,7 @@ use neuromancer_skills::{SkillMetadata, SkillRegistry};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
+const SYSTEM0_AGENT_ID: &str = "system0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageRuntimeError {
@@ -132,13 +133,10 @@ impl MessageRuntime {
         let (report_tx, mut report_rx) = mpsc::channel(256);
         let report_worker = tokio::spawn(async move { while report_rx.recv().await.is_some() {} });
 
+        let allowlisted_system0_tools =
+            effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
         let mut subagents = HashMap::<String, Arc<AgentRuntime>>::new();
         for (agent_id, agent_toml) in &config.agents {
-            let mut agent_config = agent_toml.to_agent_config(agent_id);
-            agent_config.preamble = Some(append_tool_requirements(
-                agent_config.preamble,
-                &agent_config.capabilities.skills,
-            ));
             let prompt_path = resolve_path(
                 agent_toml.system_prompt_path.as_deref(),
                 layout.default_agent_system_prompt_path(agent_id),
@@ -175,11 +173,7 @@ impl MessageRuntime {
         let config_snapshot = serde_json::to_value(config)
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
-        let system0_broker = System0ToolBroker::new(
-            subagents,
-            config_snapshot,
-            &config.orchestrator.capabilities.skills,
-        );
+        let system0_broker = System0ToolBroker::new(subagents, config_snapshot, &allowlisted_system0_tools);
         let runtime_broker = system0_broker.clone();
 
         let orchestrator_prompt_path = resolve_path(
@@ -284,19 +278,15 @@ impl MessageRuntime {
     }
 }
 
-fn build_orchestrator_config(config: &NeuromancerConfig) -> AgentConfig {
+fn build_orchestrator_config(
+    config: &NeuromancerConfig,
+    allowlisted_tools: Vec<String>,
+    system_prompt: String,
+) -> AgentConfig {
     let mut capabilities = config.orchestrator.capabilities.clone();
-    if capabilities.skills.is_empty() {
-        capabilities.skills = vec![
-            "delegate_to_agent".to_string(),
-            "list_agents".to_string(),
-            "read_config".to_string(),
-            "modify_skill".to_string(),
-        ];
-    }
-
+    capabilities.skills = allowlisted_tools;
     AgentConfig {
-        id: "system0".to_string(),
+        id: SYSTEM0_AGENT_ID.to_string(),
         mode: AgentMode::Inproc,
         image: None,
         models: AgentModelConfig {
@@ -306,9 +296,7 @@ fn build_orchestrator_config(config: &NeuromancerConfig) -> AgentConfig {
         },
         capabilities,
         health: AgentHealthConfig::default(),
-        preamble: Some(config.orchestrator.preamble.clone().unwrap_or_else(|| {
-            "You are System 0. You mediate user intent and delegate to specialized sub-agents using tools.".to_string()
-        })),
+        system_prompt,
         max_iterations: config.orchestrator.max_iterations,
     }
 }
@@ -336,15 +324,8 @@ impl System0ToolBroker {
         config_snapshot: serde_json::Value,
         allowlisted_tools: &[String],
     ) -> Self {
-        let default_tools = vec![
-            "delegate_to_agent".to_string(),
-            "list_agents".to_string(),
-            "read_config".to_string(),
-            "modify_skill".to_string(),
-        ];
-
         let allowlisted_tools = if allowlisted_tools.is_empty() {
-            default_tools.into_iter().collect()
+            default_system0_tools().into_iter().collect()
         } else {
             allowlisted_tools.iter().cloned().collect()
         };
@@ -627,6 +608,11 @@ fn default_system0_tools() -> Vec<String> {
     ]
 }
 
+fn effective_system0_tool_allowlist(configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        default_system0_tools()
+    } else {
+        configured.to_vec()
     }
 }
 
