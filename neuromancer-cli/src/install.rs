@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -12,6 +12,15 @@ use crate::CliError;
 pub struct InstallResult {
     pub created: Vec<String>,
     pub existing: Vec<String>,
+}
+
+pub fn resolve_install_config_path(config_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(path) = config_path {
+        return Ok(path);
+    }
+
+    let layout = XdgLayout::from_env().map_err(|err| CliError::Lifecycle(err.to_string()))?;
+    Ok(layout.default_config_path())
 }
 
 pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {

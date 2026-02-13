@@ -106,46 +106,6 @@ enabled = true
     config_path
 }
 
-fn write_orchestrator_config_with_default_prompts(dir: &Path, bind_addr: &str) -> PathBuf {
-    let config_path = dir.join("neuromancer-default-prompts.toml");
-    let config = format!(
-        r#"
-[global]
-instance_id = "test-instance"
-workspace_dir = "/tmp"
-data_dir = "/tmp"
-
-[models.executor]
-provider = "mock"
-model = "test-double"
-
-[routing]
-default_agent = "planner"
-rules = []
-
-[orchestrator]
-model_slot = "executor"
-
-[agents.planner]
-models.executor = "executor"
-capabilities.skills = []
-capabilities.mcp_servers = []
-capabilities.a2a_peers = []
-capabilities.secrets = []
-capabilities.memory_partitions = []
-capabilities.filesystem_roots = []
-
-[admin_api]
-bind_addr = "{}"
-enabled = true
-"#,
-        bind_addr
-    );
-
-    fs::write(&config_path, config).expect("config should be written");
-    config_path
-}
-
 fn parse_json_output(output: &[u8]) -> Value {
     serde_json::from_slice(output).expect("command output should be valid json")
 }
@@ -370,23 +330,59 @@ fn install_command_creates_prompt_files() {
 }
 
 #[test]
-fn install_defaults_to_xdg_home_when_set() {
+fn install_without_config_uses_xdg_config_and_data_home() {
     let temp = TempDir::new().expect("tempdir");
     let (addr, bind_addr) = allocate_addrs();
-    let config = write_orchestrator_config_with_default_prompts(temp.path(), &bind_addr);
-
-    let xdg_home = temp.path().join("xdg-home");
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
     let home_dir = temp.path().join("home");
     fs::create_dir_all(&home_dir).expect("home dir");
+    let neuromancer_config_dir = xdg_config_home.join("neuromancer");
+    fs::create_dir_all(&neuromancer_config_dir).expect("xdg config dir");
+    let config = neuromancer_config_dir.join("neuromancer.toml");
+
+    let config_toml = format!(
+        r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[routing]
+default_agent = "planner"
+rules = []
+
+[orchestrator]
+model_slot = "executor"
+
+[agents.planner]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+        bind_addr
+    );
+    fs::write(&config, config_toml).expect("write default config");
 
     let output = neuroctl()
         .arg("--json")
         .arg("--addr")
         .arg(&addr)
         .arg("install")
-        .arg("--config")
-        .arg(&config)
-        .env("XDG_HOME", &xdg_home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
         .env("HOME", &home_dir)
         .assert()
         .success()
@@ -397,20 +393,20 @@ fn install_defaults_to_xdg_home_when_set() {
     let json = parse_json_output(&output);
     assert_eq!(json["ok"], Value::Bool(true));
 
-    let orchestrator_prompt = xdg_home.join(".config/neuromancer/orchestrator/SYSTEM.md");
-    let planner_prompt = xdg_home.join(".config/neuromancer/agents/planner/SYSTEM.md");
-    let runtime_root = xdg_home.join(".local/neuromancer");
+    let orchestrator_prompt = xdg_config_home.join("neuromancer/orchestrator/SYSTEM.md");
+    let planner_prompt = xdg_config_home.join("neuromancer/agents/planner/SYSTEM.md");
+    let runtime_root = xdg_data_home.join("neuromancer");
     assert!(
         orchestrator_prompt.exists(),
-        "install should create orchestrator prompt under XDG_HOME",
+        "install should create orchestrator prompt under XDG_CONFIG_HOME",
     );
     assert!(
         planner_prompt.exists(),
-        "install should create agent prompt under XDG_HOME",
+        "install should create agent prompt under XDG_CONFIG_HOME",
     );
     assert!(
         runtime_root.exists(),
-        "install should create runtime root under XDG_HOME",
+        "install should create runtime root under XDG_DATA_HOME",
     );
 }
 

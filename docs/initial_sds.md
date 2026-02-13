@@ -19,7 +19,7 @@ No new "plugin protocol" is introduced: external extensibility is primarily via 
 * No backward compatibility for removed RPC/CLI task/message surfaces.
 * Prompt configuration is file-path based (`system_prompt_path`), not inline preamble text.
 * Prompt files must exist and be non-empty markdown files at startup.
-* Setup is explicit via `neuroctl install --config <path>` (no startup auto-bootstrap).
+* Setup is explicit via `neuroctl install` (optional `--config <path>` override; no startup auto-bootstrap).
 
 ---
 
@@ -987,8 +987,8 @@ This workflow is now formalized via the remediation protocol (§6.5):
 Use a single TOML file as the source of truth.
 
 For v0.1-alpha bootstrap:
-* Run `neuroctl install --config <path>` to create XDG runtime/config directories and default `SYSTEM.md` prompt files.
-* XDG roots resolve under `$XDG_HOME` when set (`$XDG_HOME/.config/neuromancer`, `$XDG_HOME/.local/neuromancer`), otherwise `~/.config/neuromancer` and `~/.local/neuromancer`.
+* Run `neuroctl install` (or `neuroctl install --config <path>`) to create XDG runtime/config directories and default `SYSTEM.md` prompt files.
+* XDG roots resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
 * Daemon startup fails if configured/default prompt files are missing or empty.
 
 ### 11.1 Design principles

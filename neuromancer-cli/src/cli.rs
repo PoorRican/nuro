@@ -76,8 +76,9 @@ pub struct DaemonStartArgs {
 
 #[derive(Debug, Args)]
 pub struct InstallArgs {
+    /// Config file path. Defaults to XDG config location when omitted.
     #[arg(long)]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -200,7 +201,21 @@ mod tests {
         .expect("cli should parse");
 
         match cli.command {
-            Command::Install(args) => assert_eq!(args.config, PathBuf::from("/tmp/neuromancer.toml")),
+            Command::Install(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/neuromancer.toml")))
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_command_without_config() {
+        let cli = Cli::try_parse_from(["neuroctl", "install"]).expect("cli should parse");
+
+        match cli.command {
+            Command::Install(args) => {
+                assert!(args.config.is_none());
+            }
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

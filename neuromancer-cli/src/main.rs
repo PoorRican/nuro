@@ -13,7 +13,7 @@ use cli::{
 };
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
-use install::run_install;
+use install::{resolve_install_config_path, run_install};
 use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
 use rpc_client::RpcClient;
 
@@ -75,7 +75,8 @@ async fn main() {
 async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
     match cli.command {
         Command::Install(args) => {
-            let result = run_install(&args.config)?;
+            let config_path = resolve_install_config_path(args.config)?;
+            let result = run_install(&config_path)?;
             Ok(serde_json::json!(result))
         }
         Command::Daemon { command } => match command {

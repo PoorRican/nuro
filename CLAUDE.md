@@ -106,8 +106,8 @@ For System0, `[orchestrator]` config controls:
 - max iterations
 
 Canonical example: `samples/v0_1_alpha/neuromancer.toml`.
-Install/bootstrap flow: `neuroctl install --config <path>`.
-XDG layout defaults resolve under `$XDG_HOME` when set (`$XDG_HOME/.config/neuromancer`, `$XDG_HOME/.local/neuromancer`), otherwise under `~/.config/neuromancer` and `~/.local/neuromancer`.
+Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`.
+XDG layout defaults resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
 
 ## Key Dependencies
 

@@ -35,22 +35,36 @@ pub enum XdgError {
 impl XdgLayout {
     pub fn from_env() -> Result<Self, XdgError> {
         let home = std::env::var("HOME").map_err(|_| XdgError::MissingHome)?;
-        let xdg_home = std::env::var("XDG_HOME")
+        let xdg_config_home = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        Ok(Self::from_home_and_xdg_home(PathBuf::from(home), xdg_home))
+        let xdg_data_home = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        Ok(Self::from_home_and_xdg(
+            PathBuf::from(home),
+            xdg_config_home,
+            xdg_data_home,
+        ))
     }
 
     pub fn new(home_dir: PathBuf) -> Self {
-        Self::from_home_and_xdg_home(home_dir, None)
+        Self::from_home_and_xdg(home_dir, None, None)
     }
 
-    pub fn from_home_and_xdg_home(home_dir: PathBuf, xdg_home: Option<PathBuf>) -> Self {
-        let root = xdg_home.unwrap_or_else(|| home_dir.clone());
-        let config_root = root.join(".config/neuromancer");
-        let runtime_root = root.join(".local/neuromancer");
+    pub fn from_home_and_xdg(
+        home_dir: PathBuf,
+        xdg_config_home: Option<PathBuf>,
+        xdg_data_home: Option<PathBuf>,
+    ) -> Self {
+        let config_base = xdg_config_home.unwrap_or_else(|| home_dir.join(".config"));
+        let data_base = xdg_data_home.unwrap_or_else(|| home_dir.join(".local"));
+        let config_root = config_base.join("neuromancer");
+        let runtime_root = data_base.join("neuromancer");
         Self {
             home_dir,
             config_root,
@@ -58,15 +72,20 @@ impl XdgLayout {
         }
     }
 
-    pub fn from_home_and_xdg_home_str(home_dir: &str, xdg_home: Option<&str>) -> Self {
-        Self::from_home_and_xdg_home(
+    pub fn from_home_and_xdg_str(
+        home_dir: &str,
+        xdg_config_home: Option<&str>,
+        xdg_data_home: Option<&str>,
+    ) -> Self {
+        Self::from_home_and_xdg(
             PathBuf::from(home_dir),
-            xdg_home.map(PathBuf::from),
+            xdg_config_home.map(PathBuf::from),
+            xdg_data_home.map(PathBuf::from),
         )
     }
 
     pub fn from_home(home_dir: &str) -> Self {
-        Self::from_home_and_xdg_home(PathBuf::from(home_dir), None)
+        Self::from_home_and_xdg(PathBuf::from(home_dir), None, None)
     }
 
     pub fn home_dir(&self) -> &Path {
@@ -79,6 +98,10 @@ impl XdgLayout {
 
     pub fn runtime_root(&self) -> PathBuf {
         self.runtime_root.clone()
+    }
+
+    pub fn default_config_path(&self) -> PathBuf {
+        self.config_root.join("neuromancer.toml")
     }
 
     pub fn skills_dir(&self) -> PathBuf {
@@ -177,10 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn xdg_home_overrides_default_roots() {
-        let layout = XdgLayout::from_home_and_xdg_home_str("/home/user", Some("/xdg"));
-        assert_eq!(layout.config_root(), PathBuf::from("/xdg/.config/neuromancer"));
-        assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/.local/neuromancer"));
+    fn xdg_config_and_data_home_override_default_roots() {
+        let layout =
+            XdgLayout::from_home_and_xdg_str("/home/user", Some("/xdg/config"), Some("/xdg/data"));
+        assert_eq!(layout.config_root(), PathBuf::from("/xdg/config/neuromancer"));
+        assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/data/neuromancer"));
         assert_eq!(layout.home_dir(), Path::new("/home/user"));
     }
 
