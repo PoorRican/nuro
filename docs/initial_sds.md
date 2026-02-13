@@ -987,8 +987,10 @@ This workflow is now formalized via the remediation protocol (§6.5):
 Use a single TOML file as the source of truth.
 
 For v0.1-alpha bootstrap:
-* Run `neuroctl install` (or `neuroctl install --config <path>`) to create XDG runtime/config directories and default `SYSTEM.md` prompt files.
+* Run `neuroctl install` (or `neuroctl install --config <path>`) to bootstrap missing config/runtime directories and default `SYSTEM.md` prompt files (never overwriting existing files).
 * XDG roots resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
+* Installer bootstraps by copying `defaults/bootstrap/` into the XDG config root (non-overwriting). Per-agent prompt files are created at `agents/<agent_name>/SYSTEM.md` from `defaults/templates/agent/SYSTEM.md` only for configured agents.
+* Bootstrap config is intentionally agent-empty; per-agent `agents/<agent_name>/SYSTEM.md` files are created only for configured agents.
 * Daemon startup fails if configured/default prompt files are missing or empty.
 
 ### 11.1 Design principles

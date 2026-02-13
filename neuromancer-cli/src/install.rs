@@ -24,6 +24,25 @@ pub fn resolve_install_config_path(config_path: Option<PathBuf>) -> Result<PathB
 }
 
 pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
+    let layout = XdgLayout::from_env().map_err(|err| CliError::Lifecycle(err.to_string()))?;
+    let defaults_root = defaults_root();
+    let bootstrap_dir = defaults_root.join("bootstrap");
+    let default_config_src = bootstrap_dir.join("neuromancer.toml");
+    let default_orchestrator_prompt_src = bootstrap_dir.join("orchestrator/SYSTEM.md");
+    let default_agent_prompt_src = defaults_root.join("templates/agent/SYSTEM.md");
+
+    let mut created = Vec::new();
+    let mut existing = Vec::new();
+
+    copy_defaults_tree(&bootstrap_dir, &layout.config_root(), &mut created, &mut existing)?;
+    ensure_dir(&layout.runtime_root(), &mut created, &mut existing)?;
+    ensure_dir(&layout.skills_dir(), &mut created, &mut existing)?;
+
+    // When --config points somewhere other than the default XDG config file, bootstrap it too.
+    if config_path != layout.default_config_path() {
+        ensure_file_from_source(config_path, &default_config_src, &mut created, &mut existing)?;
+    }
+
     let raw = fs::read_to_string(config_path).map_err(|err| {
         CliError::Usage(format!(
             "failed to read config '{}': {err}",
@@ -37,15 +56,7 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
         ))
     })?;
 
-    let layout = XdgLayout::from_env().map_err(|err| CliError::Lifecycle(err.to_string()))?;
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-
-    let mut created = Vec::new();
-    let mut existing = Vec::new();
-
-    ensure_dir(&layout.config_root(), &mut created, &mut existing)?;
-    ensure_dir(&layout.runtime_root(), &mut created, &mut existing)?;
-    ensure_dir(&layout.skills_dir(), &mut created, &mut existing)?;
 
     let orchestrator_prompt_path = resolve_path(
         config.orchestrator.system_prompt_path.as_deref(),
@@ -54,13 +65,15 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
         layout.home_dir(),
     )
     .map_err(|err| CliError::Usage(err.to_string()))?;
+    let default_orchestrator_prompt = load_template(&default_orchestrator_prompt_src)?;
     ensure_prompt_file(
         &orchestrator_prompt_path,
-        default_orchestrator_system_prompt(),
+        &default_orchestrator_prompt,
         &mut created,
         &mut existing,
     )?;
 
+    let default_agent_prompt = load_template(&default_agent_prompt_src)?;
     for agent_id in config.agents.keys() {
         let agent_cfg = config
             .agents
@@ -76,13 +89,82 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
 
         ensure_prompt_file(
             &prompt_path,
-            &default_agent_system_prompt(agent_id),
+            &default_agent_prompt,
             &mut created,
             &mut existing,
         )?;
     }
 
     Ok(InstallResult { created, existing })
+}
+
+fn defaults_root() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.join("defaults")
+}
+
+fn load_template(path: &Path) -> Result<String, CliError> {
+    fs::read_to_string(path).map_err(|err| {
+        CliError::Lifecycle(format!(
+            "failed to read defaults template '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+fn copy_defaults_tree(
+    source_root: &Path,
+    destination_root: &Path,
+    created: &mut Vec<String>,
+    existing: &mut Vec<String>,
+) -> Result<(), CliError> {
+    if !source_root.exists() {
+        return Err(CliError::Lifecycle(format!(
+            "defaults bootstrap directory not found: '{}'",
+            source_root.display()
+        )));
+    }
+    ensure_dir(destination_root, created, existing)?;
+    copy_dir_recursive(source_root, destination_root, created, existing)
+}
+
+fn copy_dir_recursive(
+    source_dir: &Path,
+    destination_dir: &Path,
+    created: &mut Vec<String>,
+    existing: &mut Vec<String>,
+) -> Result<(), CliError> {
+    for entry in fs::read_dir(source_dir).map_err(|err| {
+        CliError::Lifecycle(format!(
+            "failed to read defaults directory '{}': {err}",
+            source_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed to read defaults directory entry in '{}': {err}",
+                source_dir.display()
+            ))
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination_dir.join(entry.file_name());
+        let metadata = entry.metadata().map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed to read metadata for defaults path '{}': {err}",
+                source_path.display()
+            ))
+        })?;
+
+        if metadata.is_dir() {
+            ensure_dir(&destination_path, created, existing)?;
+            copy_dir_recursive(&source_path, &destination_path, created, existing)?;
+            continue;
+        }
+
+        ensure_file_from_source(&destination_path, &source_path, created, existing)?;
+    }
+    Ok(())
 }
 
 fn ensure_dir(path: &Path, created: &mut Vec<String>, existing: &mut Vec<String>) -> Result<(), CliError> {
@@ -93,6 +175,37 @@ fn ensure_dir(path: &Path, created: &mut Vec<String>, existing: &mut Vec<String>
 
     fs::create_dir_all(path).map_err(|err| {
         CliError::Lifecycle(format!("failed to create directory '{}': {err}", path.display()))
+    })?;
+    created.push(path.display().to_string());
+    Ok(())
+}
+
+fn ensure_file_from_source(
+    path: &Path,
+    source_path: &Path,
+    created: &mut Vec<String>,
+    existing: &mut Vec<String>,
+) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Err(CliError::Lifecycle(format!(
+            "invalid destination path '{}'",
+            path.display()
+        )));
+    };
+
+    ensure_dir(parent, created, existing)?;
+
+    if path.exists() {
+        existing.push(path.display().to_string());
+        return Ok(());
+    }
+
+    fs::copy(source_path, path).map_err(|err| {
+        CliError::Lifecycle(format!(
+            "failed to copy defaults file '{}' to '{}': {err}",
+            source_path.display(),
+            path.display(),
+        ))
     })?;
     created.push(path.display().to_string());
     Ok(())
@@ -136,54 +249,9 @@ fn ensure_prompt_file(
     Ok(())
 }
 
-fn default_orchestrator_system_prompt() -> &'static str {
-    r#"# Neuromancer System0 Prompt
-
-You are {{ORCHESTRATOR_ID}}, the System0 orchestrator for Neuromancer.
-
-## Mission
-- Mediate every inbound user/admin turn.
-- Plan safely and delegate to the most appropriate sub-agent when needed.
-- Keep continuity across turns and use prior conversation context.
-- Use control-plane tools for delegation, coordination, and safe runtime changes.
-
-## Available Agents
-{{AVAILABLE_AGENTS}}
-
-## Available Control Tools
-{{AVAILABLE_TOOLS}}
-
-## Operating Rules
-- Respect capability and policy boundaries.
-- Prefer explicit delegation to specialized agents for domain work.
-- Summarize delegated outcomes back to the user clearly.
-- If required information is missing, ask concise clarifying questions.
-"#
-}
-
-fn default_agent_system_prompt(agent_id: &str) -> String {
-    format!(
-        r#"# Neuromancer Agent Prompt: {agent_id}
-
-You are agent `{agent_id}`.
-
-## Mission
-- Execute delegated instructions accurately.
-- Use only allowlisted tools and capabilities.
-- Return concise, factual outputs suitable for orchestration.
-
-## Operating Rules
-- Do not assume permissions you do not have.
-- Report failures clearly with actionable context.
-- Prefer deterministic, auditable actions.
-"#
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -196,16 +264,19 @@ mod tests {
 
     #[test]
     fn default_orchestrator_prompt_contains_placeholders() {
-        let prompt = default_orchestrator_system_prompt();
+        let prompt = load_template(&defaults_root().join("bootstrap/orchestrator/SYSTEM.md"))
+            .expect("template should load");
         assert!(prompt.contains("{{ORCHESTRATOR_ID}}"));
         assert!(prompt.contains("{{AVAILABLE_AGENTS}}"));
         assert!(prompt.contains("{{AVAILABLE_TOOLS}}"));
     }
 
     #[test]
-    fn default_agent_prompt_mentions_agent_name() {
-        let prompt = default_agent_system_prompt("planner");
-        assert!(prompt.contains("planner"));
+    fn default_agent_prompt_is_generic() {
+        let prompt =
+            load_template(&defaults_root().join("templates/agent/SYSTEM.md")).expect("template");
+        assert!(!prompt.contains("{{AGENT_ID}}"));
+        assert!(prompt.contains("delegated sub-agent"));
     }
 
     #[test]
@@ -223,5 +294,34 @@ mod tests {
         let current = fs::read_to_string(&prompt_path).expect("read");
         assert_eq!(current, "original");
         assert!(existing.iter().any(|p| p == &prompt_path.display().to_string()));
+    }
+
+    #[test]
+    fn ensure_file_from_source_never_overwrites_existing_file() {
+        let dir = unique_temp_path("nm_install_config");
+        fs::create_dir_all(&dir).expect("dir");
+        let config_path = dir.join("neuromancer.toml");
+        fs::write(&config_path, "original").expect("write");
+        let source = dir.join("source.toml");
+        fs::write(&source, "replacement").expect("write source");
+
+        let mut created = Vec::new();
+        let mut existing = Vec::new();
+        ensure_file_from_source(&config_path, &source, &mut created, &mut existing)
+            .expect("ensure from source");
+
+        let current = fs::read_to_string(&config_path).expect("read");
+        assert_eq!(current, "original");
+        assert!(existing.iter().any(|p| p == &config_path.display().to_string()));
+    }
+
+    #[test]
+    fn blank_slate_config_has_required_sections() {
+        let config =
+            load_template(&defaults_root().join("bootstrap/neuromancer.toml")).expect("template");
+        assert!(config.contains("[global]"));
+        assert!(config.contains("[routing]"));
+        assert!(config.contains("[orchestrator]"));
+        assert!(!config.contains("[agents."));
     }
 }

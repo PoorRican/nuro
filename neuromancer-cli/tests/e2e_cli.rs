@@ -332,49 +332,11 @@ fn install_command_creates_prompt_files() {
 #[test]
 fn install_without_config_uses_xdg_config_and_data_home() {
     let temp = TempDir::new().expect("tempdir");
-    let (addr, bind_addr) = allocate_addrs();
+    let (addr, _bind_addr) = allocate_addrs();
     let xdg_config_home = temp.path().join("xdg-config-home");
     let xdg_data_home = temp.path().join("xdg-data-home");
     let home_dir = temp.path().join("home");
     fs::create_dir_all(&home_dir).expect("home dir");
-    let neuromancer_config_dir = xdg_config_home.join("neuromancer");
-    fs::create_dir_all(&neuromancer_config_dir).expect("xdg config dir");
-    let config = neuromancer_config_dir.join("neuromancer.toml");
-
-    let config_toml = format!(
-        r#"
-[global]
-instance_id = "test-instance"
-workspace_dir = "/tmp"
-data_dir = "/tmp"
-
-[models.executor]
-provider = "mock"
-model = "test-double"
-
-[routing]
-default_agent = "planner"
-rules = []
-
-[orchestrator]
-model_slot = "executor"
-
-[agents.planner]
-models.executor = "executor"
-capabilities.skills = []
-capabilities.mcp_servers = []
-capabilities.a2a_peers = []
-capabilities.secrets = []
-capabilities.memory_partitions = []
-capabilities.filesystem_roots = []
-
-[admin_api]
-bind_addr = "{}"
-enabled = true
-"#,
-        bind_addr
-    );
-    fs::write(&config, config_toml).expect("write default config");
 
     let output = neuroctl()
         .arg("--json")
@@ -393,6 +355,63 @@ enabled = true
     let json = parse_json_output(&output);
     assert_eq!(json["ok"], Value::Bool(true));
 
+    let generated_config = xdg_config_home.join("neuromancer/neuromancer.toml");
+    let orchestrator_prompt = xdg_config_home.join("neuromancer/orchestrator/SYSTEM.md");
+    let planner_prompt = xdg_config_home.join("neuromancer/agents/planner/SYSTEM.md");
+    let runtime_root = xdg_data_home.join("neuromancer");
+    assert!(
+        generated_config.exists(),
+        "install should bootstrap blank-slate config under XDG_CONFIG_HOME",
+    );
+    assert!(
+        orchestrator_prompt.exists(),
+        "install should create orchestrator prompt under XDG_CONFIG_HOME",
+    );
+    assert!(
+        !planner_prompt.exists(),
+        "blank-slate install should not create per-agent prompt files",
+    );
+    assert!(
+        runtime_root.exists(),
+        "install should create runtime root under XDG_DATA_HOME",
+    );
+}
+
+#[test]
+fn install_with_missing_explicit_config_bootstraps() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, _bind_addr) = allocate_addrs();
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    let explicit_config = temp.path().join("custom-config/neuromancer.toml");
+    assert!(!explicit_config.exists(), "precondition: config should not exist");
+
+    let output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&explicit_config)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["ok"], Value::Bool(true));
+    assert!(
+        explicit_config.exists(),
+        "install should bootstrap missing explicit config file",
+    );
+
     let orchestrator_prompt = xdg_config_home.join("neuromancer/orchestrator/SYSTEM.md");
     let planner_prompt = xdg_config_home.join("neuromancer/agents/planner/SYSTEM.md");
     let runtime_root = xdg_data_home.join("neuromancer");
@@ -401,8 +420,8 @@ enabled = true
         "install should create orchestrator prompt under XDG_CONFIG_HOME",
     );
     assert!(
-        planner_prompt.exists(),
-        "install should create agent prompt under XDG_CONFIG_HOME",
+        !planner_prompt.exists(),
+        "blank-slate config should not imply planner prompt creation",
     );
     assert!(
         runtime_root.exists(),
