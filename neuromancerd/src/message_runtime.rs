@@ -97,7 +97,10 @@ impl RuntimeCore {
                 message,
             )
             .await
-            .map_err(|err| MessageRuntimeError::Internal(err.to_string()))?;
+            .map_err(|err| {
+                tracing::error!(error = ?err, "orchestrator turn failed");
+                MessageRuntimeError::Internal(err.to_string())
+            })?;
 
         let response =
             extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
