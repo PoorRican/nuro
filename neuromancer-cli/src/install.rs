@@ -12,6 +12,7 @@ use crate::CliError;
 pub struct InstallResult {
     pub created: Vec<String>,
     pub existing: Vec<String>,
+    pub overwritten: Vec<String>,
 }
 
 pub fn resolve_install_config_path(config_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
@@ -23,7 +24,7 @@ pub fn resolve_install_config_path(config_path: Option<PathBuf>) -> Result<PathB
     Ok(layout.default_config_path())
 }
 
-pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
+pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallResult, CliError> {
     let layout = XdgLayout::from_env().map_err(|err| CliError::Lifecycle(err.to_string()))?;
     let defaults_root = defaults_root();
     let bootstrap_dir = defaults_root.join("bootstrap");
@@ -33,6 +34,7 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
 
     let mut created = Vec::new();
     let mut existing = Vec::new();
+    let mut overwritten = Vec::new();
 
     copy_defaults_tree(&bootstrap_dir, &layout.config_root(), &mut created, &mut existing)?;
     ensure_dir(&layout.runtime_root(), &mut created, &mut existing)?;
@@ -41,6 +43,14 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
     // When --config points somewhere other than the default XDG config file, bootstrap it too.
     if config_path != layout.default_config_path() {
         ensure_file_from_source(config_path, &default_config_src, &mut created, &mut existing)?;
+    }
+    if override_config {
+        overwrite_file_from_source(
+            config_path,
+            &default_config_src,
+            &mut created,
+            &mut overwritten,
+        )?;
     }
 
     let raw = fs::read_to_string(config_path).map_err(|err| {
@@ -95,7 +105,11 @@ pub fn run_install(config_path: &Path) -> Result<InstallResult, CliError> {
         )?;
     }
 
-    Ok(InstallResult { created, existing })
+    Ok(InstallResult {
+        created,
+        existing,
+        overwritten,
+    })
 }
 
 fn defaults_root() -> PathBuf {
@@ -211,6 +225,46 @@ fn ensure_file_from_source(
     Ok(())
 }
 
+fn overwrite_file_from_source(
+    path: &Path,
+    source_path: &Path,
+    created: &mut Vec<String>,
+    overwritten: &mut Vec<String>,
+) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Err(CliError::Lifecycle(format!(
+            "invalid destination path '{}'",
+            path.display()
+        )));
+    };
+
+    if !parent.exists() {
+        fs::create_dir_all(parent).map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed to create directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+        created.push(parent.display().to_string());
+    }
+
+    let existed = path.exists();
+    fs::copy(source_path, path).map_err(|err| {
+        CliError::Lifecycle(format!(
+            "failed to copy defaults file '{}' to '{}': {err}",
+            source_path.display(),
+            path.display(),
+        ))
+    })?;
+
+    if existed {
+        overwritten.push(path.display().to_string());
+    } else {
+        created.push(path.display().to_string());
+    }
+    Ok(())
+}
+
 fn ensure_prompt_file(
     path: &Path,
     content: &str,
@@ -313,6 +367,27 @@ mod tests {
         let current = fs::read_to_string(&config_path).expect("read");
         assert_eq!(current, "original");
         assert!(existing.iter().any(|p| p == &config_path.display().to_string()));
+    }
+
+    #[test]
+    fn overwrite_file_from_source_replaces_existing_file() {
+        let dir = unique_temp_path("nm_install_override");
+        fs::create_dir_all(&dir).expect("dir");
+        let config_path = dir.join("neuromancer.toml");
+        fs::write(&config_path, "original").expect("write");
+        let source = dir.join("source.toml");
+        fs::write(&source, "replacement").expect("write source");
+
+        let mut created = Vec::new();
+        let mut overwritten = Vec::new();
+        overwrite_file_from_source(&config_path, &source, &mut created, &mut overwritten)
+            .expect("override from source");
+
+        let current = fs::read_to_string(&config_path).expect("read");
+        assert_eq!(current, "replacement");
+        assert!(overwritten
+            .iter()
+            .any(|p| p == &config_path.display().to_string()));
     }
 
     #[test]

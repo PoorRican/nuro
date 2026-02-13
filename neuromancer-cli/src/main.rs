@@ -76,7 +76,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
     match cli.command {
         Command::Install(args) => {
             let config_path = resolve_install_config_path(args.config)?;
-            let result = run_install(&config_path)?;
+            let result = run_install(&config_path, args.override_config)?;
             Ok(serde_json::json!(result))
         }
         Command::Daemon { command } => match command {

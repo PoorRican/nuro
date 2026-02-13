@@ -79,6 +79,10 @@ pub struct InstallArgs {
     /// Config file path. Defaults to XDG config location when omitted.
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Overwrite the target config file from defaults before prompt bootstrap.
+    #[arg(long)]
+    pub override_config: bool,
 }
 
 #[derive(Debug, Args)]
@@ -197,12 +201,14 @@ mod tests {
             "install",
             "--config",
             "/tmp/neuromancer.toml",
+            "--override-config",
         ])
         .expect("cli should parse");
 
         match cli.command {
             Command::Install(args) => {
-                assert_eq!(args.config, Some(PathBuf::from("/tmp/neuromancer.toml")))
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/neuromancer.toml")));
+                assert!(args.override_config);
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
@@ -215,6 +221,7 @@ mod tests {
         match cli.command {
             Command::Install(args) => {
                 assert!(args.config.is_none());
+                assert!(!args.override_config);
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
