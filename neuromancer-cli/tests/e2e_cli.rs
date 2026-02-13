@@ -654,9 +654,112 @@ enabled = true
 
     let message = String::from_utf8(stderr).expect("stderr should be utf-8");
     assert!(
-        message.contains("GROQ_API_KEY is not set"),
-        "missing groq key should be reported explicitly: {message}",
+        message.contains("provider 'groq'"),
+        "missing provider credential should be reported explicitly: {message}",
     );
+    assert!(
+        message.contains("GROQ_API_KEY"),
+        "missing env var should be named explicitly: {message}",
+    );
+    assert!(
+        message.contains("Run `neuroctl install`"),
+        "remediation should direct user to install key capture: {message}",
+    );
+}
+
+#[test]
+fn daemon_start_uses_provider_key_file_without_env_var() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    let config = temp.path().join("neuromancer.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "groq"
+model = "openai/gpt-oss-120B"
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+            bind_addr
+        ),
+    )
+    .expect("write config");
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&config)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
+
+    let key_file = xdg_data_home.join("neuromancer/provider_keys/groq.key");
+    fs::create_dir_all(
+        key_file
+            .parent()
+            .expect("key file should have parent directory"),
+    )
+    .expect("provider key dir");
+    fs::write(&key_file, "dummy-key\n").expect("write provider key file");
+
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .env_remove("GROQ_API_KEY")
+        .assert()
+        .success();
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("stop")
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .assert()
+        .success();
 }
 
 #[test]
