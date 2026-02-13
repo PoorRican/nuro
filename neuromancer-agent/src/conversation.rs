@@ -244,17 +244,15 @@ impl ConversationContext {
                     out.push(rig::completion::Message::assistant(text.clone()));
                 }
                 (MessageRole::Assistant, MessageContent::ToolCalls(calls)) => {
-                    // Represent tool calls as assistant messages with tool call content
-                    for call in calls {
-                        out.push(rig::completion::Message::Assistant {
-                            content: rig::OneOrMany::one(
-                                rig::message::AssistantContent::tool_call(
-                                    &call.id,
-                                    &call.tool_id,
-                                    call.arguments.clone(),
-                                ),
-                            ),
-                        });
+                    // Preserve a single assistant turn even when multiple tools are requested.
+                    if let Ok(content) = rig::OneOrMany::many(calls.iter().map(|call| {
+                        rig::message::AssistantContent::tool_call(
+                            &call.id,
+                            &call.tool_id,
+                            call.arguments.clone(),
+                        )
+                    })) {
+                        out.push(rig::completion::Message::Assistant { content });
                     }
                 }
                 (MessageRole::Tool, MessageContent::ToolResult(result)) => {
