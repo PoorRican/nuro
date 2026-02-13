@@ -12,7 +12,10 @@ use cli::{
     Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
     OrchestratorRunsCommand, RpcCommand,
 };
-use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
+use daemon::{
+    DaemonRestartOptions, DaemonStartOptions, DaemonStopOptions, daemon_status, restart_daemon,
+    start_daemon, stop_daemon,
+};
 use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
@@ -104,6 +107,25 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                     }
                 }
 
+                Ok(serde_json::json!(result))
+            }
+            DaemonCommand::Restart(args) => {
+                let config_path = resolve_config_path(args.config)?;
+                let result = restart_daemon(&DaemonRestartOptions {
+                    config: config_path,
+                    daemon_bin: args.daemon_bin,
+                    pid_file: args.pid_file,
+                    grace: args.grace,
+                    wait_healthy: args.wait_healthy,
+                    addr: cli.addr,
+                    timeout: cli.timeout,
+                })
+                .await?;
+                if !json_mode {
+                    for warning in &result.warnings {
+                        output::print_warning(warning);
+                    }
+                }
                 Ok(serde_json::json!(result))
             }
             DaemonCommand::Stop(args) => {

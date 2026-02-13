@@ -28,6 +28,17 @@ pub struct DaemonStopOptions {
     pub grace: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct DaemonRestartOptions {
+    pub config: PathBuf,
+    pub daemon_bin: Option<PathBuf>,
+    pub pid_file: PathBuf,
+    pub grace: Duration,
+    pub wait_healthy: bool,
+    pub addr: String,
+    pub timeout: Duration,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonStartResult {
     pub pid: i32,
@@ -42,6 +53,16 @@ pub struct DaemonStopResult {
     pub pid: i32,
     pub stopped: bool,
     pub forced: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonRestartResult {
+    pub previous_running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<DaemonStopResult>,
+    pub start: DaemonStartResult,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,6 +138,48 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
         pid,
         pid_file: options.pid_file.display().to_string(),
         healthy,
+        warnings,
+    })
+}
+
+pub async fn restart_daemon(
+    options: &DaemonRestartOptions,
+) -> Result<DaemonRestartResult, CliError> {
+    let mut warnings = Vec::new();
+    let status = daemon_status(
+        &options.pid_file,
+        &options.addr,
+        std::cmp::min(options.timeout, Duration::from_secs(5)),
+    )
+    .await?;
+
+    let mut stop_result = None;
+    if status.running {
+        let stopped = stop_daemon(&DaemonStopOptions {
+            pid_file: options.pid_file.clone(),
+            grace: options.grace,
+        })
+        .await?;
+        stop_result = Some(stopped);
+    } else {
+        warnings.push("daemon was not running; starting a new instance.".to_string());
+    }
+
+    let mut started = start_daemon(&DaemonStartOptions {
+        config: options.config.clone(),
+        daemon_bin: options.daemon_bin.clone(),
+        pid_file: options.pid_file.clone(),
+        wait_healthy: options.wait_healthy,
+        addr: options.addr.clone(),
+        timeout: options.timeout,
+    })
+    .await?;
+    warnings.append(&mut started.warnings);
+
+    Ok(DaemonRestartResult {
+        previous_running: status.running,
+        stop: stop_result,
+        start: started,
         warnings,
     })
 }

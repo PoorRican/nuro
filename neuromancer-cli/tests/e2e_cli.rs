@@ -217,6 +217,58 @@ fn daemon_lifecycle_start_status_stop() {
 }
 
 #[test]
+fn daemon_restart_command_restarts_running_daemon() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_orchestrator_config(temp.path(), &bind_addr);
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+    run_install(&config, &addr);
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .assert()
+        .success();
+
+    let restart = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("restart")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let restart_json = parse_json_output(&restart);
+    assert_eq!(restart_json["ok"], Value::Bool(true));
+    assert_eq!(restart_json["result"]["previous_running"], Value::Bool(true));
+    assert_eq!(restart_json["result"]["start"]["healthy"], Value::Bool(true));
+}
+
+#[test]
 fn orchestrator_turn_command_routes_via_rpc() {
     let temp = TempDir::new().expect("tempdir");
     let (addr, bind_addr) = allocate_addrs();

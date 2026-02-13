@@ -55,6 +55,7 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum DaemonCommand {
     Start(DaemonStartArgs),
+    Restart(DaemonRestartArgs),
     Stop(DaemonStopArgs),
     Status(DaemonStatusArgs),
 }
@@ -70,6 +71,25 @@ pub struct DaemonStartArgs {
 
     #[arg(long, default_value = "/tmp/neuromancer.pid")]
     pub pid_file: PathBuf,
+
+    #[arg(long)]
+    pub wait_healthy: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonRestartArgs {
+    /// Config file path. Defaults to XDG config location when omitted.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    #[arg(long)]
+    pub daemon_bin: Option<PathBuf>,
+
+    #[arg(long, default_value = "/tmp/neuromancer.pid")]
+    pub pid_file: PathBuf,
+
+    #[arg(long, default_value = "15s", value_parser = parse_duration)]
+    pub grace: Duration,
 
     #[arg(long)]
     pub wait_healthy: bool,
@@ -211,6 +231,24 @@ mod tests {
                 command: DaemonCommand::Start(args),
             } => {
                 assert_eq!(args.config, Some(PathBuf::from("/tmp/config.toml")));
+                assert!(!args.wait_healthy);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_daemon_restart_defaults() {
+        let cli = Cli::try_parse_from(["neuroctl", "daemon", "restart"]).expect("cli should parse");
+
+        match cli.command {
+            Command::Daemon {
+                command: DaemonCommand::Restart(args),
+            } => {
+                assert!(args.config.is_none());
+                assert!(args.daemon_bin.is_none());
+                assert_eq!(args.pid_file, PathBuf::from("/tmp/neuromancer.pid"));
+                assert_eq!(args.grace, Duration::from_secs(15));
                 assert!(!args.wait_healthy);
             }
             other => panic!("unexpected command parsed: {other:?}"),
