@@ -102,11 +102,12 @@ Single TOML file (`neuromancer.toml`) with sections: `[global]`, `[otel]`, `[sec
 For System0, `[orchestrator]` config controls:
 - executor model slot
 - allowlisted capabilities
-- orchestrator preamble
+- `system_prompt_path` for the orchestrator SYSTEM.md
 - max iterations
 
-Canonical example: `docs/v0_1_alpha_config_example.toml`.
-Migration guide: `docs/v0_1_alpha_migration.md`.
+Canonical example: `samples/v0_1_alpha/neuromancer.toml`.
+Install/bootstrap flow: `neuroctl install --config <path>`.
+XDG layout defaults resolve under `$XDG_HOME` when set (`$XDG_HOME/.config/neuromancer`, `$XDG_HOME/.local/neuromancer`), otherwise under `~/.config/neuromancer` and `~/.local/neuromancer`.
 
 ## Key Dependencies
 

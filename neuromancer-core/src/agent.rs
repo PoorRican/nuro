@@ -57,7 +57,7 @@ pub struct AgentConfig {
     pub models: AgentModelConfig,
     pub capabilities: AgentCapabilities,
     pub health: AgentHealthConfig,
-    pub preamble: Option<String>,
+    pub system_prompt: String,
     pub max_iterations: u32,
 }
 

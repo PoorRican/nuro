@@ -226,7 +226,7 @@ mod tests {
                 models: Default::default(),
                 capabilities: Default::default(),
                 health: Default::default(),
-                preamble: Some("Browser agent".into()),
+                system_prompt: "Browser agent".into(),
                 max_iterations: 20,
             },
         );
@@ -239,7 +239,7 @@ mod tests {
                 models: Default::default(),
                 capabilities: Default::default(),
                 health: Default::default(),
-                preamble: Some("Planner agent".into()),
+                system_prompt: "Planner agent".into(),
                 max_iterations: 20,
             },
         );

@@ -91,8 +91,12 @@ impl AgentRegistry {
             .map(|(id, entry)| {
                 let desc = entry
                     .config
-                    .preamble
-                    .clone()
+                    .system_prompt
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string)
                     .unwrap_or_else(|| format!("Agent: {id}"));
                 (id.clone(), desc)
             })
@@ -197,7 +201,7 @@ mod tests {
             models: AgentModelConfig::default(),
             capabilities: AgentCapabilities::default(),
             health: AgentHealthConfig::default(),
-            preamble: Some(format!("{id} agent")),
+            system_prompt: format!("{id} agent"),
             max_iterations: 20,
         }
     }

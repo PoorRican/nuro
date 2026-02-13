@@ -57,7 +57,7 @@ The crate does **not** use rig's `Agent` type. It wraps rig's `CompletionModel` 
 - Truncation triggers when `token_used > token_budget`
 - Strategies: `SlidingWindow` (default, keeps last N non-system messages), `Strict` (drops oldest), `Summarize` (stub, falls back to Strict)
 - System messages are always preserved during truncation
-- `to_rig_messages()` converts to rig's `Message` format (skips system messages, which go via preamble)
+- `to_rig_messages()` converts to rig's `Message` format (skips system messages, which are provided via `system_prompt`)
 
 ### Model Resolution (`model_router.rs`)
 
@@ -71,7 +71,7 @@ Resolution order for `resolve_for_agent(role, agent_models)`:
 
 These are the main types this crate consumes — defined in the workspace root's `neuromancer-core`:
 
-- **`AgentConfig`** — identity, mode, capabilities, limits, model slots, preamble, max_iterations
+- **`AgentConfig`** — identity, mode, capabilities, limits, model slots, system_prompt, max_iterations
 - **`AgentContext`** — request-scoped security context (agent_id, task_id, allowed_tools, allowed_secrets, etc.)
 - **`Task`** / **`TaskState`** / **`TaskOutput`** — work unit lifecycle and results
 - **`ToolBroker`** trait — `list_tools(ctx)` and `call_tool(ctx, call)` (policy-gated)

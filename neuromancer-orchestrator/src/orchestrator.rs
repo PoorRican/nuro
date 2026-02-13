@@ -308,7 +308,7 @@ mod tests {
                 models: AgentModelConfig::default(),
                 capabilities: AgentCapabilities::default(),
                 health: AgentHealthConfig::default(),
-                preamble: Some("Planner agent".into()),
+                system_prompt: "Planner agent".into(),
                 max_iterations: 20,
             },
         );
@@ -321,7 +321,7 @@ mod tests {
                 models: AgentModelConfig::default(),
                 capabilities: AgentCapabilities::default(),
                 health: AgentHealthConfig::default(),
-                preamble: Some("Browser agent".into()),
+                system_prompt: "Browser agent".into(),
                 max_iterations: 20,
             },
         );

@@ -111,11 +111,12 @@ pub struct A2aConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestratorConfig {
     pub model_slot: Option<String>,
     #[serde(default)]
     pub capabilities: AgentCapabilities,
-    pub preamble: Option<String>,
+    pub system_prompt_path: Option<String>,
     #[serde(default = "default_orchestrator_max_iterations")]
     pub max_iterations: u32,
 }
@@ -125,7 +126,7 @@ impl Default for OrchestratorConfig {
         Self {
             model_slot: None,
             capabilities: AgentCapabilities::default(),
-            preamble: None,
+            system_prompt_path: None,
             max_iterations: default_orchestrator_max_iterations(),
         }
     }
@@ -137,6 +138,7 @@ fn default_orchestrator_max_iterations() -> u32 {
 
 /// Per-agent config as it appears in TOML (slightly different shape from runtime AgentConfig).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentTomlConfig {
     #[serde(default = "default_agent_mode")]
     pub mode: AgentMode,
@@ -147,7 +149,7 @@ pub struct AgentTomlConfig {
     pub capabilities: AgentCapabilities,
     #[serde(default)]
     pub health: AgentHealthConfig,
-    pub preamble: Option<String>,
+    pub system_prompt_path: Option<String>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
 }
@@ -161,7 +163,7 @@ fn default_max_iterations() -> u32 {
 }
 
 impl AgentTomlConfig {
-    pub fn to_agent_config(&self, id: &str) -> AgentConfig {
+    pub fn to_agent_config(&self, id: &str, system_prompt: String) -> AgentConfig {
         AgentConfig {
             id: id.to_string(),
             mode: self.mode.clone(),
@@ -169,7 +171,7 @@ impl AgentTomlConfig {
             models: self.models.clone(),
             capabilities: self.capabilities.clone(),
             health: self.health.clone(),
-            preamble: self.preamble.clone(),
+            system_prompt,
             max_iterations: self.max_iterations,
         }
     }
@@ -356,4 +358,68 @@ impl Default for AdminApiConfig {
 
 fn default_admin_bind() -> String {
     "127.0.0.1:9090".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config_toml(extra_orchestrator: &str, extra_agent: &str) -> String {
+        format!(
+            r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[routing]
+default_agent = "planner"
+rules = []
+
+[orchestrator]
+{extra_orchestrator}
+
+[agents.planner]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+{extra_agent}
+"#
+        )
+    }
+
+    #[test]
+    fn system_prompt_path_deserializes_for_orchestrator_and_agent() {
+        let toml = minimal_config_toml(
+            r#"system_prompt_path = "prompts/orchestrator/SYSTEM.md""#,
+            r#"system_prompt_path = "prompts/agents/planner/SYSTEM.md""#,
+        );
+        let cfg: NeuromancerConfig = toml::from_str(&toml).expect("config should parse");
+        assert_eq!(
+            cfg.orchestrator.system_prompt_path.as_deref(),
+            Some("prompts/orchestrator/SYSTEM.md")
+        );
+        assert_eq!(
+            cfg.agents
+                .get("planner")
+                .and_then(|agent| agent.system_prompt_path.as_deref()),
+            Some("prompts/agents/planner/SYSTEM.md")
+        );
+    }
+
+    #[test]
+    fn legacy_preamble_is_rejected() {
+        let toml = minimal_config_toml(
+            r#"preamble = "legacy""#,
+            r#"preamble = "legacy-agent""#,
+        );
+        let err = toml::from_str::<NeuromancerConfig>(&toml).expect_err("legacy keys must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field"));
+        assert!(msg.contains("preamble"));
+    }
 }

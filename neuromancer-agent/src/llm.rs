@@ -32,7 +32,7 @@ impl LlmResponse {
 pub trait LlmClient: Send + Sync {
     /// Perform a completion call.
     ///
-    /// `system_prompt` - the system/preamble text.
+    /// `system_prompt` - the system instruction text.
     /// `messages` - chat history in rig Message format.
     /// `tool_definitions` - available tools for this call.
     async fn complete(

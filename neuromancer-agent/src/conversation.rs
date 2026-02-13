@@ -271,7 +271,7 @@ impl ConversationContext {
                         )),
                     });
                 }
-                // System messages are handled via preamble, not chat history
+                // System messages are handled via the configured system prompt, not chat history
                 (MessageRole::System, _) => {}
                 // Mixed content: extract text portions
                 (_, MessageContent::Mixed(parts)) => {
@@ -356,7 +356,7 @@ mod tests {
         ctx.add_message(ChatMessage::assistant_text("Hi there"));
 
         let rig_msgs = ctx.to_rig_messages();
-        // System messages are not included in rig messages (handled as preamble)
+        // System messages are not included in rig messages (handled via system prompt)
         assert_eq!(rig_msgs.len(), 2);
     }
 }
