@@ -8,14 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, watch};
-use tracing::warn;
 use tracing::{error, info};
 
-/// Neuromancer daemon — deterministic orchestrator for rig-powered sub-agents.
+/// Neuromancer daemon — System0 orchestrator runtime for rig-powered sub-agents.
 #[derive(Parser, Debug)]
 #[command(name = "neuromancerd", version, about)]
 struct Cli {
@@ -40,7 +39,7 @@ async fn main() -> Result<()> {
     // 1. Load and validate config
     // -----------------------------------------------------------------------
     let initial_config = config::load_config(&cli.config)?;
-    config::validate_config(&initial_config)?;
+    config::validate_config(&initial_config, &cli.config)?;
 
     if cli.validate {
         println!("config is valid");
@@ -80,18 +79,16 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 5. Start admin API server
     // -----------------------------------------------------------------------
-    let message_runtime = match message_runtime::MessageRuntime::new(&initial_config).await {
-        Ok(runtime) => Some(Arc::new(runtime)),
-        Err(err) => {
-            warn!(error = %err, "message runtime unavailable; orchestrator.turn RPC will fail");
-            None
-        }
-    };
+    let message_runtime = Arc::new(
+        message_runtime::MessageRuntime::new(&initial_config, &cli.config)
+            .await
+            .map_err(|err| anyhow!("failed to initialize message runtime: {err}"))?,
+    );
 
     let admin_state = admin::AppState {
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        message_runtime,
+        message_runtime: Some(message_runtime),
     };
 
     let admin_router = admin::admin_router(admin_state);
