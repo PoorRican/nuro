@@ -6,6 +6,7 @@ pub struct XdgLayout {
     home_dir: PathBuf,
     config_root: PathBuf,
     runtime_root: PathBuf,
+    runtime_home_root: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,15 +46,21 @@ impl XdgLayout {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
-        Ok(Self::from_home_and_xdg(
+        let xdg_runtime_home = std::env::var("XDG_RUNTIME_HOME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        Ok(Self::from_home_and_xdg_runtime(
             PathBuf::from(home),
             xdg_config_home,
             xdg_data_home,
+            xdg_runtime_home,
         ))
     }
 
     pub fn new(home_dir: PathBuf) -> Self {
-        Self::from_home_and_xdg(home_dir, None, None)
+        Self::from_home_and_xdg_runtime(home_dir, None, None, None)
     }
 
     pub fn from_home_and_xdg(
@@ -61,14 +68,26 @@ impl XdgLayout {
         xdg_config_home: Option<PathBuf>,
         xdg_data_home: Option<PathBuf>,
     ) -> Self {
+        Self::from_home_and_xdg_runtime(home_dir, xdg_config_home, xdg_data_home, None)
+    }
+
+    pub fn from_home_and_xdg_runtime(
+        home_dir: PathBuf,
+        xdg_config_home: Option<PathBuf>,
+        xdg_data_home: Option<PathBuf>,
+        xdg_runtime_home: Option<PathBuf>,
+    ) -> Self {
         let config_base = xdg_config_home.unwrap_or_else(|| home_dir.join(".config"));
         let data_base = xdg_data_home.unwrap_or_else(|| home_dir.join(".local"));
+        let runtime_home_base = xdg_runtime_home.unwrap_or_else(|| data_base.clone());
         let config_root = config_base.join("neuromancer");
         let runtime_root = data_base.join("neuromancer");
+        let runtime_home_root = runtime_home_base.join("neuromancer");
         Self {
             home_dir,
             config_root,
             runtime_root,
+            runtime_home_root,
         }
     }
 
@@ -77,15 +96,16 @@ impl XdgLayout {
         xdg_config_home: Option<&str>,
         xdg_data_home: Option<&str>,
     ) -> Self {
-        Self::from_home_and_xdg(
+        Self::from_home_and_xdg_runtime(
             PathBuf::from(home_dir),
             xdg_config_home.map(PathBuf::from),
             xdg_data_home.map(PathBuf::from),
+            None,
         )
     }
 
     pub fn from_home(home_dir: &str) -> Self {
-        Self::from_home_and_xdg(PathBuf::from(home_dir), None, None)
+        Self::from_home_and_xdg_runtime(PathBuf::from(home_dir), None, None, None)
     }
 
     pub fn home_dir(&self) -> &Path {
@@ -100,12 +120,20 @@ impl XdgLayout {
         self.runtime_root.clone()
     }
 
+    pub fn runtime_home_root(&self) -> PathBuf {
+        self.runtime_home_root.clone()
+    }
+
     pub fn default_config_path(&self) -> PathBuf {
         self.config_root.join("neuromancer.toml")
     }
 
     pub fn skills_dir(&self) -> PathBuf {
         self.config_root.join("skills")
+    }
+
+    pub fn provider_keys_dir(&self) -> PathBuf {
+        self.runtime_home_root.join("provider_keys")
     }
 
     pub fn default_orchestrator_system_prompt_path(&self) -> PathBuf {
@@ -190,6 +218,14 @@ mod tests {
         assert_eq!(layout.config_root(), PathBuf::from("/tmp/home/.config/neuromancer"));
         assert_eq!(layout.runtime_root(), PathBuf::from("/tmp/home/.local/neuromancer"));
         assert_eq!(
+            layout.runtime_home_root(),
+            PathBuf::from("/tmp/home/.local/neuromancer")
+        );
+        assert_eq!(
+            layout.provider_keys_dir(),
+            PathBuf::from("/tmp/home/.local/neuromancer/provider_keys")
+        );
+        assert_eq!(
             layout.default_orchestrator_system_prompt_path(),
             PathBuf::from("/tmp/home/.config/neuromancer/orchestrator/SYSTEM.md")
         );
@@ -205,7 +241,30 @@ mod tests {
             XdgLayout::from_home_and_xdg_str("/home/user", Some("/xdg/config"), Some("/xdg/data"));
         assert_eq!(layout.config_root(), PathBuf::from("/xdg/config/neuromancer"));
         assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/data/neuromancer"));
+        assert_eq!(
+            layout.runtime_home_root(),
+            PathBuf::from("/xdg/data/neuromancer")
+        );
         assert_eq!(layout.home_dir(), Path::new("/home/user"));
+    }
+
+    #[test]
+    fn xdg_runtime_home_overrides_runtime_home_root() {
+        let layout = XdgLayout::from_home_and_xdg_runtime(
+            PathBuf::from("/home/user"),
+            Some(PathBuf::from("/xdg/config")),
+            Some(PathBuf::from("/xdg/data")),
+            Some(PathBuf::from("/xdg/runtime")),
+        );
+        assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/data/neuromancer"));
+        assert_eq!(
+            layout.runtime_home_root(),
+            PathBuf::from("/xdg/runtime/neuromancer")
+        );
+        assert_eq!(
+            layout.provider_keys_dir(),
+            PathBuf::from("/xdg/runtime/neuromancer/provider_keys")
+        );
     }
 
     #[test]
