@@ -17,7 +17,7 @@ No new "plugin protocol" is introduced: external extensibility is primarily via 
 
 **v0.1-alpha directives (authoritative):**
 * No backward compatibility for removed RPC/CLI task/message surfaces.
-* Prompt configuration is file-path based (`system_prompt_path`), not inline preamble text.
+* Prompt configuration is file-path based (`system_prompt_path`).
 * Prompt files must exist and be non-empty markdown files at startup.
 * Setup is explicit via `neuroctl install` (optional `--config <path>` override; no startup auto-bootstrap).
 
@@ -757,8 +757,7 @@ async fn build_agent(
     let model = model_router.resolve(&config.model_slot)?;
 
     let mut builder = model
-        .agent(system_prompt)
-        .preamble(system_prompt.clone());
+        .agent(system_prompt);
 
     // Add policy-wrapped native tools
     for tool in tools {

@@ -62,7 +62,7 @@ where
 {
     async fn complete(
         &self,
-        system_prompt: &str,
+        _system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
     ) -> Result<LlmResponse, NeuromancerError> {
@@ -91,7 +91,6 @@ where
         let request = self
             .model
             .completion_request(current_prompt.clone())
-            .preamble(system_prompt.to_string())
             .messages(chat_history)
             .tools(tool_definitions)
             .build();
