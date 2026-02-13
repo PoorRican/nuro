@@ -3,6 +3,7 @@ mod daemon;
 mod e2e;
 mod install;
 mod output;
+mod provider_keys;
 mod rpc_client;
 
 use clap::Parser;
@@ -78,6 +79,11 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
         Command::Install(args) => {
             let config_path = resolve_config_path(args.config)?;
             let result = run_install(&config_path, args.override_config)?;
+            if !json_mode {
+                for warning in &result.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
             Ok(serde_json::json!(result))
         }
         Command::Daemon { command } => match command {
