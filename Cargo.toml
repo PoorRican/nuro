@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "neuromancer-core",
-    "neuromancer-orchestrator",
     "neuromancer-agent",
     "neuromancerd",
     "neuromancer-cli",
@@ -22,7 +21,6 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 neuromancer-core = { path = "neuromancer-core" }
-neuromancer-orchestrator = { path = "neuromancer-orchestrator" }
 neuromancer-agent = { path = "neuromancer-agent" }
 neuromancer-a2a = { path = "neuromancer-a2a" }
 neuromancer-mcp = { path = "neuromancer-mcp" }

@@ -24,12 +24,11 @@ The daemon binary is `neuromancerd`:
 cargo run -p neuromancerd -- -c neuromancer.toml
 ```
 
-## Workspace Structure (11 crates)
+## Workspace Structure (10 crates)
 
 | Crate | Role |
 |-------|------|
 | `neuromancer-core` | Shared traits and types only (no implementations) |
-| `neuromancer-orchestrator` | Routing/classification utilities used by orchestrator workflows |
 | `neuromancer-agent` | Rig-based agent runtime with state machine execution |
 | `neuromancer-cli` | `neuroctl` admin/ops CLI over JSON-RPC |
 | `neuromancerd` | Daemon binary: config, admin API, System0 runtime, telemetry, shutdown |

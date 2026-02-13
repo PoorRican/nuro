@@ -736,11 +736,8 @@ Wrapping rig in a Neuromancer-specific trait would add indirection without value
 | Crate | rig dependency? | Reason |
 |---|---|---|
 | `neuromancer-core` | No | Defines traits only |
-| `neuromancer-orchestrator` | **Yes** (lightweight) | LLM-based intent classifier for routing fallback |
 | `neuromancer-agent` | **Yes** (full) | Agent construction, execution, tool dispatch |
-| `neuromancerd` | Transitive | Via orchestrator + agent |
-
-Note: `neuromancer-orchestrator` uses rig only for the routing classifier — a single `CompletionModel::complete()` call with a constrained prompt. It does NOT use rig's Agent, tool, or conversation abstractions.
+| `neuromancerd` | Transitive | Via `neuromancer-agent` |
 
 ### 7.2 Agent construction with rig AgentBuilder
 
@@ -1645,9 +1642,6 @@ neuromancer/
   neuromancer-core/               # Core traits: ToolBroker, MemoryStore, SecretsBroker,
                                   #   PolicyEngine, error types, shared types.
                                   #   NO rig dependency. NO sqlx dependency.
-  neuromancer-orchestrator/       # Orchestrator, routing rules + LLM classifier,
-                                  #   supervision loop, task queue, remediation logic.
-                                  #   Depends on: neuromancer-core, rig-core (for classifier only).
   neuromancer-agent/              # Agent execution runtime: state machine, rig Agent
                                   #   construction, ConversationContext, model router.
                                   #   Depends on: neuromancer-core, rig-core.
@@ -1667,8 +1661,6 @@ neuromancer/
   neuromancer-secrets/            # Secrets broker: encrypted store, ACL enforcement,
                                   #   handle resolution, injection.
 ```
-
-**Dependency note:** Both `neuromancer-orchestrator` and `neuromancer-agent` depend on `rig-core`, but for different reasons. The orchestrator uses only `CompletionModel::complete()` for the routing classifier. The agent crate uses rig's full Agent/tool/conversation stack. The orchestrator never constructs a rig Agent or uses tool dispatch.
 
 ### 19.2 Implementation milestones
 

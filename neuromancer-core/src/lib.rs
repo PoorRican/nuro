@@ -3,7 +3,6 @@ pub mod config;
 pub mod error;
 pub mod memory;
 pub mod policy;
-pub mod routing;
 pub mod rpc;
 pub mod secrets;
 pub mod task;
