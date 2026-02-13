@@ -9,6 +9,7 @@ use neuromancer_core::xdg::XdgLayout;
 use serde::Serialize;
 
 use crate::CliError;
+use crate::provider_keys::{provider_credential_targets, read_nonempty_env, read_nonempty_file};
 use crate::rpc_client::RpcClient;
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,8 @@ pub struct DaemonStatusResult {
 
 pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartResult, CliError> {
     let parsed_config = load_and_validate_daemon_config(&options.config)?;
+    let layout = XdgLayout::from_env().map_err(|err| CliError::Lifecycle(err.to_string()))?;
+    let provider_env_values = resolve_provider_env_values(&parsed_config, &layout)?;
     let mut warnings = Vec::new();
     if parsed_config.agents.is_empty() {
         warnings.push(
@@ -72,14 +75,18 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
 
     let daemon_bin = resolve_daemon_bin(options.daemon_bin.as_deref())?;
 
-    let child = Command::new(&daemon_bin)
+    let mut command = Command::new(&daemon_bin);
+    command
         .arg("--config")
         .arg(&options.config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| {
+        .stderr(Stdio::null());
+    for (env_var, value) in provider_env_values {
+        command.env(env_var, value);
+    }
+
+    let child = command.spawn().map_err(|err| {
             CliError::Lifecycle(format!(
                 "failed to spawn daemon '{}' with config '{}': {err}",
                 daemon_bin.display(),
@@ -246,30 +253,40 @@ fn load_and_validate_daemon_config(config_path: &Path) -> Result<NeuromancerConf
         ))
     })?;
 
-    validate_required_provider_env(&config)?;
-
     Ok(config)
 }
 
-fn validate_required_provider_env(config: &NeuromancerConfig) -> Result<(), CliError> {
-    let uses_groq = config
-        .models
-        .values()
-        .any(|slot| slot.provider.trim().eq_ignore_ascii_case("groq"));
+fn resolve_provider_env_values(
+    config: &NeuromancerConfig,
+    layout: &XdgLayout,
+) -> Result<Vec<(String, String)>, CliError> {
+    let mut resolved = Vec::new();
+    for target in provider_credential_targets(config, layout) {
+        if let Some(value) = read_nonempty_env(&target.env_var) {
+            resolved.push((target.env_var, value));
+            continue;
+        }
 
-    if uses_groq
-        && env::var("GROQ_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .is_none()
-    {
-        return Err(CliError::Usage(
-            "config uses provider 'groq' but GROQ_API_KEY is not set".to_string(),
-        ));
+        let file_value = read_nonempty_file(&target.path).map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed reading provider key file '{}': {err}",
+                target.path.display()
+            ))
+        })?;
+        if let Some(value) = file_value {
+            resolved.push((target.env_var, value));
+            continue;
+        }
+
+        return Err(CliError::Usage(format!(
+            "config uses provider '{}' but no credential was found. Expected '{}' env var or key file '{}'. Run `neuroctl install` to capture provider keys.",
+            target.provider,
+            target.env_var,
+            target.path.display()
+        )));
     }
 
-    Ok(())
+    Ok(resolved)
 }
 
 fn install_create_hint_for(config_path: &Path) -> String {
