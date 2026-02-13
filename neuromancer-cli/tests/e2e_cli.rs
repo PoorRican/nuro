@@ -83,6 +83,48 @@ rules = []
 
 [orchestrator]
 model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+
+[agents.planner]
+models.executor = "executor"
+system_prompt_path = "prompts/agents/planner/SYSTEM.md"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+        bind_addr
+    );
+
+    fs::write(&config_path, config).expect("config should be written");
+    config_path
+}
+
+fn write_orchestrator_config_with_default_prompts(dir: &Path, bind_addr: &str) -> PathBuf {
+    let config_path = dir.join("neuromancer-default-prompts.toml");
+    let config = format!(
+        r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[routing]
+default_agent = "planner"
+rules = []
+
+[orchestrator]
+model_slot = "executor"
 
 [agents.planner]
 models.executor = "executor"
@@ -108,6 +150,18 @@ fn parse_json_output(output: &[u8]) -> Value {
     serde_json::from_slice(output).expect("command output should be valid json")
 }
 
+fn run_install(config: &Path, addr: &str) {
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(addr)
+        .arg("install")
+        .arg("--config")
+        .arg(config)
+        .assert()
+        .success();
+}
+
 #[test]
 fn daemon_lifecycle_start_status_stop() {
     let temp = TempDir::new().expect("tempdir");
@@ -117,6 +171,7 @@ fn daemon_lifecycle_start_status_stop() {
     let _cleanup = Cleanup {
         pid_file: pid_file.clone(),
     };
+    run_install(&config, &addr);
 
     let start = neuroctl()
         .arg("--json")
@@ -187,6 +242,7 @@ fn orchestrator_turn_command_routes_via_rpc() {
     let _cleanup = Cleanup {
         pid_file: pid_file.clone(),
     };
+    run_install(&config, &addr);
 
     neuroctl()
         .arg("--json")
@@ -285,6 +341,77 @@ fn orchestrator_turn_command_routes_via_rpc() {
 #[test]
 fn removed_task_command_fails_with_usage_error() {
     neuroctl().arg("task").arg("list").assert().code(2);
+}
+
+#[test]
+fn install_command_creates_prompt_files() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_orchestrator_config(temp.path(), &bind_addr);
+
+    let output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&config)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["ok"], Value::Bool(true));
+
+    let prompt_file = temp.path().join("prompts/orchestrator/SYSTEM.md");
+    assert!(prompt_file.exists(), "install should create orchestrator prompt");
+}
+
+#[test]
+fn install_defaults_to_xdg_home_when_set() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_orchestrator_config_with_default_prompts(temp.path(), &bind_addr);
+
+    let xdg_home = temp.path().join("xdg-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    let output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&config)
+        .env("XDG_HOME", &xdg_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["ok"], Value::Bool(true));
+
+    let orchestrator_prompt = xdg_home.join(".config/neuromancer/orchestrator/SYSTEM.md");
+    let planner_prompt = xdg_home.join(".config/neuromancer/agents/planner/SYSTEM.md");
+    let runtime_root = xdg_home.join(".local/neuromancer");
+    assert!(
+        orchestrator_prompt.exists(),
+        "install should create orchestrator prompt under XDG_HOME",
+    );
+    assert!(
+        planner_prompt.exists(),
+        "install should create agent prompt under XDG_HOME",
+    );
+    assert!(
+        runtime_root.exists(),
+        "install should create runtime root under XDG_HOME",
+    );
 }
 
 #[test]
