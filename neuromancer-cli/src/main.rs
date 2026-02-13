@@ -13,7 +13,7 @@ use cli::{
 };
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
-use install::{resolve_install_config_path, run_install};
+use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
 use rpc_client::RpcClient;
 
@@ -75,14 +75,15 @@ async fn main() {
 async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
     match cli.command {
         Command::Install(args) => {
-            let config_path = resolve_install_config_path(args.config)?;
+            let config_path = resolve_config_path(args.config)?;
             let result = run_install(&config_path, args.override_config)?;
             Ok(serde_json::json!(result))
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Start(args) => {
+                let config_path = resolve_config_path(args.config)?;
                 let result = start_daemon(&DaemonStartOptions {
-                    config: args.config,
+                    config: config_path,
                     daemon_bin: args.daemon_bin,
                     pid_file: args.pid_file,
                     wait_healthy: args.wait_healthy,
@@ -135,8 +136,9 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
         }
         Command::E2e { command } => match command {
             E2eCommand::Smoke(args) => {
+                let config_path = resolve_config_path(args.config)?;
                 let result = run_smoke(&SmokeOptions {
-                    config: args.config,
+                    config: config_path,
                     daemon_bin: args.daemon_bin,
                     pid_file: args.pid_file,
                     addr: cli.addr,

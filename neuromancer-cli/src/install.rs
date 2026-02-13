@@ -15,7 +15,7 @@ pub struct InstallResult {
     pub overwritten: Vec<String>,
 }
 
-pub fn resolve_install_config_path(config_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+pub fn resolve_config_path(config_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(path) = config_path {
         return Ok(path);
     }
