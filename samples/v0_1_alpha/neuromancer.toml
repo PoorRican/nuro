@@ -1,0 +1,42 @@
+[global]
+instance_id = "local-dev"
+workspace_dir = "/tmp/neuromancer"
+data_dir = "/tmp/neuromancer"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[routing]
+default_agent = "planner"
+rules = []
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+max_iterations = 30
+capabilities.skills = [
+  "delegate_to_agent",
+  "list_agents",
+  "read_config",
+  "modify_skill"
+]
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[agents.planner]
+models.executor = "executor"
+system_prompt_path = "prompts/agents/planner/SYSTEM.md"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[admin_api]
+bind_addr = "127.0.0.1:9090"
+enabled = true

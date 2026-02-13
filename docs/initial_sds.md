@@ -1,10 +1,10 @@
-# Neuromancer v0.5 System Design Specification
+# Neuromancer v0.1-alpha System Design Specification
 
 ## 0. Status and scope
 
-**Status:** Draft proposal for v0.5 ("first daemon you can keep running without fear").
-**Revision:** v0.5-r2 — behavioral specification rewrite addressing orchestrator/sub-agent separation, rig-first LLM integration, and runtime dynamics.
-**Scope:** A Rust daemon ("Neuromancer") that provides a **deterministic orchestrator** supervising multiple isolated **rig-powered sub-agents**, using:
+**Status:** Active v0.1-alpha runtime specification.
+**Revision:** v0.1-alpha-r1 — System0 CLI runtime with prompt-path driven orchestrator/agent prompts.
+**Scope:** A Rust daemon ("Neuromancer") that provides a **System0 LLM orchestrator** supervising isolated **rig-powered sub-agents**, using:
 
 * **Agent Skills** for instruction bundles
 * **MCP** for external tools/services (via rmcp, surfaced through rig's `.mcp_tool()`)
@@ -13,7 +13,13 @@
 
 No new "plugin protocol" is introduced: external extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the "instruction + packaging" layer.
 
-**Key architectural invariant:** Sub-agents do ALL complex reasoning, planning, and tool use via [rig](https://docs.rs/rig-core). The orchestrator is primarily deterministic, but uses a **lightweight LLM routing call** when no deterministic rule matches an incoming trigger (e.g., arbitrary user messages like "download this file" or "update the check-email cron to every 10 minutes").
+**Key architectural invariant:** Public ingress is `orchestrator.turn`. The System0 orchestrator itself is a rig-backed LLM agent that mediates user/admin turns, delegates work, and maintains single-session history through `neuromancer-agent`.
+
+**v0.1-alpha directives (authoritative):**
+* No backward compatibility for removed RPC/CLI task/message surfaces.
+* Prompt configuration is file-path based (`system_prompt_path`), not inline preamble text.
+* Prompt files must exist and be non-empty markdown files at startup.
+* Setup is explicit via `neuroctl install --config <path>` (no startup auto-bootstrap).
 
 ---
 
@@ -61,7 +67,7 @@ Neuromancer is explicitly designed around failures we've now repeatedly seen in 
 6. **Admin API for runtime introspection**
    Localhost HTTP endpoints for task inspection, agent health, cron management, and manual task submission.
 
-### 2.2 Non-goals (v0.5)
+### 2.2 Non-goals (v0.1-alpha)
 
 * A public skill marketplace / package manager (v0.5 supports local skill packs; supply-chain hardening is *foundation work*).
 * Full multi-tenant enterprise RBAC UI.
@@ -71,64 +77,46 @@ Neuromancer is explicitly designed around failures we've now repeatedly seen in 
 
 ## 3. High-level architecture
 
-Neuromancer is split into **control plane** and **data plane**. The control plane is primarily deterministic but has a lightweight LLM routing capability for classifying ambiguous inputs.
+Neuromancer is split into **control plane** and **data plane**. The control plane is System0, implemented as an LLM agent runtime with policy-gated control-plane tooling.
 
-### 3.1 Control plane: `neuromancerd` + Orchestrator (primarily deterministic, LLM-assisted routing)
+### 3.1 Control plane: `neuromancerd` + System0 orchestrator
 
-The daemon process hosts the **Orchestrator**, a supervisor that is deterministic wherever possible but can invoke a lightweight LLM call for routing ambiguous inputs. The orchestrator:
+The daemon process hosts **System0**, which mediates user/admin turns and delegates execution to sub-agents. The orchestrator:
 
 * Loads **central TOML config**
 * Runs **Trigger Manager** (Discord + cron)
 * Maintains **Secrets Broker**, **Memory Store**, **MCP Client Pool**, **A2A Registry**
-* Routes trigger events to agents via **configurable routing rules** (deterministic) or **LLM-based intent classification** (fallback)
+* Accepts public ingress from `orchestrator.turn` and processes one queued turn at a time
 * Supervises sub-agent runtimes (in-process, subprocess, or container)
-* Manages the **task queue** and **audit trail**
+* Manages delegated-run tracking and audit trail
 * Facilitates cross-agent communication and remediation
 * Provides an **Admin API** on localhost
 
-The orchestrator does NOT do complex reasoning, multi-step planning, or tool use. Its only LLM interaction is a constrained routing/classification call when deterministic rules don't match. Examples of ambiguous inputs requiring LLM routing:
-
-* "go to huggingface.com and add $100 in compute credits" → route to `browser` agent
-* "update the interval of the 'check email' task to every 10 minutes" → route to `planner` or handle as admin action
-* "download this file" → route to `files` agent
+System0 itself is an LLM agent and can reason/plan, but outbound actions are constrained by an allowlisted tool broker and trigger/capability policy.
 
 ```rust
 struct Orchestrator {
     config: Arc<NeuromancerConfig>,
-    agent_registry: AgentRegistry,
-    task_queue: TaskQueue,
+    input_message_queue: InputMessageQueue,
+    delegated_run_registry: DelegatedRunRegistry,
+    system0_runtime: AgentRuntime,
+    global_session_id: AgentSessionId,
     memory_store: Arc<dyn MemoryStore>,
     secrets_broker: Arc<dyn SecretsBroker>,
     mcp_pool: McpClientPool,
     policy_engine: Arc<dyn PolicyEngine>,
-    router: Router,  // deterministic rules + LLM fallback
 }
 
 impl Orchestrator {
-    /// Match a trigger event to an agent. Tries deterministic rules first;
-    /// falls back to LLM-based intent classification if no rule matches.
-    async fn route(&self, event: TriggerEvent) -> Result<TaskId>;
+    /// Enqueue one public inbound turn from CLI/admin RPC.
+    async fn orchestrator_turn(&self, message: String) -> Result<OrchestratorTurnResult>;
 
-    /// Main supervision loop: dequeue tasks, dispatch to agents, handle reports.
-    async fn supervise(&self) -> Result<()>;
+    /// Execute one System0 turn against the global agent session.
+    async fn process_turn(&self, turn: InputTurn) -> Result<OrchestratorTurnResult>;
 
-    /// Relay a message between agents (cross-agent communication).
-    async fn relay(&self, from: AgentId, to: AgentId, msg: AgentMessage) -> Result<()>;
-
-    /// Decide what to do when a sub-agent reports a problem.
-    async fn remediate(&self, report: SubAgentReport) -> RemediationAction;
-}
-
-struct Router {
-    rules: Vec<RoutingRule>,           // deterministic, evaluated first
-    default_agent: AgentId,            // used when LLM routing also fails
-    classifier_model: Box<dyn CompletionModel>,  // lightweight model for intent classification
-}
-
-impl Router {
-    /// Try deterministic rules first. If none match, call the classifier model
-    /// with the agent registry (names + descriptions) to pick the best agent.
-    async fn resolve(&self, event: &TriggerEvent) -> Result<AgentId>;
+    /// Read-only delegated run introspection.
+    async fn list_runs(&self) -> Result<Vec<DelegatedRun>>;
+    async fn get_run(&self, run_id: String) -> Result<DelegatedRun>;
 }
 ```
 
@@ -303,67 +291,30 @@ trait PolicyEngine: Send + Sync {
 
 ### 6.2 Orchestrator loop
 
-The orchestrator is the main event loop of `neuromancerd`. It is primarily deterministic — routing and remediation decisions are based on configuration and rules. When no rule matches an incoming event, a lightweight LLM classifier selects the target agent.
+The orchestrator is the main event loop of `neuromancerd`. In v0.1-alpha it runs as a System0 `neuromancer-agent` instance, receives inbound turns through `orchestrator.turn`, and keeps a single persistent session history in the agent crate.
 
 ```
 loop {
     select! {
-        event = trigger_rx.recv() => {
-            let task = self.route(event).await?;  // rules-first, LLM fallback
-            self.task_queue.enqueue(task).await?;
+        turn = input_message_queue.recv() => {
+            system0_agent.execute_turn(global_session_id, turn.message).await?;
         }
-        task = self.task_queue.dequeue().await => {
-            let agent_id = task.assigned_agent;
-            self.agent_registry.dispatch(agent_id, task).await?;
-        }
-        report = agent_report_rx.recv() => {
-            match self.remediate(report).await {
-                RemediationAction::Retry { .. } => { /* re-enqueue */ }
-                RemediationAction::Clarify { .. } => { /* inject context, re-dispatch */ }
-                RemediationAction::GrantTemporary { .. } => { /* issue scoped grant */ }
-                RemediationAction::Reassign { .. } => { /* route to different agent */ }
-                RemediationAction::EscalateToUser { .. } => { /* send to trigger channel */ }
-                RemediationAction::Abort { .. } => { /* mark task failed */ }
-            }
+        delegated = delegated_run_updates.recv() => {
+            delegated_registry.update(delegated);
         }
         _ = shutdown_signal() => break,
     }
 }
 ```
 
-**Routing** uses a two-tier approach:
+Public ingress is message-turn based:
+* `orchestrator.turn` enqueues one input message.
+* Runtime executes one System0 turn against the single session.
+* Delegated runs are tracked internally and exposed via:
+  * `orchestrator.runs.list`
+  * `orchestrator.runs.get`
 
-**Tier 1 — Deterministic rules** (evaluated first, no LLM cost):
-
-```toml
-[routing]
-default_agent = "planner"
-classifier_model = "router"   # model slot for Tier 2
-
-[[routing.rules]]
-match = { channel_id = "browser-tasks" }
-agent = "browser"
-
-[[routing.rules]]
-match = { trigger = "cron", id = "daily-issue-summary" }
-agent = "github-summarizer"
-```
-
-Rules are evaluated top-to-bottom. First match wins. Matching criteria include: `channel_id`, `trigger` type, `guild_id`, `user_id`, `prefix`, or combinations.
-
-**Tier 2 — LLM-based intent classification** (fallback when no rule matches):
-
-When no deterministic rule matches, the orchestrator calls the `classifier_model` (a cheap, fast model like `gpt-4o-mini`) with:
-* The incoming message text
-* A list of available agents with their descriptions and capabilities
-* A constrained prompt asking: "Which agent should handle this? Respond with the agent name only."
-
-This handles arbitrary user messages like:
-* "go to huggingface.com and add $100 in compute credits" → `browser`
-* "update the interval of the 'check email' task to every 10 minutes" → `planner`
-* "download this file" → `files`
-
-If the classifier also fails (low confidence, invalid response), `default_agent` is used as the final fallback.
+The orchestrator prompt is loaded from `system_prompt_path` (or the XDG default), placeholders are rendered with runtime context (`{{AVAILABLE_AGENTS}}`, `{{AVAILABLE_TOOLS}}`, `{{ORCHESTRATOR_ID}}`), and that rendered content is supplied to `AgentRuntime` at instantiation time.
 
 ### 6.3 Agent execution state machine
 
@@ -810,7 +761,7 @@ async fn build_agent(
 
     let mut builder = model
         .agent(system_prompt)
-        .preamble(&config.preamble);
+        .preamble(system_prompt.clone());
 
     // Add policy-wrapped native tools
     for tool in tools {
@@ -1035,6 +986,11 @@ This workflow is now formalized via the remediation protocol (§6.5):
 
 Use a single TOML file as the source of truth.
 
+For v0.1-alpha bootstrap:
+* Run `neuroctl install --config <path>` to create XDG runtime/config directories and default `SYSTEM.md` prompt files.
+* XDG roots resolve under `$XDG_HOME` when set (`$XDG_HOME/.config/neuromancer`, `$XDG_HOME/.local/neuromancer`), otherwise `~/.config/neuromancer` and `~/.local/neuromancer`.
+* Daemon startup fails if configured/default prompt files are missing or empty.
+
 ### 11.1 Design principles
 
 * **Explicit capabilities**, no ambient permissions
@@ -1070,7 +1026,6 @@ backend = "sqlite"
 sqlite_path = "/var/lib/neuromancer/data/memory.db"
 
 [models]
-router = { provider = "openai", model = "gpt-4o-mini" }
 planner = { provider = "openai", model = "gpt-4o" }
 executor = { provider = "openai", model = "gpt-4o" }
 browser = { provider = "anthropic", model = "claude-sonnet-4-5-20250929" }
@@ -1094,7 +1049,11 @@ agent_card_signing = "optional"
 
 [routing]
 default_agent = "planner"
-classifier_model = "router"
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+max_iterations = 30
 
 [[routing.rules]]
 match = { channel_id = "browser-tasks" }
@@ -1110,6 +1069,7 @@ agent = "github-summarizer"
 mode = "inproc"
 models.planner = "planner"
 models.executor = "executor"
+system_prompt_path = "prompts/agents/planner/SYSTEM.md"
 capabilities.skills = ["task_manager", "code_review"]
 capabilities.mcp_servers = []
 capabilities.a2a_peers = ["browser", "files"]
@@ -1124,6 +1084,7 @@ watchdog_timeout = "60s"
 mode = "container"
 image = "neuromancer:0.5"
 models.executor = "browser"
+system_prompt_path = "prompts/agents/browser/SYSTEM.md"
 capabilities.skills = ["browser_summarize", "browser_clickpath"]
 capabilities.mcp_servers = ["playwright"]
 capabilities.secrets = ["web_login_cookiejar"]
@@ -1137,6 +1098,7 @@ circuit_breaker = { failures = 5, window = "10m" }
 [agents.files]
 mode = "container"
 image = "neuromancer:0.5"
+system_prompt_path = "prompts/agents/files/SYSTEM.md"
 capabilities.skills = ["fs_readwrite"]
 capabilities.mcp_servers = ["filesystem"]
 capabilities.secrets = []
