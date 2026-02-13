@@ -10,7 +10,7 @@ use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig};
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::rpc::{DelegatedRun, OrchestratorTurnResult};
+use neuromancer_core::rpc::{DelegatedRun, OrchestratorToolInvocation, OrchestratorTurnResult};
 use neuromancer_core::task::Task;
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
@@ -105,11 +105,13 @@ impl RuntimeCore {
         let response =
             extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
         let delegated_runs = self.system0_broker.take_runs(turn_id).await;
+        let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
 
         Ok(OrchestratorTurnResult {
             turn_id: turn_id.to_string(),
             response,
             delegated_runs,
+            tool_invocations,
         })
     }
 }
@@ -310,6 +312,7 @@ struct System0BrokerInner {
     current_trigger_type: TriggerType,
     current_turn_id: uuid::Uuid,
     runs_by_turn: HashMap<uuid::Uuid, Vec<DelegatedRun>>,
+    tool_invocations_by_turn: HashMap<uuid::Uuid, Vec<OrchestratorToolInvocation>>,
     runs_index: HashMap<String, DelegatedRun>,
     runs_order: Vec<String>,
     running_agents: HashMap<String, String>,
@@ -335,6 +338,7 @@ impl System0ToolBroker {
                 current_trigger_type: TriggerType::Admin,
                 current_turn_id: uuid::Uuid::nil(),
                 runs_by_turn: HashMap::new(),
+                tool_invocations_by_turn: HashMap::new(),
                 runs_index: HashMap::new(),
                 runs_order: Vec::new(),
                 running_agents: HashMap::new(),
@@ -347,11 +351,20 @@ impl System0ToolBroker {
         inner.current_turn_id = turn_id;
         inner.current_trigger_type = trigger_type;
         inner.runs_by_turn.remove(&turn_id);
+        inner.tool_invocations_by_turn.remove(&turn_id);
     }
 
     async fn take_runs(&self, turn_id: uuid::Uuid) -> Vec<DelegatedRun> {
         let mut inner = self.inner.lock().await;
         inner.runs_by_turn.remove(&turn_id).unwrap_or_default()
+    }
+
+    async fn take_tool_invocations(&self, turn_id: uuid::Uuid) -> Vec<OrchestratorToolInvocation> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .tool_invocations_by_turn
+            .remove(&turn_id)
+            .unwrap_or_default()
     }
 
     async fn list_runs(&self) -> Vec<DelegatedRun> {
@@ -426,6 +439,39 @@ impl System0ToolBroker {
             },
         ]
     }
+
+    fn record_invocation(
+        inner: &mut System0BrokerInner,
+        turn_id: uuid::Uuid,
+        call: &ToolCall,
+        output: &ToolOutput,
+    ) {
+        let (status, rendered_output) = match output {
+            ToolOutput::Success(value) => ("success".to_string(), value.clone()),
+            ToolOutput::Error(err) => ("error".to_string(), serde_json::json!({ "error": err })),
+        };
+
+        inner
+            .tool_invocations_by_turn
+            .entry(turn_id)
+            .or_default()
+            .push(OrchestratorToolInvocation {
+                call_id: call.id.clone(),
+                tool_id: call.tool_id.clone(),
+                arguments: call.arguments.clone(),
+                status,
+                output: rendered_output,
+            });
+    }
+
+    fn record_invocation_err(
+        inner: &mut System0BrokerInner,
+        turn_id: uuid::Uuid,
+        call: &ToolCall,
+        err: &NeuromancerError,
+    ) {
+        Self::record_invocation(inner, turn_id, call, &ToolOutput::Error(err.to_string()));
+    }
 }
 
 #[async_trait::async_trait]
@@ -453,85 +499,108 @@ impl ToolBroker for System0ToolBroker {
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
         let mut inner = self.inner.lock().await;
+        let turn_id = inner.current_turn_id;
 
         if !inner.allowlisted_tools.contains(&call.tool_id) {
-            return Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: call.tool_id,
-            }));
+            let err = NeuromancerError::Tool(ToolError::NotFound {
+                tool_id: call.tool_id.clone(),
+            });
+            Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+            return Err(err);
         }
 
         match call.tool_id.as_str() {
-            "list_agents" => Ok(ToolResult {
-                call_id: call.id,
-                output: ToolOutput::Success(serde_json::json!({
+            "list_agents" => {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: ToolOutput::Success(serde_json::json!({
                     "agents": inner.subagents.keys().cloned().collect::<Vec<_>>()
                 })),
-            }),
-            "read_config" => Ok(ToolResult {
-                call_id: call.id,
-                output: ToolOutput::Success(inner.config_snapshot.clone()),
-            }),
+                };
+                Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                Ok(result)
+            }
+            "read_config" => {
+                let result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: ToolOutput::Success(inner.config_snapshot.clone()),
+                };
+                Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                Ok(result)
+            }
             "modify_skill" => {
                 if inner.current_trigger_type != TriggerType::Admin {
-                    return Ok(ToolResult {
-                        call_id: call.id,
+                    let result = ToolResult {
+                        call_id: call.id.clone(),
                         output: ToolOutput::Error(
                             "modify_skill requires an admin trigger".to_string(),
                         ),
-                    });
+                    };
+                    Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                    return Ok(result);
                 }
 
-                let skill_id = call
+                let Some(skill_id) = call
                     .arguments
                     .get("skill_id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                else {
+                    let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
                             tool_id: "modify_skill".to_string(),
                             message: "missing 'skill_id'".to_string(),
-                        })
-                    })?;
+                        });
+                    Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+                    return Err(err);
+                };
 
-                Ok(ToolResult {
-                    call_id: call.id,
+                let result = ToolResult {
+                    call_id: call.id.clone(),
                     output: ToolOutput::Success(serde_json::json!({
                         "status": "accepted",
                         "skill_id": skill_id,
                     })),
-                })
+                };
+                Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                Ok(result)
             }
             "delegate_to_agent" => {
-                let agent_id = call
+                let Some(agent_id) = call
                     .arguments
                     .get("agent_id")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                else {
+                    let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
                             tool_id: "delegate_to_agent".to_string(),
                             message: "missing 'agent_id'".to_string(),
-                        })
-                    })?
-                    .to_string();
-                let instruction = call
+                        });
+                    Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+                    return Err(err);
+                };
+                let agent_id = agent_id.to_string();
+
+                let Some(instruction) = call
                     .arguments
                     .get("instruction")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        NeuromancerError::Tool(ToolError::ExecutionFailed {
+                else {
+                    let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
                             tool_id: "delegate_to_agent".to_string(),
                             message: "missing 'instruction'".to_string(),
-                        })
-                    })?
-                    .to_string();
+                        });
+                    Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+                    return Err(err);
+                };
+                let instruction = instruction.to_string();
 
                 let Some(runtime) = inner.subagents.get(&agent_id).cloned() else {
-                    return Err(NeuromancerError::Tool(ToolError::NotFound {
+                    let err = NeuromancerError::Tool(ToolError::NotFound {
                         tool_id: format!("delegate_to_agent:{agent_id}"),
-                    }));
+                    });
+                    Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+                    return Err(err);
                 };
 
                 let run_id = uuid::Uuid::new_v4().to_string();
-                let turn_id = inner.current_turn_id;
                 inner
                     .running_agents
                     .insert(agent_id.clone(), run_id.clone());
@@ -575,19 +644,25 @@ impl ToolBroker for System0ToolBroker {
                     .push(run.clone());
                 inner.runs_index.insert(run.run_id.clone(), run.clone());
 
-                Ok(ToolResult {
-                    call_id: call.id,
+                let result = ToolResult {
+                    call_id: call.id.clone(),
                     output: ToolOutput::Success(serde_json::json!({
                         "run_id": run.run_id,
                         "agent_id": run.agent_id,
                         "state": run.state,
                         "summary": run.summary,
                     })),
-                })
+                };
+                Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                Ok(result)
             }
-            _ => Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: call.tool_id,
-            })),
+            _ => {
+                let err = NeuromancerError::Tool(ToolError::NotFound {
+                    tool_id: call.tool_id.clone(),
+                });
+                Self::record_invocation_err(&mut inner, turn_id, &call, &err);
+                Err(err)
+            }
         }
     }
 }

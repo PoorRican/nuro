@@ -98,10 +98,20 @@ pub struct DelegatedRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorToolInvocation {
+    pub call_id: String,
+    pub tool_id: String,
+    pub arguments: serde_json::Value,
+    pub status: String,
+    pub output: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorTurnResult {
     pub turn_id: String,
     pub response: String,
     pub delegated_runs: Vec<DelegatedRun>,
+    pub tool_invocations: Vec<OrchestratorToolInvocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +168,13 @@ mod tests {
                 agent_id: "finance_manager".to_string(),
                 state: "completed".to_string(),
                 summary: Some("delegation summary".to_string()),
+            }],
+            tool_invocations: vec![OrchestratorToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "list_agents".to_string(),
+                arguments: serde_json::json!({}),
+                status: "success".to_string(),
+                output: serde_json::json!({"agents": []}),
             }],
         };
 

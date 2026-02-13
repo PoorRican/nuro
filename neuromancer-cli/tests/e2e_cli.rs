@@ -317,6 +317,17 @@ fn orchestrator_turn_command_routes_via_rpc() {
             .unwrap_or_default()
             .is_empty()
     );
+    let tool_invocations = json["result"]["tool_invocations"]
+        .as_array()
+        .expect("turn result should include tool invocations");
+    assert!(
+        !tool_invocations.is_empty(),
+        "mock orchestrator turn should emit tool invocations"
+    );
+    assert!(
+        tool_invocations[0].get("arguments").is_some(),
+        "tool invocations should include arguments"
+    );
 
     let runs_output = neuroctl()
         .arg("--json")
