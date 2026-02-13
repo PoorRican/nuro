@@ -63,6 +63,8 @@ impl RpcClient {
             params,
             id: Some(id.clone()),
         };
+        let request_debug =
+            serde_json::to_string(&request).unwrap_or_else(|_| format!("{{\"method\":\"{method}\"}}"));
 
         let response = self
             .http
@@ -70,30 +72,37 @@ impl RpcClient {
             .json(&request)
             .send()
             .await
-            .map_err(|err| map_transport_error(err, &self.endpoint))?;
+            .map_err(|err| map_transport_error(err, &self.endpoint, method, &request_debug))?;
 
         let status = response.status();
         let body = response
             .bytes()
             .await
             .map_err(|err| RpcClientError::Transport(err.to_string()))?;
+        let body_debug = String::from_utf8_lossy(&body).to_string();
 
-        let envelope: JsonRpcResponse = serde_json::from_slice(&body)
-            .map_err(|err| RpcClientError::InvalidResponse(err.to_string()))?;
+        let envelope: JsonRpcResponse = serde_json::from_slice(&body).map_err(|err| {
+            RpcClientError::InvalidResponse(format!(
+                "failed to parse JSON-RPC response for method '{method}': {err}. {}",
+                format_rpc_debug_context(&request_debug, &body_debug)
+            ))
+        })?;
 
         if envelope.id != Some(id) {
             return Err(RpcClientError::InvalidResponse(format!(
-                "mismatched response id for method '{method}'"
+                "mismatched response id for method '{method}'. {}",
+                format_rpc_debug_context(&request_debug, &body_debug)
             )));
         }
 
         if let Some(err) = envelope.error {
-            return Err(map_rpc_error(err));
+            return Err(map_rpc_error(err, &request_debug, &body_debug));
         }
 
         envelope.result.ok_or_else(|| {
             RpcClientError::InvalidResponse(format!(
-                "missing result in response for method '{method}' (http status: {status})"
+                "missing result in response for method '{method}' (http status: {status}). {}",
+                format_rpc_debug_context(&request_debug, &body_debug)
             ))
         })
     }
@@ -149,22 +158,60 @@ impl RpcClient {
     }
 }
 
-fn map_rpc_error(err: JsonRpcError) -> RpcClientError {
-    RpcClientError::Rpc(err.code, err.message)
+fn map_rpc_error(err: JsonRpcError, request_debug: &str, response_debug: &str) -> RpcClientError {
+    RpcClientError::Rpc(
+        err.code,
+        format!(
+            "{}. {}",
+            err.message,
+            format_rpc_debug_context(request_debug, response_debug)
+        ),
+    )
 }
 
-fn map_transport_error(err: reqwest::Error, endpoint: &str) -> RpcClientError {
+fn map_transport_error(
+    err: reqwest::Error,
+    endpoint: &str,
+    method: &str,
+    request_debug: &str,
+) -> RpcClientError {
     if err.is_connect() {
         return RpcClientError::Transport(format!(
-            "unable to reach daemon admin RPC at '{endpoint}'. neuromancerd does not appear to be running. Start it with `neuroctl daemon start`."
+            "unable to reach daemon admin RPC at '{endpoint}' for method '{method}'. neuromancerd does not appear to be running. Start it with `neuroctl daemon start`. {}",
+            format_rpc_debug_context(request_debug, "")
         ));
     }
 
     if err.is_timeout() {
         return RpcClientError::Transport(format!(
-            "request to daemon admin RPC at '{endpoint}' timed out"
+            "request to daemon admin RPC at '{endpoint}' timed out for method '{method}'. {}",
+            format_rpc_debug_context(request_debug, "")
         ));
     }
 
-    RpcClientError::Transport(err.to_string())
+    RpcClientError::Transport(format!(
+        "{}. {}",
+        err,
+        format_rpc_debug_context(request_debug, "")
+    ))
+}
+
+fn format_rpc_debug_context(request_debug: &str, response_debug: &str) -> String {
+    if response_debug.is_empty() {
+        return format!("request={}", truncate_debug(request_debug, 4_000));
+    }
+    format!(
+        "request={} response={}",
+        truncate_debug(request_debug, 4_000),
+        truncate_debug(response_debug, 4_000),
+    )
+}
+
+fn truncate_debug(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{}...(+{} chars)", truncated, char_count - max_chars)
 }

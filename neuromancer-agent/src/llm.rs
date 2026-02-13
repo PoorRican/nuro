@@ -62,31 +62,11 @@ where
 {
     async fn complete(
         &self,
-        _system_prompt: &str,
+        system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
     ) -> Result<LlmResponse, NeuromancerError> {
-        // Build the current prompt from the last user message, or empty string
-        let current_prompt = messages
-            .last()
-            .and_then(|m| match m {
-                rig::completion::Message::User { content } => content.iter().find_map(|c| {
-                    if let rig::message::UserContent::Text(t) = c {
-                        Some(t.text.clone())
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
-            })
-            .unwrap_or_default();
-
-        // All messages except the last (which becomes the prompt)
-        let chat_history = if messages.len() > 1 {
-            messages[..messages.len() - 1].to_vec()
-        } else {
-            vec![]
-        };
+        let (current_prompt, chat_history) = split_prompt_and_history(messages);
 
         let request = self
             .model
@@ -95,9 +75,19 @@ where
             .tools(tool_definitions)
             .build();
 
+        let request_debug = render_request_debug(
+            system_prompt,
+            &current_prompt,
+            &request.chat_history,
+            &request.tools,
+        );
         let response = self.model.completion(request).await.map_err(|e| {
             NeuromancerError::Llm(neuromancer_core::error::LlmError::InvalidResponse {
-                reason: e.to_string(),
+                reason: format!(
+                    "{}\nrequest_debug: {}",
+                    e,
+                    truncate_debug(&request_debug, 8_000)
+                ),
             })
         })?;
 
@@ -128,6 +118,62 @@ where
             completion_tokens: 0,
         })
     }
+}
+
+fn split_prompt_and_history(
+    messages: Vec<rig::completion::Message>,
+) -> (String, Vec<rig::completion::Message>) {
+    let Some(last) = messages.last() else {
+        return (String::new(), vec![]);
+    };
+
+    if let Some(text) = extract_user_text(last) {
+        let history = if messages.len() > 1 {
+            messages[..messages.len() - 1].to_vec()
+        } else {
+            vec![]
+        };
+        return (text, history);
+    }
+
+    (String::new(), messages)
+}
+
+fn extract_user_text(message: &rig::completion::Message) -> Option<String> {
+    match message {
+        rig::completion::Message::User { content } => content.iter().find_map(|c| {
+            if let rig::message::UserContent::Text(t) = c {
+                Some(t.text.clone())
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+fn render_request_debug(
+    system_prompt: &str,
+    current_prompt: &str,
+    chat_history: &[rig::completion::Message],
+    tools: &[rig::completion::ToolDefinition],
+) -> String {
+    serde_json::json!({
+        "system_prompt_preview": truncate_debug(system_prompt, 500),
+        "current_prompt_preview": truncate_debug(current_prompt, 500),
+        "chat_history": chat_history,
+        "tools": tools,
+    })
+    .to_string()
+}
+
+fn truncate_debug(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{}...(+{} chars)", truncated, char_count - max_chars)
 }
 
 /// A mock LLM client for testing.
