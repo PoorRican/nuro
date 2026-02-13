@@ -20,6 +20,8 @@ No new "plugin protocol" is introduced: external extensibility is primarily via 
 * Prompt configuration is file-path based (`system_prompt_path`).
 * Prompt files must exist and be non-empty markdown files at startup.
 * Setup is explicit via `neuroctl install` (optional `--config <path>` override; no startup auto-bootstrap).
+* `neuroctl install` prompts for provider API keys (one per configured provider) when interactive, writing temporary plaintext files under `XDG_RUNTIME_HOME` for v0.1-alpha.
+* OS-specific keychain integration MUST replace temporary plaintext runtime key files.
 
 ---
 
@@ -985,6 +987,9 @@ Use a single TOML file as the source of truth.
 For v0.1-alpha bootstrap:
 * Run `neuroctl install` (or `neuroctl install --config <path>`) to bootstrap missing config/runtime directories and default `SYSTEM.md` prompt files (never overwriting existing files). Use `--override-config` to overwrite the target config from bootstrap defaults.
 * XDG roots resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
+* Provider API keys are stored under `$XDG_RUNTIME_HOME/neuromancer/provider_keys` (fallback: `$XDG_DATA_HOME/neuromancer/provider_keys`) during v0.1-alpha.
+* `neuroctl install` detects configured providers and prompts for one API key per provider in interactive sessions.
+* This runtime key-file approach is temporary and insecure; OS keychain integration is mandatory.
 * Installer bootstraps by copying `defaults/bootstrap/` into the XDG config root (non-overwriting). Per-agent prompt files are created at `agents/<agent_name>/SYSTEM.md` from `defaults/templates/agent/SYSTEM.md` only for configured agents.
 * Bootstrap config is intentionally agent-empty; per-agent `agents/<agent_name>/SYSTEM.md` files are created only for configured agents.
 * Daemon startup fails if configured/default prompt files are missing or empty.

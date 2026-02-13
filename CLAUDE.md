@@ -105,8 +105,9 @@ For System0, `[orchestrator]` config controls:
 - max iterations
 
 Canonical example: `samples/v0_1_alpha/neuromancer.toml`.
-Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`. Use `--override-config` to replace the target config file from bootstrap defaults.
-XDG layout defaults resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`).
+Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`. Use `--override-config` to replace the target config file from bootstrap defaults. Install also detects configured model providers and prompts for API keys (one per provider) when interactive.
+XDG layout defaults resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`). Provider API keys are currently stored under `$XDG_RUNTIME_HOME/neuromancer/provider_keys` (falling back to `$XDG_DATA_HOME/neuromancer/provider_keys` when `XDG_RUNTIME_HOME` is unset) as a temporary alpha behavior.
+OS-specific keychain integration is a required follow-up and must replace plaintext runtime key files.
 Install bootstraps by copying `defaults/bootstrap/` into the XDG config root (non-overwriting). Per-agent prompt files are then created at `agents/<agent_name>/SYSTEM.md` from `defaults/templates/agent/SYSTEM.md` when agents are configured.
 
 ## Key Dependencies
