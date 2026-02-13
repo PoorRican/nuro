@@ -210,3 +210,44 @@ impl LlmClient for MockLlmClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_prompt_uses_last_user_text_as_prompt() {
+        let messages = vec![
+            rig::completion::Message::assistant("hello"),
+            rig::completion::Message::user("what now"),
+        ];
+
+        let (prompt, history) = split_prompt_and_history(messages);
+        assert_eq!(prompt, "what now");
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn split_prompt_keeps_tool_result_in_history() {
+        let messages = vec![
+            rig::completion::Message::user("question"),
+            rig::completion::Message::Assistant {
+                content: rig::OneOrMany::one(rig::message::AssistantContent::tool_call(
+                    "call-1",
+                    "list_agents",
+                    serde_json::json!({}),
+                )),
+            },
+            rig::completion::Message::User {
+                content: rig::OneOrMany::one(rig::message::UserContent::tool_result(
+                    "call-1",
+                    rig::OneOrMany::one(rig::message::ToolResultContent::text("[]")),
+                )),
+            },
+        ];
+
+        let (prompt, history) = split_prompt_and_history(messages);
+        assert_eq!(prompt, "");
+        assert_eq!(history.len(), 3);
+    }
+}

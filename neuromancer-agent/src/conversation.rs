@@ -308,6 +308,7 @@ fn estimate_tokens(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 
     #[test]
     fn add_messages_tracks_tokens() {
@@ -358,5 +359,79 @@ mod tests {
         let rig_msgs = ctx.to_rig_messages();
         // System messages are not included in rig messages (handled via system prompt)
         assert_eq!(rig_msgs.len(), 2);
+    }
+
+    #[test]
+    fn to_rig_messages_keeps_multi_tool_calls_in_one_assistant_message() {
+        let mut ctx = ConversationContext::new(10000, TruncationStrategy::Strict);
+        ctx.add_message(ChatMessage::system("System prompt"));
+        ctx.add_message(ChatMessage::assistant_tool_calls(vec![
+            ToolCall {
+                id: "call-1".into(),
+                tool_id: "list_agents".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".into(),
+                tool_id: "read_config".into(),
+                arguments: serde_json::json!({ "section": "orchestrator" }),
+            },
+        ]));
+
+        let rig_msgs = ctx.to_rig_messages();
+        assert_eq!(rig_msgs.len(), 1);
+        match &rig_msgs[0] {
+            rig::completion::Message::Assistant { content } => assert_eq!(content.len(), 2),
+            _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn to_rig_messages_encodes_each_tool_result_as_tool_response_message() {
+        let mut ctx = ConversationContext::new(10000, TruncationStrategy::Strict);
+        ctx.add_message(ChatMessage::system("System prompt"));
+        ctx.add_message(ChatMessage::assistant_tool_calls(vec![
+            ToolCall {
+                id: "call-1".into(),
+                tool_id: "list_agents".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "call-2".into(),
+                tool_id: "read_config".into(),
+                arguments: serde_json::json!({}),
+            },
+        ]));
+        ctx.add_message(ChatMessage::tool_result(ToolResult {
+            call_id: "call-1".into(),
+            output: ToolOutput::Success(serde_json::json!({"ok": true})),
+        }));
+        ctx.add_message(ChatMessage::tool_result(ToolResult {
+            call_id: "call-2".into(),
+            output: ToolOutput::Success(serde_json::json!({"ok": true})),
+        }));
+
+        let rig_msgs = ctx.to_rig_messages();
+        assert_eq!(rig_msgs.len(), 3);
+
+        match &rig_msgs[1] {
+            rig::completion::Message::User { content } => {
+                assert!(matches!(
+                    content.first(),
+                    rig::message::UserContent::ToolResult(_)
+                ));
+            }
+            _ => panic!("expected first tool response as user tool_result"),
+        }
+
+        match &rig_msgs[2] {
+            rig::completion::Message::User { content } => {
+                assert!(matches!(
+                    content.first(),
+                    rig::message::UserContent::ToolResult(_)
+                ));
+            }
+            _ => panic!("expected second tool response as user tool_result"),
+        }
     }
 }
