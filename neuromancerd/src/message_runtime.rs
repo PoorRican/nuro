@@ -660,9 +660,10 @@ fn build_llm_client(
                     "GROQ_API_KEY is required when using provider='groq'".to_string(),
                 )
             })?;
-            let groq = rig::providers::groq::Client::new(&key);
+            let groq_compat =
+                rig::providers::openai::Client::from_url(&key, "https://api.groq.com/openai/v1");
             Ok(Arc::new(RigLlmClient::new(
-                groq.completion_model(&slot.model),
+                groq_compat.completion_model(&slot.model),
             )))
         }
         "mock" => Ok(Arc::new(TwoStepMockLlmClient::default())),
