@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use neuromancer_core::config::NeuromancerConfig;
+use neuromancer_core::xdg::{XdgLayout, resolve_path, validate_markdown_prompt_file};
 
 /// Load and deserialize config from a TOML file.
 pub fn load_config(path: &Path) -> Result<NeuromancerConfig> {
@@ -21,7 +22,7 @@ pub fn load_config(path: &Path) -> Result<NeuromancerConfig> {
 /// - routing rules reference agents that exist
 /// - model slots referenced by agents exist
 /// - cron task templates reference agents that exist
-pub fn validate_config(config: &NeuromancerConfig) -> Result<()> {
+pub fn validate_config(config: &NeuromancerConfig, config_path: &Path) -> Result<()> {
     // Check routing default agent exists
     if !config.agents.contains_key(&config.routing.default_agent) {
         anyhow::bail!(
@@ -111,6 +112,8 @@ pub fn validate_config(config: &NeuromancerConfig) -> Result<()> {
         }
     }
 
+    validate_prompt_config_health(config, config_path)?;
+
     info!("config validation passed");
     Ok(())
 }
@@ -121,7 +124,7 @@ pub fn spawn_config_watcher(
     path: &Path,
 ) -> Result<(RecommendedWatcher, watch::Receiver<Arc<NeuromancerConfig>>)> {
     let initial = load_config(path)?;
-    validate_config(&initial)?;
+    validate_config(&initial, path)?;
     let (tx, rx) = watch::channel(Arc::new(initial));
 
     let watched_path = path.to_path_buf();
@@ -131,7 +134,7 @@ pub fn spawn_config_watcher(
                 if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
                     info!("config file changed, reloading");
                     match load_config(&watched_path) {
-                        Ok(new_config) => match validate_config(&new_config) {
+                        Ok(new_config) => match validate_config(&new_config, &watched_path) {
                             Ok(()) => {
                                 if tx.send(Arc::new(new_config)).is_err() {
                                     warn!("config watch channel closed");
@@ -156,4 +159,131 @@ pub fn spawn_config_watcher(
     watcher.watch(path, RecursiveMode::NonRecursive)?;
 
     Ok((watcher, rx))
+}
+
+fn validate_prompt_config_health(config: &NeuromancerConfig, config_path: &Path) -> Result<()> {
+    let layout = XdgLayout::from_env().map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+
+    let orchestrator_path = resolve_path(
+        config.orchestrator.system_prompt_path.as_deref(),
+        layout.default_orchestrator_system_prompt_path(),
+        config_dir,
+        layout.home_dir(),
+    )
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    validate_markdown_prompt_file(&orchestrator_path).map_err(|err| {
+        anyhow::anyhow!(
+            "orchestrator system prompt is invalid at '{}': {}. Run 'neuroctl install --config {}' to remediate.",
+            orchestrator_path.display(),
+            err,
+            config_path.display()
+        )
+    })?;
+
+    for agent_id in config.agents.keys() {
+        let agent_cfg = config
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| anyhow::anyhow!("agent '{}' not found during validation", agent_id))?;
+        let agent_path = resolve_path(
+            agent_cfg.system_prompt_path.as_deref(),
+            layout.default_agent_system_prompt_path(agent_id),
+            config_dir,
+            layout.home_dir(),
+        )
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+
+        validate_markdown_prompt_file(&agent_path).map_err(|err| {
+            anyhow::anyhow!(
+                "agent '{}' system prompt is invalid at '{}': {}. Run 'neuroctl install --config {}' to remediate.",
+                agent_id,
+                agent_path.display(),
+                err,
+                config_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{}_{}", prefix, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_config(dir: &Path, include_prompts: bool) -> PathBuf {
+        let config_path = dir.join("neuromancer.toml");
+        let config = r#"
+[global]
+instance_id = "test"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[routing]
+default_agent = "planner"
+rules = []
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+
+[agents.planner]
+models.executor = "executor"
+system_prompt_path = "prompts/agents/planner/SYSTEM.md"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+        fs::write(&config_path, config).expect("config write");
+
+        if include_prompts {
+            let orchestrator_path = dir.join("prompts/orchestrator/SYSTEM.md");
+            let planner_path = dir.join("prompts/agents/planner/SYSTEM.md");
+            fs::create_dir_all(
+                orchestrator_path
+                    .parent()
+                    .expect("orchestrator parent should exist"),
+            )
+            .expect("orchestrator dir");
+            fs::create_dir_all(planner_path.parent().expect("planner parent should exist"))
+                .expect("planner dir");
+            fs::write(&orchestrator_path, "# System0").expect("orchestrator prompt");
+            fs::write(&planner_path, "# Planner").expect("planner prompt");
+        }
+
+        config_path
+    }
+
+    #[test]
+    fn validate_config_fails_when_prompt_files_are_missing() {
+        let dir = temp_dir("nm_cfg_missing_prompts");
+        let config_path = write_config(&dir, false);
+        let config = load_config(&config_path).expect("load");
+        let err = validate_config(&config, &config_path).expect_err("missing prompts must fail");
+        assert!(err.to_string().contains("system prompt is invalid"));
+    }
+
+    #[test]
+    fn validate_config_succeeds_when_prompt_files_exist() {
+        let dir = temp_dir("nm_cfg_with_prompts");
+        let config_path = write_config(&dir, true);
+        let config = load_config(&config_path).expect("load");
+        validate_config(&config, &config_path).expect("validation should pass");
+    }
 }
