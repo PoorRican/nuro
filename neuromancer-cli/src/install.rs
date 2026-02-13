@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -7,12 +8,17 @@ use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::xdg::{XdgLayout, resolve_path};
 
 use crate::CliError;
+use crate::provider_keys::{
+    ProviderCredentialTarget, provider_credential_targets, read_nonempty_file, write_key_file,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallResult {
     pub created: Vec<String>,
     pub existing: Vec<String>,
     pub overwritten: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 pub fn resolve_config_path(config_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
@@ -35,9 +41,12 @@ pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallR
     let mut created = Vec::new();
     let mut existing = Vec::new();
     let mut overwritten = Vec::new();
+    let mut warnings = Vec::new();
 
     copy_defaults_tree(&bootstrap_dir, &layout.config_root(), &mut created, &mut existing)?;
     ensure_dir(&layout.runtime_root(), &mut created, &mut existing)?;
+    ensure_dir(&layout.runtime_home_root(), &mut created, &mut existing)?;
+    ensure_dir(&layout.provider_keys_dir(), &mut created, &mut existing)?;
     ensure_dir(&layout.skills_dir(), &mut created, &mut existing)?;
 
     // When --config points somewhere other than the default XDG config file, bootstrap it too.
@@ -105,11 +114,102 @@ pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallR
         )?;
     }
 
+    bootstrap_provider_keys(
+        &config,
+        &layout,
+        &mut created,
+        &mut existing,
+        &mut warnings,
+    )?;
+
     Ok(InstallResult {
         created,
         existing,
         overwritten,
+        warnings,
     })
+}
+
+fn bootstrap_provider_keys(
+    config: &NeuromancerConfig,
+    layout: &XdgLayout,
+    created: &mut Vec<String>,
+    existing: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<(), CliError> {
+    let targets = provider_credential_targets(config, layout);
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    warnings.push(
+        "Provider API keys are stored as plaintext files under XDG_RUNTIME_HOME for v0.1-alpha. OS-specific keychain integration MUST be implemented.".to_string(),
+    );
+
+    if !io::stdin().is_terminal() {
+        warnings.push(
+            "Install is running without an interactive terminal; provider key prompts were skipped."
+                .to_string(),
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "warning: provider keys will be written under '{}' (temporary v0.1-alpha behavior)",
+        layout.provider_keys_dir().display()
+    );
+    eprintln!(
+        "warning: OS-specific keychain integration MUST be implemented in a follow-up release"
+    );
+
+    for target in targets {
+        if let Some(existing_key) = read_nonempty_file(&target.path).map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed to read provider key file '{}': {err}",
+                target.path.display()
+            ))
+        })? {
+            if !existing_key.is_empty() {
+                existing.push(target.path.display().to_string());
+                continue;
+            }
+        }
+
+        let input = prompt_for_provider_key(&target)?;
+        if input.trim().is_empty() {
+            warnings.push(format!(
+                "No API key provided for provider '{}' (env var {}).",
+                target.provider, target.env_var
+            ));
+            continue;
+        }
+
+        write_key_file(&target.path, &input).map_err(|err| {
+            CliError::Lifecycle(format!(
+                "failed to write provider key file '{}': {err}",
+                target.path.display()
+            ))
+        })?;
+        created.push(target.path.display().to_string());
+    }
+
+    Ok(())
+}
+
+fn prompt_for_provider_key(target: &ProviderCredentialTarget) -> Result<String, CliError> {
+    eprint!(
+        "Enter API key for provider '{}' ({}). Leave blank to skip: ",
+        target.provider, target.env_var
+    );
+    io::stderr()
+        .flush()
+        .map_err(|err| CliError::Lifecycle(format!("failed to flush prompt: {err}")))?;
+
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .map_err(|err| CliError::Lifecycle(format!("failed to read API key input: {err}")))?;
+    Ok(buffer.trim().to_string())
 }
 
 fn defaults_root() -> PathBuf {
