@@ -9,3 +9,4 @@ pub mod secrets;
 pub mod task;
 pub mod tool;
 pub mod trigger;
+pub mod xdg;
