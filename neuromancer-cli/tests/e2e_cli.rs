@@ -102,6 +102,33 @@ enabled = true
     config_path
 }
 
+fn write_blank_config_no_agents(dir: &Path, bind_addr: &str) -> PathBuf {
+    let config_path = dir.join("neuromancer.toml");
+    let config = format!(
+        r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+        bind_addr
+    );
+    fs::write(&config_path, config).expect("config should be written");
+    config_path
+}
+
 fn parse_json_output(output: &[u8]) -> Value {
     serde_json::from_slice(output).expect("command output should be valid json")
 }
@@ -527,6 +554,108 @@ fn daemon_start_without_config_uses_default_and_explains_missing_config() {
     assert!(
         message.contains("Run `neuroctl install`"),
         "missing config should provide install remediation: {message}",
+    );
+}
+
+#[test]
+fn daemon_start_warns_when_no_agents_configured() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_blank_config_no_agents(temp.path(), &bind_addr);
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+    run_install(&config, &addr);
+
+    let start = neuroctl()
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    let stderr = String::from_utf8(start).expect("stderr should be utf-8");
+    assert!(
+        stderr.contains("warning: no agents are configured"),
+        "start should emit a warning when no agents are configured: {stderr}",
+    );
+
+    neuroctl()
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("stop")
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .assert()
+        .success();
+}
+
+#[test]
+fn daemon_start_fails_with_clear_error_when_groq_key_missing() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = temp.path().join("neuromancer.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "groq"
+model = "openai/gpt-oss-120B"
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+            bind_addr
+        ),
+    )
+    .expect("write config");
+    run_install(&config, &addr);
+
+    let pid_file = temp.path().join("daemon.pid");
+    let stderr = neuroctl()
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .env_remove("GROQ_API_KEY")
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+
+    let message = String::from_utf8(stderr).expect("stderr should be utf-8");
+    assert!(
+        message.contains("GROQ_API_KEY is not set"),
+        "missing groq key should be reported explicitly: {message}",
     );
 }
 

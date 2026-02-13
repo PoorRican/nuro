@@ -32,6 +32,8 @@ pub struct DaemonStartResult {
     pub pid: i32,
     pub pid_file: String,
     pub healthy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,7 +53,13 @@ pub struct DaemonStatusResult {
 }
 
 pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartResult, CliError> {
-    validate_daemon_config_path(&options.config)?;
+    let parsed_config = load_and_validate_daemon_config(&options.config)?;
+    let mut warnings = Vec::new();
+    if parsed_config.agents.is_empty() {
+        warnings.push(
+            "no agents are configured; System0 can answer turns but cannot delegate until agents are added.".to_string(),
+        );
+    }
 
     if let Ok(existing_pid) = read_pid_file(&options.pid_file) {
         if pid_is_alive(existing_pid) {
@@ -83,27 +91,26 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
         .map_err(|_| CliError::Lifecycle("daemon pid did not fit in i32".to_string()))?;
 
     write_pid_file(&options.pid_file, pid)?;
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    if !pid_is_alive(pid) {
-        remove_pid_file(&options.pid_file)?;
-        return Err(CliError::Lifecycle(format!(
-            "daemon process exited immediately after launch (config '{}'). Check config validity and rerun, or start with --wait-healthy for readiness checks.",
-            options.config.display()
-        )));
-    }
-
-    let healthy = if options.wait_healthy {
-        wait_for_healthy(&options.addr, options.timeout).await?;
-        Some(true)
+    let readiness_timeout = if options.wait_healthy {
+        options.timeout
     } else {
-        None
+        std::cmp::min(options.timeout, Duration::from_secs(5))
     };
+    wait_for_startup_readiness(
+        pid,
+        &options.pid_file,
+        &options.config,
+        &options.addr,
+        readiness_timeout,
+    )
+    .await?;
+    let healthy = Some(true);
 
     Ok(DaemonStartResult {
         pid,
         pid_file: options.pid_file.display().to_string(),
         healthy,
+        warnings,
     })
 }
 
@@ -208,7 +215,7 @@ pub async fn daemon_status(
     }
 }
 
-fn validate_daemon_config_path(config_path: &Path) -> Result<(), CliError> {
+fn load_and_validate_daemon_config(config_path: &Path) -> Result<NeuromancerConfig, CliError> {
     if config_path.is_dir() {
         return Err(CliError::Usage(format!(
             "config path '{}' is a directory; expected a TOML file",
@@ -231,13 +238,36 @@ fn validate_daemon_config_path(config_path: &Path) -> Result<(), CliError> {
         ))
     })?;
 
-    toml::from_str::<NeuromancerConfig>(&raw).map_err(|err| {
+    let config = toml::from_str::<NeuromancerConfig>(&raw).map_err(|err| {
         CliError::Usage(format!(
             "config '{}' is invalid: {err}. {}",
             config_path.display(),
             install_override_hint_for(config_path)
         ))
     })?;
+
+    validate_required_provider_env(&config)?;
+
+    Ok(config)
+}
+
+fn validate_required_provider_env(config: &NeuromancerConfig) -> Result<(), CliError> {
+    let uses_groq = config
+        .models
+        .values()
+        .any(|slot| slot.provider.trim().eq_ignore_ascii_case("groq"));
+
+    if uses_groq
+        && env::var("GROQ_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err(CliError::Usage(
+            "config uses provider 'groq' but GROQ_API_KEY is not set".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -371,24 +401,46 @@ fn send_signal(pid: i32, signal: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn wait_for_healthy(addr: &str, timeout: Duration) -> Result<(), CliError> {
-    let client = RpcClient::new(addr, Duration::from_secs(1))?;
+async fn wait_for_startup_readiness(
+    pid: i32,
+    pid_file: &Path,
+    config_path: &Path,
+    addr: &str,
+    timeout: Duration,
+) -> Result<(), CliError> {
     let deadline = Instant::now() + timeout;
+    let client = RpcClient::new(addr, Duration::from_secs(1))?;
     let mut last_error = None;
 
     while Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            remove_pid_file(pid_file)?;
+            return Err(CliError::Lifecycle(format!(
+                "daemon process exited during startup (pid {pid}). Check config '{}'.",
+                config_path.display()
+            )));
+        }
+
         match client.health().await {
             Ok(_) => return Ok(()),
             Err(err) => {
                 last_error = Some(err.to_string());
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
     }
 
+    if !pid_is_alive(pid) {
+        remove_pid_file(pid_file)?;
+        return Err(CliError::Lifecycle(format!(
+            "daemon process exited during startup (pid {pid}) before health became available."
+        )));
+    }
+
     Err(CliError::Lifecycle(format!(
-        "daemon did not become healthy within {} ({})",
+        "daemon started (pid {pid}) but admin RPC did not become healthy within {} at '{}'. {}",
         humantime::format_duration(timeout),
+        addr,
         last_error.unwrap_or_else(|| "no response".to_string())
     )))
 }

@@ -73,6 +73,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
+    let json_mode = cli.json;
     match cli.command {
         Command::Install(args) => {
             let config_path = resolve_config_path(args.config)?;
@@ -91,6 +92,11 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                     timeout: cli.timeout,
                 })
                 .await?;
+                if !json_mode {
+                    for warning in &result.warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                }
 
                 Ok(serde_json::json!(result))
             }
