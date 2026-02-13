@@ -26,7 +26,7 @@ pub struct SmokeResult {
 }
 
 pub async fn run_smoke(options: &SmokeOptions) -> Result<SmokeResult, CliError> {
-    let _install = run_install(&options.config)?;
+    let _install = run_install(&options.config, false)?;
 
     let start_options = DaemonStartOptions {
         config: options.config.clone(),

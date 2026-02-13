@@ -426,6 +426,56 @@ fn install_with_missing_explicit_config_bootstraps() {
 }
 
 #[test]
+fn install_with_override_config_rewrites_existing_config() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, _bind_addr) = allocate_addrs();
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    let explicit_config = temp.path().join("custom-config/neuromancer.toml");
+    fs::create_dir_all(
+        explicit_config
+            .parent()
+            .expect("explicit config should have parent"),
+    )
+    .expect("config dir");
+    fs::write(
+        &explicit_config,
+        r#"[models.executor]
+provider = "mock"
+model = "test-double"
+"#,
+    )
+    .expect("seed config");
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&explicit_config)
+        .arg("--override-config")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
+
+    let rewritten = fs::read_to_string(&explicit_config).expect("read rewritten config");
+    assert!(
+        rewritten.contains("provider = \"groq\""),
+        "override should rewrite model provider to groq default",
+    );
+    assert!(
+        rewritten.contains("model = \"openai/gpt-oss-120B\""),
+        "override should rewrite model id to gpt-oss-120B default",
+    );
+}
+
+#[test]
 fn rpc_transport_failures_use_exit_code_4() {
     neuroctl()
         .arg("--addr")

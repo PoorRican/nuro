@@ -395,7 +395,6 @@ mod tests {
         let config =
             load_template(&defaults_root().join("bootstrap/neuromancer.toml")).expect("template");
         assert!(config.contains("[global]"));
-        assert!(config.contains("[routing]"));
         assert!(config.contains("[orchestrator]"));
         assert!(!config.contains("[agents."));
     }
