@@ -70,7 +70,7 @@ impl RpcClient {
             .json(&request)
             .send()
             .await
-            .map_err(|err| RpcClientError::Transport(err.to_string()))?;
+            .map_err(|err| map_transport_error(err, &self.endpoint))?;
 
         let status = response.status();
         let body = response
@@ -151,4 +151,20 @@ impl RpcClient {
 
 fn map_rpc_error(err: JsonRpcError) -> RpcClientError {
     RpcClientError::Rpc(err.code, err.message)
+}
+
+fn map_transport_error(err: reqwest::Error, endpoint: &str) -> RpcClientError {
+    if err.is_connect() {
+        return RpcClientError::Transport(format!(
+            "unable to reach daemon admin RPC at '{endpoint}'. neuromancerd does not appear to be running. Start it with `neuroctl daemon start`."
+        ));
+    }
+
+    if err.is_timeout() {
+        return RpcClientError::Transport(format!(
+            "request to daemon admin RPC at '{endpoint}' timed out"
+        ));
+    }
+
+    RpcClientError::Transport(err.to_string())
 }

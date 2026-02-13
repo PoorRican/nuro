@@ -477,12 +477,22 @@ model = "test-double"
 
 #[test]
 fn rpc_transport_failures_use_exit_code_4() {
-    neuroctl()
+    let stderr = neuroctl()
         .arg("--addr")
         .arg("http://127.0.0.1:1")
         .arg("health")
         .assert()
-        .code(4);
+        .code(4)
+        .get_output()
+        .stderr
+        .clone();
+
+    let message = String::from_utf8(stderr).expect("stderr should be utf-8");
+    assert!(
+        message.contains("does not appear to be running"),
+        "transport error should explain that daemon is likely down: {message}",
+    );
+}
 
 #[test]
 fn daemon_start_without_config_uses_default_and_explains_missing_config() {
