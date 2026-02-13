@@ -164,12 +164,6 @@ impl MessageRuntime {
             subagents.insert(agent_id.clone(), runtime);
         }
 
-        if subagents.is_empty() {
-            return Err(MessageRuntimeError::Config(
-                "no sub-agents are configured in runtime".to_string(),
-            ));
-        }
-
         let config_snapshot = serde_json::to_value(config)
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
