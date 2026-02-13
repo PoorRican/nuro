@@ -96,7 +96,7 @@ Removed methods should return JSON-RPC method-not-found.
 
 ## Configuration
 
-Single TOML file (`neuromancer.toml`) with sections: `[global]`, `[otel]`, `[secrets]`, `[memory]`, `[models.*]`, `[mcp_servers.*]`, `[a2a]`, `[routing]`, `[orchestrator]`, `[agents.*]`, `[triggers]`, `[admin_api]`.
+Single TOML file (`neuromancer.toml`) with sections: `[global]`, `[otel]`, `[secrets]`, `[memory]`, `[models.*]`, `[mcp_servers.*]`, `[a2a]`, `[orchestrator]`, `[agents.*]`, `[triggers]`, `[admin_api]`.
 
 For System0, `[orchestrator]` config controls:
 - executor model slot

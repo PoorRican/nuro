@@ -1044,23 +1044,10 @@ allowed_roots = ["/var/lib/neuromancer/workspaces"]
 bind_addr = "0.0.0.0:8800"
 agent_card_signing = "optional"
 
-# --- Routing (replaces agents.core) ---
-
-[routing]
-default_agent = "planner"
-
 [orchestrator]
 model_slot = "executor"
 system_prompt_path = "prompts/orchestrator/SYSTEM.md"
 max_iterations = 30
-
-[[routing.rules]]
-match = { channel_id = "browser-tasks" }
-agent = "browser"
-
-[[routing.rules]]
-match = { trigger = "cron", id = "daily-issue-summary" }
-agent = "github-summarizer"
 
 # --- Agents (sub-agents only, no "core" agent) ---
 
@@ -1317,7 +1304,6 @@ struct TriggerEvent {
     occurred_at: DateTime<Utc>,
     principal: Principal,         // discord user, system cron, etc.
     payload: TriggerPayload,      // message text, attachments, schedule context, etc.
-    route_hint: Option<AgentId>,  // from channel_routes or cron config
     metadata: TriggerMetadata,    // channel_id, guild_id, thread_id, etc.
 }
 ```
@@ -1385,7 +1371,7 @@ When a Discord message passes activation and rate limit checks:
 
 1. Extract message content, attachments, and thread context.
 2. If attachments are present: download them to a task-scoped workspace directory. Include file paths in the task instruction.
-3. Resolve the target agent via `channel_routes` (overrides global `routing.rules` for Discord).
+3. Apply `channel_routes` policy checks for activation/rate limiting before emitting a trigger event.
 4. If `thread_mode` is `PerTask`: create a Discord thread for the task. All subsequent responses for this task go to the thread.
 5. Construct a `TriggerEvent` with `principal` set to the Discord user, `payload` containing the message text + attachment paths, and `metadata` containing channel/guild/thread IDs.
 6. Send to the orchestrator.

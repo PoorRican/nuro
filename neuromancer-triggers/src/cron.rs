@@ -4,7 +4,6 @@ use tokio::sync::mpsc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info, instrument, warn};
 
-use neuromancer_core::agent::AgentId;
 use neuromancer_core::config::CronTriggerConfig;
 use neuromancer_core::trigger::{
     Actor, TriggerEvent, TriggerMetadata, TriggerPayload, TriggerSource, TriggerType,
@@ -70,7 +69,6 @@ fn build_cron_job(
     tx: mpsc::Sender<TriggerEvent>,
 ) -> Result<Job, CronError> {
     let job_id = config.id.clone();
-    let agent: AgentId = config.task_template.agent.clone();
     let instruction_template = config.task_template.instruction.clone();
     let parameters = config.task_template.parameters.clone();
     let idempotency_key_template = config.execution.idempotency_key.clone();
@@ -79,7 +77,6 @@ fn build_cron_job(
     let job = Job::new_async(schedule.as_str(), move |_uuid, _lock| {
         let tx = tx.clone();
         let job_id = job_id.clone();
-        let agent = agent.clone();
         let instruction_template = instruction_template.clone();
         let parameters = parameters.clone();
         let idempotency_key_template = idempotency_key_template.clone();
@@ -121,7 +118,6 @@ fn build_cron_job(
                     rendered_instruction,
                     parameters,
                 },
-                route_hint: Some(agent),
                 metadata: TriggerMetadata::default(),
             };
 

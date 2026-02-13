@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{
     AgentCapabilities, AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig,
 };
-use crate::routing::RoutingConfig;
 
 /// Top-level Neuromancer configuration loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NeuromancerConfig {
     pub global: GlobalConfig,
     #[serde(default)]
@@ -23,7 +23,6 @@ pub struct NeuromancerConfig {
     pub mcp_servers: HashMap<String, McpServerConfig>,
     #[serde(default)]
     pub a2a: A2aConfig,
-    pub routing: RoutingConfig,
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
     #[serde(default)]
@@ -371,10 +370,6 @@ mod tests {
 instance_id = "t"
 workspace_dir = "/tmp"
 data_dir = "/tmp"
-
-[routing]
-default_agent = "planner"
-rules = []
 
 [orchestrator]
 {extra_orchestrator}

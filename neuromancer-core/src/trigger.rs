@@ -67,6 +67,5 @@ pub struct TriggerEvent {
     pub trigger_type: TriggerType,
     pub source: TriggerSource,
     pub payload: TriggerPayload,
-    pub route_hint: Option<AgentId>,
     pub metadata: TriggerMetadata,
 }

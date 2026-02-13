@@ -347,7 +347,6 @@ pub fn process_discord_message(
         payload: TriggerPayload::Message {
             text: message_text.to_string(),
         },
-        route_hint: Some(route.agent.clone()),
         metadata: TriggerMetadata {
             channel_id: Some(channel_id.to_string()),
             guild_id: guild_id.map(|s| s.to_string()),

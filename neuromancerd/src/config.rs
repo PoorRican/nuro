@@ -19,38 +19,9 @@ pub fn load_config(path: &Path) -> Result<NeuromancerConfig> {
 }
 
 /// Validate config for internal consistency:
-/// - routing rules reference agents that exist
 /// - model slots referenced by agents exist
 /// - cron task templates reference agents that exist
 pub fn validate_config(config: &NeuromancerConfig, config_path: &Path) -> Result<()> {
-    // Check routing default agent exists
-    if !config.agents.contains_key(&config.routing.default_agent) {
-        anyhow::bail!(
-            "routing.default_agent '{}' not found in [agents]",
-            config.routing.default_agent
-        );
-    }
-
-    // Check routing rules reference valid agents
-    for rule in &config.routing.rules {
-        if !config.agents.contains_key(&rule.agent) {
-            anyhow::bail!(
-                "routing rule targets agent '{}' which is not defined in [agents]",
-                rule.agent
-            );
-        }
-    }
-
-    // Check classifier_model references a defined model slot
-    if let Some(ref classifier) = config.routing.classifier_model {
-        if !config.models.contains_key(classifier) {
-            anyhow::bail!(
-                "routing.classifier_model '{}' not found in [models]",
-                classifier
-            );
-        }
-    }
-
     if let Some(ref slot_name) = config.orchestrator.model_slot {
         if !config.models.contains_key(slot_name) {
             anyhow::bail!(
@@ -231,10 +202,6 @@ data_dir = "/tmp"
 [models.executor]
 provider = "mock"
 model = "test-double"
-
-[routing]
-default_agent = "planner"
-rules = []
 
 [orchestrator]
 model_slot = "executor"

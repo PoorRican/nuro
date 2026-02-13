@@ -77,10 +77,6 @@ data_dir = "/tmp"
 provider = "mock"
 model = "test-double"
 
-[routing]
-default_agent = "planner"
-rules = []
-
 [orchestrator]
 model_slot = "executor"
 system_prompt_path = "prompts/orchestrator/SYSTEM.md"
