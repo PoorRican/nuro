@@ -1,6 +1,7 @@
 mod cli;
 mod daemon;
 mod e2e;
+mod install;
 mod output;
 mod rpc_client;
 
@@ -12,6 +13,7 @@ use cli::{
 };
 use daemon::{DaemonStartOptions, DaemonStopOptions, daemon_status, start_daemon, stop_daemon};
 use e2e::{SmokeOptions, run_smoke};
+use install::run_install;
 use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
 use rpc_client::RpcClient;
 
@@ -72,6 +74,10 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
     match cli.command {
+        Command::Install(args) => {
+            let result = run_install(&args.config)?;
+            Ok(serde_json::json!(result))
+        }
         Command::Daemon { command } => match command {
             DaemonCommand::Start(args) => {
                 let result = start_daemon(&DaemonStartOptions {

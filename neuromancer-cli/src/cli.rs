@@ -28,6 +28,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Install(InstallArgs),
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -71,6 +72,12 @@ pub struct DaemonStartArgs {
 
     #[arg(long)]
     pub wait_healthy: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    #[arg(long)]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -178,6 +185,22 @@ mod tests {
                 assert!(args.wait_healthy);
                 assert_eq!(args.pid_file, PathBuf::from("/tmp/neuromancer.pid"));
             }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "install",
+            "--config",
+            "/tmp/neuromancer.toml",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Install(args) => assert_eq!(args.config, PathBuf::from("/tmp/neuromancer.toml")),
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

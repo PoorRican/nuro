@@ -7,6 +7,7 @@ use neuromancer_core::rpc::OrchestratorTurnParams;
 
 use crate::CliError;
 use crate::daemon::{DaemonStartOptions, DaemonStopOptions, start_daemon, stop_daemon};
+use crate::install::run_install;
 use crate::rpc_client::RpcClient;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ pub struct SmokeResult {
 }
 
 pub async fn run_smoke(options: &SmokeOptions) -> Result<SmokeResult, CliError> {
+    let _install = run_install(&options.config)?;
+
     let start_options = DaemonStartOptions {
         config: options.config.clone(),
         daemon_bin: options.daemon_bin.clone(),
