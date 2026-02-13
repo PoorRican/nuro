@@ -630,10 +630,20 @@ fn render_orchestrator_prompt(
 ) -> String {
     agents.sort();
     tools.sort();
+    let rendered_agents = if agents.is_empty() {
+        "none".to_string()
+    } else {
+        agents.join(", ")
+    };
+    let rendered_tools = if tools.is_empty() {
+        "none".to_string()
+    } else {
+        tools.join(", ")
+    };
     template
         .replace("{{ORCHESTRATOR_ID}}", SYSTEM0_AGENT_ID)
-        .replace("{{AVAILABLE_AGENTS}}", &agents.join(", "))
-        .replace("{{AVAILABLE_TOOLS}}", &tools.join(", "))
+        .replace("{{AVAILABLE_AGENTS}}", &rendered_agents)
+        .replace("{{AVAILABLE_TOOLS}}", &rendered_tools)
 }
 
 fn build_llm_client(
@@ -1089,5 +1099,16 @@ mod tests {
         assert!(rendered.contains("id=system0"));
         assert!(rendered.contains("agents=browser, planner"));
         assert!(rendered.contains("tools=list_agents, read_config"));
+    }
+
+    #[test]
+    fn render_orchestrator_prompt_handles_empty_lists() {
+        let rendered = render_orchestrator_prompt(
+            "agents={{AVAILABLE_AGENTS}} tools={{AVAILABLE_TOOLS}}",
+            vec![],
+            vec![],
+        );
+        assert!(rendered.contains("agents=none"));
+        assert!(rendered.contains("tools=none"));
     }
 }
