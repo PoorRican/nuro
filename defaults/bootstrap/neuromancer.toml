@@ -10,12 +10,8 @@ workspace_dir = ".local/neuromancer/workspaces"
 data_dir = ".local/neuromancer/data"
 
 [models.executor]
-provider = "mock"
-model = "test-double"
-
-[routing]
-default_agent = "replace-me"
-rules = []
+provider = "groq"
+model = "openai/gpt-oss-120B"
 
 [orchestrator]
 model_slot = "executor"
