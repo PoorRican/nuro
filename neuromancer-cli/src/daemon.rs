@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use neuromancer_core::config::NeuromancerConfig;
+use neuromancer_core::xdg::XdgLayout;
 use serde::Serialize;
 
 use crate::CliError;
@@ -49,9 +51,7 @@ pub struct DaemonStatusResult {
 }
 
 pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartResult, CliError> {
-    if options.config.as_os_str().is_empty() {
-        return Err(CliError::Usage("--config is required".to_string()));
-    }
+    validate_daemon_config_path(&options.config)?;
 
     if let Ok(existing_pid) = read_pid_file(&options.pid_file) {
         if pid_is_alive(existing_pid) {
@@ -83,6 +83,15 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
         .map_err(|_| CliError::Lifecycle("daemon pid did not fit in i32".to_string()))?;
 
     write_pid_file(&options.pid_file, pid)?;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    if !pid_is_alive(pid) {
+        remove_pid_file(&options.pid_file)?;
+        return Err(CliError::Lifecycle(format!(
+            "daemon process exited immediately after launch (config '{}'). Check config validity and rerun, or start with --wait-healthy for readiness checks.",
+            options.config.display()
+        )));
+    }
 
     let healthy = if options.wait_healthy {
         wait_for_healthy(&options.addr, options.timeout).await?;
@@ -196,6 +205,64 @@ pub async fn daemon_status(
             healthy: Some(false),
             detail: Some(err.to_string()),
         }),
+    }
+}
+
+fn validate_daemon_config_path(config_path: &Path) -> Result<(), CliError> {
+    if config_path.is_dir() {
+        return Err(CliError::Usage(format!(
+            "config path '{}' is a directory; expected a TOML file",
+            config_path.display()
+        )));
+    }
+
+    if !config_path.exists() {
+        return Err(CliError::Usage(format!(
+            "config file '{}' was not found. {}",
+            config_path.display(),
+            install_create_hint_for(config_path)
+        )));
+    }
+
+    let raw = fs::read_to_string(config_path).map_err(|err| {
+        CliError::Usage(format!(
+            "failed to read config '{}': {err}",
+            config_path.display()
+        ))
+    })?;
+
+    toml::from_str::<NeuromancerConfig>(&raw).map_err(|err| {
+        CliError::Usage(format!(
+            "config '{}' is invalid: {err}. {}",
+            config_path.display(),
+            install_override_hint_for(config_path)
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn install_create_hint_for(config_path: &Path) -> String {
+    match XdgLayout::from_env() {
+        Ok(layout) if config_path == layout.default_config_path() => {
+            "Run `neuroctl install` to bootstrap defaults.".to_string()
+        }
+        _ => format!(
+            "Run `neuroctl install --config {}` to bootstrap defaults for this path.",
+            config_path.display()
+        ),
+    }
+}
+
+fn install_override_hint_for(config_path: &Path) -> String {
+    match XdgLayout::from_env() {
+        Ok(layout) if config_path == layout.default_config_path() => {
+            "Run `neuroctl install --override-config` to rewrite defaults.".to_string()
+        }
+        _ => format!(
+            "Run `neuroctl install --config {} --override-config` to rewrite defaults for this path.",
+            config_path.display()
+        ),
     }
 }
 

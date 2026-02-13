@@ -483,6 +483,41 @@ fn rpc_transport_failures_use_exit_code_4() {
         .arg("health")
         .assert()
         .code(4);
+
+#[test]
+fn daemon_start_without_config_uses_default_and_explains_missing_config() {
+    let temp = TempDir::new().expect("tempdir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    let pid_file = temp.path().join("daemon.pid");
+    let stderr = neuroctl()
+        .arg("daemon")
+        .arg("start")
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+
+    let message = String::from_utf8(stderr).expect("stderr should be utf-8");
+    assert!(
+        message.contains("config file"),
+        "missing config should be explicitly reported: {message}",
+    );
+    assert!(
+        message.contains("Run `neuroctl install`"),
+        "missing config should provide install remediation: {message}",
+    );
 }
 
 #[test]
