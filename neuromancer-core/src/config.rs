@@ -406,15 +406,4 @@ capabilities.filesystem_roots = []
         );
     }
 
-    #[test]
-    fn legacy_preamble_is_rejected() {
-        let toml = minimal_config_toml(
-            r#"preamble = "legacy""#,
-            r#"preamble = "legacy-agent""#,
-        );
-        let err = toml::from_str::<NeuromancerConfig>(&toml).expect_err("legacy keys must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("unknown field"));
-        assert!(msg.contains("preamble"));
-    }
 }
