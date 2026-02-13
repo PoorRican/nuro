@@ -617,6 +617,10 @@ fn daemon_start_warns_when_no_agents_configured() {
 fn daemon_start_fails_with_clear_error_when_groq_key_missing() {
     let temp = TempDir::new().expect("tempdir");
     let (addr, bind_addr) = allocate_addrs();
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
     let config = temp.path().join("neuromancer.toml");
     fs::write(
         &config,
@@ -643,7 +647,18 @@ enabled = true
         ),
     )
     .expect("write config");
-    run_install(&config, &addr);
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&config)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
 
     let pid_file = temp.path().join("daemon.pid");
     let stderr = neuroctl()
@@ -655,6 +670,9 @@ enabled = true
         .arg(daemon_bin())
         .arg("--pid-file")
         .arg(&pid_file)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
         .env_remove("GROQ_API_KEY")
         .assert()
         .code(2)

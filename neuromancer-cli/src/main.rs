@@ -81,7 +81,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
             let result = run_install(&config_path, args.override_config)?;
             if !json_mode {
                 for warning in &result.warnings {
-                    eprintln!("warning: {warning}");
+                    output::print_warning(warning);
                 }
             }
             Ok(serde_json::json!(result))
@@ -100,7 +100,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                 .await?;
                 if !json_mode {
                     for warning in &result.warnings {
-                        eprintln!("warning: {warning}");
+                        output::print_warning(warning);
                     }
                 }
 

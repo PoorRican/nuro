@@ -1,3 +1,5 @@
+use console::style;
+
 pub fn print_success(json_mode: bool, payload: &serde_json::Value) {
     if json_mode {
         let envelope = serde_json::json!({
@@ -32,5 +34,13 @@ pub fn print_error(json_mode: bool, message: &str, exit_code: i32) {
         return;
     }
 
-    eprintln!("error: {message}");
+    eprintln!("{}", style(format!("error: {message}")).red());
+}
+
+pub fn print_warning(message: &str) {
+    eprintln!("{}", style(format!("warning: {message}")).yellow());
+}
+
+pub fn format_warning(message: &str) -> String {
+    format!("{}", style(format!("warning: {message}")).yellow())
 }

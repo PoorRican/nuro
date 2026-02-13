@@ -8,6 +8,7 @@ use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::xdg::{XdgLayout, resolve_path};
 
 use crate::CliError;
+use crate::output;
 use crate::provider_keys::{
     ProviderCredentialTarget, provider_credential_targets, read_nonempty_file, write_key_file,
 };
@@ -155,11 +156,17 @@ fn bootstrap_provider_keys(
     }
 
     eprintln!(
-        "warning: provider keys will be written under '{}' (temporary v0.1-alpha behavior)",
-        layout.provider_keys_dir().display()
+        "{}",
+        output::format_warning(&format!(
+            "provider keys will be written under '{}' (temporary v0.1-alpha behavior)",
+            layout.provider_keys_dir().display()
+        ))
     );
     eprintln!(
-        "warning: OS-specific keychain integration MUST be implemented in a follow-up release"
+        "{}",
+        output::format_warning(
+            "OS-specific keychain integration MUST be implemented in a follow-up release",
+        )
     );
 
     for target in targets {

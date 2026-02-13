@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 reqwest = { workspace = true }
 humantime = { workspace = true }
 toml = { workspace = true }
+console = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
