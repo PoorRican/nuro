@@ -161,6 +161,7 @@ pub struct E2eSmokeArgs {
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorCommand {
     Turn(OrchestratorTurnArgs),
+    Chat(OrchestratorChatArgs),
     Runs {
         #[command(subcommand)]
         command: OrchestratorRunsCommand,
@@ -180,6 +181,9 @@ pub struct OrchestratorTurnArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct OrchestratorChatArgs {}
+
+#[derive(Debug, Args)]
 pub struct OrchestratorRunGetArgs {
     /// Delegated run id returned by `orchestrator turn`.
     pub run_id: String,
@@ -195,13 +199,8 @@ mod tests {
 
     #[test]
     fn parses_daemon_start_wait_healthy() {
-        let cli = Cli::try_parse_from([
-            "neuroctl",
-            "daemon",
-            "start",
-            "--wait-healthy",
-        ])
-        .expect("cli should parse");
+        let cli = Cli::try_parse_from(["neuroctl", "daemon", "start", "--wait-healthy"])
+            .expect("cli should parse");
 
         match cli.command {
             Command::Daemon {
@@ -311,6 +310,19 @@ mod tests {
             } => {
                 assert_eq!(args.message, "what should I pay first?");
             }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_chat_command() {
+        let cli =
+            Cli::try_parse_from(["neuroctl", "orchestrator", "chat"]).expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Chat(_),
+            } => {}
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

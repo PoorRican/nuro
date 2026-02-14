@@ -1,3 +1,4 @@
+mod chat;
 mod cli;
 mod daemon;
 mod e2e;
@@ -8,6 +9,7 @@ mod rpc_client;
 
 use clap::Parser;
 
+use chat::run_orchestrator_chat;
 use cli::{
     Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
     OrchestratorRunsCommand, RpcCommand,
@@ -65,9 +67,10 @@ async fn main() {
 
     let result = run(cli).await;
     match result {
-        Ok(payload) => {
+        Ok(RunOutcome::Payload(payload)) => {
             output::print_success(json_mode, &payload);
         }
+        Ok(RunOutcome::Silent) => {}
         Err(err) => {
             let exit_code = err.exit_code();
             output::print_error(json_mode, &err.to_string(), exit_code);
@@ -76,7 +79,12 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
+enum RunOutcome {
+    Payload(serde_json::Value),
+    Silent,
+}
+
+async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
     let json_mode = cli.json;
     match cli.command {
         Command::Install(args) => {
@@ -87,7 +95,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                     output::print_warning(warning);
                 }
             }
-            Ok(serde_json::json!(result))
+            Ok(RunOutcome::Payload(serde_json::json!(result)))
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Start(args) => {
@@ -107,7 +115,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                     }
                 }
 
-                Ok(serde_json::json!(result))
+                Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
             DaemonCommand::Restart(args) => {
                 let config_path = resolve_config_path(args.config)?;
@@ -126,7 +134,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                         output::print_warning(warning);
                     }
                 }
-                Ok(serde_json::json!(result))
+                Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
             DaemonCommand::Stop(args) => {
                 let result = stop_daemon(&DaemonStopOptions {
@@ -134,24 +142,24 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                     grace: args.grace,
                 })
                 .await?;
-                Ok(serde_json::json!(result))
+                Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
             DaemonCommand::Status(args) => {
                 let result = daemon_status(&args.pid_file, &cli.addr, cli.timeout).await?;
-                Ok(serde_json::json!(result))
+                Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
         },
         Command::Health => {
             let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
             let health = rpc.health().await?;
-            Ok(serde_json::json!(health))
+            Ok(RunOutcome::Payload(serde_json::json!(health)))
         }
         Command::Config { command } => {
             let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
             match command {
                 ConfigCommand::Reload => {
                     let response = rpc.config_reload().await?;
-                    Ok(serde_json::json!(response))
+                    Ok(RunOutcome::Payload(serde_json::json!(response)))
                 }
             }
         }
@@ -161,10 +169,10 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                 RpcCommand::Call(args) => {
                     let params = parse_json_params(args.params)?;
                     let response = rpc.call(&args.method, params).await?;
-                    Ok(serde_json::json!({
+                    Ok(RunOutcome::Payload(serde_json::json!({
                         "method": args.method,
                         "result": response,
-                    }))
+                    })))
                 }
             }
         }
@@ -180,7 +188,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                 })
                 .await?;
 
-                Ok(serde_json::json!(result))
+                Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
         },
         Command::Orchestrator { command } => {
@@ -192,12 +200,16 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                             message: args.message,
                         })
                         .await?;
-                    Ok(serde_json::json!(response))
+                    Ok(RunOutcome::Payload(serde_json::json!(response)))
+                }
+                OrchestratorCommand::Chat(_args) => {
+                    run_orchestrator_chat(&rpc, json_mode).await?;
+                    Ok(RunOutcome::Silent)
                 }
                 OrchestratorCommand::Runs { command } => match command {
                     OrchestratorRunsCommand::List => {
                         let response = rpc.orchestrator_runs_list().await?;
-                        Ok(serde_json::json!(response))
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
                     }
                     OrchestratorRunsCommand::Get(args) => {
                         let response = rpc
@@ -205,7 +217,7 @@ async fn run(cli: Cli) -> Result<serde_json::Value, CliError> {
                                 run_id: args.run_id,
                             })
                             .await?;
-                        Ok(serde_json::json!(response))
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
                     }
                 },
             }
