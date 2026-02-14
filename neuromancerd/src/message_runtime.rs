@@ -1379,11 +1379,16 @@ fn extract_response_text(output: &neuromancer_core::task::TaskOutput) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{}_{}", prefix, uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn python3_available() -> bool {
+        Command::new("python3").arg("--version").output().is_ok()
     }
 
     #[test]
@@ -1414,6 +1419,136 @@ mod tests {
         let resolved = resolve_local_data_path(&local_root, "data/accounts.csv")
             .expect("relative path should resolve");
         assert_eq!(resolved, fs::canonicalize(file_path).expect("canonical"));
+    }
+
+    #[test]
+    fn resolve_skill_script_path_rejects_absolute_paths() {
+        let skill_root = temp_dir("nm_skill_root");
+        let absolute = skill_root.join("scripts/run.py");
+        let err = resolve_skill_script_path(&skill_root, absolute.to_string_lossy().as_ref())
+            .expect_err("absolute path should be rejected");
+        assert!(matches!(err, MessageRuntimeError::PathViolation(_)));
+    }
+
+    #[test]
+    fn resolve_skill_script_path_rejects_parent_traversal() {
+        let skill_root = temp_dir("nm_skill_root");
+        let err = resolve_skill_script_path(&skill_root, "../run.py")
+            .expect_err("parent traversal should be rejected");
+        assert!(matches!(err, MessageRuntimeError::PathViolation(_)));
+    }
+
+    #[test]
+    fn resolve_skill_script_path_accepts_valid_relative_path() {
+        let skill_root = temp_dir("nm_skill_root");
+        let script_dir = skill_root.join("scripts");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        let script = script_dir.join("run.py");
+        fs::write(&script, "print('{}')").expect("script write");
+
+        let resolved = resolve_skill_script_path(&skill_root, "scripts/run.py")
+            .expect("relative script path should resolve");
+        assert_eq!(resolved, fs::canonicalize(script).expect("canonical"));
+    }
+
+    #[tokio::test]
+    async fn run_skill_script_returns_json() {
+        if !python3_available() {
+            return;
+        }
+
+        let skill_root = temp_dir("nm_skill_root");
+        let script_dir = skill_root.join("scripts");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        let script = script_dir.join("run.py");
+        fs::write(
+            &script,
+            r#"import json, sys
+payload = json.loads(sys.stdin.read())
+print(json.dumps({"ok": True, "skill": payload.get("skill")}))
+"#,
+        )
+        .expect("script write");
+
+        let payload = serde_json::json!({
+            "skill": "manage-bills",
+            "arguments": {}
+        });
+        let value = run_skill_script(
+            &script,
+            &payload,
+            Duration::from_secs(1),
+            "finance-manager",
+            "task-1",
+            "manage-bills",
+        )
+        .await
+        .expect("script should succeed");
+        assert_eq!(value["ok"], serde_json::json!(true));
+        assert_eq!(value["skill"], serde_json::json!("manage-bills"));
+    }
+
+    #[tokio::test]
+    async fn run_skill_script_times_out() {
+        if !python3_available() {
+            return;
+        }
+
+        let skill_root = temp_dir("nm_skill_root");
+        let script_dir = skill_root.join("scripts");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        let script = script_dir.join("slow.py");
+        fs::write(
+            &script,
+            r#"import time
+time.sleep(1.0)
+print("{}")
+"#,
+        )
+        .expect("script write");
+
+        let err = run_skill_script(
+            &script,
+            &serde_json::json!({}),
+            Duration::from_millis(10),
+            "finance-manager",
+            "task-1",
+            "manage-bills",
+        )
+        .await
+        .expect_err("script should time out");
+        assert!(
+            err.to_string().contains("script_timeout"),
+            "unexpected timeout error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_skill_script_rejects_invalid_json() {
+        if !python3_available() {
+            return;
+        }
+
+        let skill_root = temp_dir("nm_skill_root");
+        let script_dir = skill_root.join("scripts");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        let script = script_dir.join("invalid.py");
+        fs::write(&script, r#"print("not-json")"#).expect("script write");
+
+        let err = run_skill_script(
+            &script,
+            &serde_json::json!({}),
+            Duration::from_secs(1),
+            "finance-manager",
+            "task-1",
+            "manage-bills",
+        )
+        .await
+        .expect_err("script output should fail JSON parsing");
+        assert!(
+            err.to_string().contains("script_invalid_json"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]
