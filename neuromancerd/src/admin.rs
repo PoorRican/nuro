@@ -15,9 +15,11 @@ use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
-    OrchestratorRunsListResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
-    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
+    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
+    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
+    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
     OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
     OrchestratorTurnResult,
 };
@@ -182,6 +184,51 @@ async fn op_orchestrator_subagent_turn(
 
     runtime
         .orchestrator_subagent_turn(params.thread_id, params.message)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_events_query(
+    state: &AppState,
+    params: OrchestratorEventsQueryParams,
+) -> Result<OrchestratorEventsQueryResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_events_query(params)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_run_diagnose(
+    state: &AppState,
+    params: OrchestratorRunDiagnoseParams,
+) -> Result<OrchestratorRunDiagnoseResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_run_diagnose(params.run_id)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_stats_get(state: &AppState) -> Result<OrchestratorStatsGetResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_stats_get()
         .await
         .map_err(map_message_runtime_error)
 }
@@ -380,6 +427,30 @@ async fn dispatch_rpc(
                     Err(err) => Err(err),
                 },
                 Err(err) => Err(err),
+            }
+        }
+        "orchestrator.events.query" => match parse_params::<OrchestratorEventsQueryParams>(params) {
+            Ok(req) => match op_orchestrator_events_query(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
+        "orchestrator.runs.diagnose" => match parse_params::<OrchestratorRunDiagnoseParams>(params) {
+            Ok(req) => match op_orchestrator_run_diagnose(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
+        "orchestrator.stats.get" => {
+            if let Err(err) = require_no_params_or_empty_object(params.as_ref()) {
+                Err(err)
+            } else {
+                match op_orchestrator_stats_get(state).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                }
             }
         }
         _ => Err(RpcMethodError::method_not_found(format!(

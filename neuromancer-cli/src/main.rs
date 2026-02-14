@@ -12,7 +12,8 @@ use clap::Parser;
 use chat::run_orchestrator_chat;
 use cli::{
     Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
-    OrchestratorRunsCommand, OrchestratorSubagentCommand, OrchestratorThreadsCommand, RpcCommand,
+    OrchestratorEventsCommand, OrchestratorRunsCommand, OrchestratorStatsCommand,
+    OrchestratorSubagentCommand, OrchestratorThreadsCommand, RpcCommand,
 };
 use daemon::{
     DaemonRestartOptions, DaemonStartOptions, DaemonStopOptions, daemon_status, restart_daemon,
@@ -21,7 +22,8 @@ use daemon::{
 use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{
-    OrchestratorRunGetParams, OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
+    OrchestratorEventsQueryParams, OrchestratorRunDiagnoseParams, OrchestratorRunGetParams,
+    OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
     OrchestratorThreadResurrectParams, OrchestratorTurnParams,
 };
 use rpc_client::RpcClient;
@@ -220,6 +222,37 @@ async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
                                 run_id: args.run_id,
                             })
                             .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                    OrchestratorRunsCommand::Diagnose(args) => {
+                        let response = rpc
+                            .orchestrator_run_diagnose(OrchestratorRunDiagnoseParams {
+                                run_id: args.run_id,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                },
+                OrchestratorCommand::Events { command } => match command {
+                    OrchestratorEventsCommand::Query(args) => {
+                        let response = rpc
+                            .orchestrator_events_query(OrchestratorEventsQueryParams {
+                                thread_id: args.thread_id,
+                                run_id: args.run_id,
+                                agent_id: args.agent_id,
+                                tool_id: args.tool_id,
+                                event_type: args.event_type,
+                                error_contains: args.error_contains,
+                                offset: args.offset,
+                                limit: args.limit,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                },
+                OrchestratorCommand::Stats { command } => match command {
+                    OrchestratorStatsCommand::Get => {
+                        let response = rpc.orchestrator_stats_get().await?;
                         Ok(RunOutcome::Payload(serde_json::json!(response)))
                     }
                 },

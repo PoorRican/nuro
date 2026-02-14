@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC 2.0 id type supported by the daemon control-plane RPC.
@@ -168,6 +170,18 @@ pub struct ThreadEvent {
     pub run_id: Option<String>,
     pub payload: serde_json::Value,
     pub redaction_applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +215,50 @@ pub struct OrchestratorSubagentTurnResult {
     pub run: DelegatedRun,
     pub response: String,
     pub tool_invocations: Vec<OrchestratorToolInvocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorEventsQueryParams {
+    pub thread_id: Option<String>,
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub tool_id: Option<String>,
+    pub event_type: Option<String>,
+    pub error_contains: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorEventsQueryResult {
+    pub events: Vec<ThreadEvent>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorRunDiagnoseParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorRunDiagnoseResult {
+    pub run: DelegatedRun,
+    pub thread: Option<ThreadSummary>,
+    pub events: Vec<ThreadEvent>,
+    pub inferred_failure_cause: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorStatsGetResult {
+    pub threads_total: usize,
+    pub events_total: usize,
+    pub runs_total: usize,
+    pub failed_runs: usize,
+    pub event_counts: BTreeMap<String, usize>,
+    pub tool_counts: BTreeMap<String, usize>,
+    pub agent_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +373,12 @@ mod tests {
             run_id: Some("run-1".to_string()),
             payload: serde_json::json!({"content":"hello"}),
             redaction_applied: false,
+            turn_id: Some("turn-1".to_string()),
+            parent_event_id: None,
+            call_id: None,
+            attempt: None,
+            duration_ms: Some(25),
+            meta: Some(serde_json::json!({"note":"ok"})),
         };
 
         let encoded = serde_json::to_string(&event).expect("event should serialize");
@@ -343,6 +407,27 @@ mod tests {
 
         let encoded = serde_json::to_string(&result).expect("result should serialize");
         let decoded: OrchestratorContextGetResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn orchestrator_stats_get_result_roundtrip() {
+        let result = OrchestratorStatsGetResult {
+            threads_total: 2,
+            events_total: 12,
+            runs_total: 3,
+            failed_runs: 1,
+            event_counts: BTreeMap::from([
+                ("message_user".to_string(), 3),
+                ("tool_result".to_string(), 4),
+            ]),
+            tool_counts: BTreeMap::from([("delegate_to_agent".to_string(), 2)]),
+            agent_counts: BTreeMap::from([("planner".to_string(), 2)]),
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: OrchestratorStatsGetResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }

@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
-    OrchestratorRunsListResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
-    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
+    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
+    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
+    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
     OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
     OrchestratorTurnResult,
 };
@@ -217,6 +219,38 @@ impl RpcClient {
             ),
         )
         .await
+    }
+
+    pub async fn orchestrator_events_query(
+        &self,
+        params: OrchestratorEventsQueryParams,
+    ) -> Result<OrchestratorEventsQueryResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.events.query",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_run_diagnose(
+        &self,
+        params: OrchestratorRunDiagnoseParams,
+    ) -> Result<OrchestratorRunDiagnoseResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.runs.diagnose",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_stats_get(&self) -> Result<OrchestratorStatsGetResult, RpcClientError> {
+        self.call_typed("orchestrator.stats.get", None).await
     }
 }
 

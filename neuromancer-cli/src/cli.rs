@@ -166,6 +166,14 @@ pub enum OrchestratorCommand {
         #[command(subcommand)]
         command: OrchestratorRunsCommand,
     },
+    Events {
+        #[command(subcommand)]
+        command: OrchestratorEventsCommand,
+    },
+    Stats {
+        #[command(subcommand)]
+        command: OrchestratorStatsCommand,
+    },
     Threads {
         #[command(subcommand)]
         command: OrchestratorThreadsCommand,
@@ -180,6 +188,17 @@ pub enum OrchestratorCommand {
 pub enum OrchestratorRunsCommand {
     List,
     Get(OrchestratorRunGetArgs),
+    Diagnose(OrchestratorRunDiagnoseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorEventsCommand {
+    Query(OrchestratorEventsQueryArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorStatsCommand {
+    Get,
 }
 
 #[derive(Debug, Subcommand)]
@@ -207,6 +226,39 @@ pub struct OrchestratorChatArgs {}
 pub struct OrchestratorRunGetArgs {
     /// Delegated run id returned by `orchestrator turn`.
     pub run_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorRunDiagnoseArgs {
+    /// Delegated run id returned by `orchestrator turn`.
+    pub run_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorEventsQueryArgs {
+    #[arg(long)]
+    pub thread_id: Option<String>,
+
+    #[arg(long)]
+    pub run_id: Option<String>,
+
+    #[arg(long)]
+    pub agent_id: Option<String>,
+
+    #[arg(long)]
+    pub tool_id: Option<String>,
+
+    #[arg(long)]
+    pub event_type: Option<String>,
+
+    #[arg(long)]
+    pub error_contains: Option<String>,
+
+    #[arg(long)]
+    pub offset: Option<usize>,
+
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -398,6 +450,73 @@ mod tests {
             } => match command {
                 OrchestratorRunsCommand::List => {}
                 other => panic!("unexpected runs command parsed: {other:?}"),
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_runs_diagnose_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "runs",
+            "diagnose",
+            "run-123",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Runs { command },
+            } => match command {
+                OrchestratorRunsCommand::Diagnose(args) => assert_eq!(args.run_id, "run-123"),
+                other => panic!("unexpected runs command parsed: {other:?}"),
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_events_query_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "events",
+            "query",
+            "--thread-id",
+            "thread-1",
+            "--tool-id",
+            "delegate_to_agent",
+            "--limit",
+            "50",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Events { command },
+            } => match command {
+                OrchestratorEventsCommand::Query(args) => {
+                    assert_eq!(args.thread_id.as_deref(), Some("thread-1"));
+                    assert_eq!(args.tool_id.as_deref(), Some("delegate_to_agent"));
+                    assert_eq!(args.limit, Some(50));
+                }
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_stats_get_command() {
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "stats", "get"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Stats { command },
+            } => match command {
+                OrchestratorStatsCommand::Get => {}
             },
             other => panic!("unexpected command parsed: {other:?}"),
         }

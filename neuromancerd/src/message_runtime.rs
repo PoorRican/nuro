@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
@@ -10,13 +10,17 @@ use neuromancer_agent::conversation::{ChatMessage, ConversationContext, Truncati
 use neuromancer_agent::llm::{LlmClient, RigLlmClient};
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
-use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig};
+use neuromancer_core::agent::{
+    AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig, SubAgentReport,
+};
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
-    DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
-    OrchestratorThreadGetResult, OrchestratorThreadMessage, OrchestratorThreadResurrectResult,
-    OrchestratorToolInvocation, OrchestratorTurnResult, ThreadEvent, ThreadSummary,
+    DelegatedRun, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
+    OrchestratorRunDiagnoseResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnResult,
+    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadMessage,
+    OrchestratorThreadResurrectResult, OrchestratorToolInvocation, OrchestratorTurnResult,
+    ThreadEvent, ThreadSummary,
 };
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
@@ -32,6 +36,7 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM0_AGENT_ID: &str = "system0";
 const DEFAULT_SKILL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_THREAD_PAGE_LIMIT: usize = 100;
+const DEFAULT_EVENTS_QUERY_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 struct SubAgentThreadState {
@@ -239,6 +244,41 @@ impl ThreadJournal {
         read_thread_events_from_path(&path)
     }
 
+    fn read_all_thread_events(&self) -> Result<Vec<ThreadEvent>, MessageRuntimeError> {
+        let mut events = Vec::new();
+
+        let system_file = self.system_thread_file();
+        if system_file.exists() {
+            events.extend(read_thread_events_from_path(&system_file)?);
+        }
+
+        let subagents_dir = self.base_dir.join("subagents");
+        if subagents_dir.exists() {
+            for dir_entry in fs::read_dir(&subagents_dir).map_err(|err| {
+                MessageRuntimeError::Internal(format!(
+                    "failed to read subagent thread dir '{}': {err}",
+                    subagents_dir.display()
+                ))
+            })? {
+                let Ok(dir_entry) = dir_entry else { continue };
+                let path = dir_entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                events.extend(read_thread_events_from_path(&path)?);
+            }
+        }
+
+        events.sort_by(|a, b| {
+            if a.ts == b.ts {
+                a.seq.cmp(&b.seq)
+            } else {
+                a.ts.cmp(&b.ts)
+            }
+        });
+        Ok(events)
+    }
+
     async fn append_messages(
         &self,
         thread_id: &str,
@@ -294,6 +334,12 @@ impl ThreadJournal {
                 run_id: run_id.map(|value| value.to_string()),
                 payload,
                 redaction_applied: false,
+                turn_id: None,
+                parent_event_id: None,
+                call_id: None,
+                attempt: None,
+                duration_ms: None,
+                meta: None,
             })
             .await?;
         }
@@ -415,6 +461,12 @@ impl RuntimeCore {
                 run_id: Some(turn_id.to_string()),
                 payload: serde_json::json!({ "role": "user", "content": message.clone() }),
                 redaction_applied: false,
+                turn_id: Some(turn_id.to_string()),
+                parent_event_id: None,
+                call_id: None,
+                attempt: None,
+                duration_ms: None,
+                meta: None,
             })
             .await;
 
@@ -447,6 +499,12 @@ impl RuntimeCore {
                             "message": "orchestrator turn failed",
                         }),
                         redaction_applied: false,
+                        turn_id: Some(turn_id.to_string()),
+                        parent_event_id: None,
+                        call_id: None,
+                        attempt: None,
+                        duration_ms: None,
+                        meta: None,
                     })
                     .await;
                 tracing::error!(
@@ -482,6 +540,12 @@ impl RuntimeCore {
                         "arguments": invocation.arguments,
                     }),
                     redaction_applied: false,
+                    turn_id: Some(turn_id.to_string()),
+                    parent_event_id: None,
+                    call_id: Some(invocation.call_id.clone()),
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
                 })
                 .await;
             let _ = self
@@ -502,6 +566,12 @@ impl RuntimeCore {
                         "output": invocation.output,
                     }),
                     redaction_applied: false,
+                    turn_id: Some(turn_id.to_string()),
+                    parent_event_id: None,
+                    call_id: Some(invocation.call_id.clone()),
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
                 })
                 .await;
         }
@@ -519,6 +589,12 @@ impl RuntimeCore {
                 run_id: Some(turn_id.to_string()),
                 payload: serde_json::json!({ "role": "assistant", "content": response.clone() }),
                 redaction_applied: false,
+                turn_id: Some(turn_id.to_string()),
+                parent_event_id: None,
+                call_id: None,
+                attempt: None,
+                duration_ms: Some(turn_started_at.elapsed().as_millis() as u64),
+                meta: None,
             })
             .await;
         tracing::info!(
@@ -561,7 +637,36 @@ impl MessageRuntime {
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
         let (report_tx, mut report_rx) = mpsc::channel(256);
-        let report_worker = tokio::spawn(async move { while report_rx.recv().await.is_some() {} });
+        let report_thread_journal = thread_journal.clone();
+        let report_worker = tokio::spawn(async move {
+            while let Some(report) = report_rx.recv().await {
+                let event = ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: SYSTEM0_AGENT_ID.to_string(),
+                    thread_kind: "system".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "subagent_report".to_string(),
+                    agent_id: None,
+                    run_id: Some(subagent_report_task_id(&report)),
+                    payload: serde_json::json!({
+                        "report_type": subagent_report_type(&report),
+                        "report": report,
+                    }),
+                    redaction_applied: false,
+                    turn_id: None,
+                    parent_event_id: None,
+                    call_id: None,
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
+                };
+
+                if let Err(err) = report_thread_journal.append_event(event).await {
+                    tracing::error!(error = ?err, "thread_journal_report_write_failed");
+                }
+            }
+        });
         let session_store = InMemorySessionStore::new();
         let session_id = uuid::Uuid::new_v4();
 
@@ -908,6 +1013,12 @@ impl MessageRuntime {
                 run_id: resurrected.latest_run_id.clone(),
                 payload: serde_json::json!({"resurrected": true}),
                 redaction_applied: false,
+                turn_id: None,
+                parent_event_id: None,
+                call_id: None,
+                attempt: None,
+                duration_ms: None,
+                meta: None,
             })
             .await?;
 
@@ -1007,6 +1118,12 @@ impl MessageRuntime {
                         "tool_id": "orchestrator.subagent.turn",
                     }),
                     redaction_applied: false,
+                    turn_id: None,
+                    parent_event_id: None,
+                    call_id: None,
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
                 })
                 .await?;
         }
@@ -1051,6 +1168,12 @@ impl MessageRuntime {
                     "error": delegated_run.error,
                 }),
                 redaction_applied: false,
+                turn_id: None,
+                parent_event_id: None,
+                call_id: None,
+                attempt: None,
+                duration_ms: None,
+                meta: None,
             })
             .await?;
 
@@ -1060,6 +1183,206 @@ impl MessageRuntime {
             response,
             tool_invocations: Vec::new(),
         })
+    }
+
+    pub async fn orchestrator_events_query(
+        &self,
+        params: OrchestratorEventsQueryParams,
+    ) -> Result<OrchestratorEventsQueryResult, MessageRuntimeError> {
+        let offset = params.offset.unwrap_or(0);
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_EVENTS_QUERY_LIMIT)
+            .clamp(1, 1000);
+
+        let mut events = self.thread_journal.read_all_thread_events()?;
+        events.retain(|event| event_matches_query(event, &params));
+
+        let total = events.len();
+        let events = events.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+
+        Ok(OrchestratorEventsQueryResult {
+            events,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn orchestrator_run_diagnose(
+        &self,
+        run_id: String,
+    ) -> Result<OrchestratorRunDiagnoseResult, MessageRuntimeError> {
+        if run_id.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "run_id must not be empty".to_string(),
+            ));
+        }
+
+        let run = self
+            .system0_broker
+            .get_run(&run_id)
+            .await
+            .ok_or_else(|| MessageRuntimeError::ResourceNotFound(format!("run '{run_id}'")))?;
+
+        let all_events = self.thread_journal.read_all_thread_events()?;
+        let mut events = all_events
+            .iter()
+            .filter(|event| event.run_id.as_deref() == Some(run_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if events.is_empty()
+            && let Some(thread_id) = run.thread_id.as_deref()
+        {
+            events = self
+                .thread_journal
+                .read_thread_events(thread_id)?
+                .into_iter()
+                .filter(|event| event.run_id.as_deref() == Some(run_id.as_str()))
+                .collect();
+        }
+
+        let thread = if let Some(thread_id) = run.thread_id.as_deref() {
+            let summaries = self.orchestrator_threads_list().await?;
+            summaries.into_iter().find(|summary| summary.thread_id == thread_id)
+        } else {
+            None
+        };
+
+        let inferred_failure_cause = events.iter().rev().find_map(event_error_text);
+
+        Ok(OrchestratorRunDiagnoseResult {
+            run,
+            thread,
+            events,
+            inferred_failure_cause,
+        })
+    }
+
+    pub async fn orchestrator_stats_get(&self) -> Result<OrchestratorStatsGetResult, MessageRuntimeError> {
+        let events = self.thread_journal.read_all_thread_events()?;
+        let runs = self.system0_broker.list_runs().await;
+        let threads_total = self.orchestrator_threads_list().await?.len();
+
+        let mut event_counts = BTreeMap::<String, usize>::new();
+        let mut tool_counts = BTreeMap::<String, usize>::new();
+        let mut agent_counts = BTreeMap::<String, usize>::new();
+        for event in &events {
+            *event_counts.entry(event.event_type.clone()).or_default() += 1;
+            if let Some(tool_id) = event_tool_id(event) {
+                *tool_counts.entry(tool_id).or_default() += 1;
+            }
+            if let Some(agent_id) = event.agent_id.clone() {
+                *agent_counts.entry(agent_id).or_default() += 1;
+            }
+        }
+
+        let failed_runs = runs
+            .iter()
+            .filter(|run| run.state == "failed" || run.state == "error")
+            .count();
+
+        Ok(OrchestratorStatsGetResult {
+            threads_total,
+            events_total: events.len(),
+            runs_total: runs.len(),
+            failed_runs,
+            event_counts,
+            tool_counts,
+            agent_counts,
+        })
+    }
+}
+
+fn event_matches_query(event: &ThreadEvent, params: &OrchestratorEventsQueryParams) -> bool {
+    if let Some(thread_id) = params.thread_id.as_deref()
+        && event.thread_id != thread_id
+    {
+        return false;
+    }
+
+    if let Some(run_id) = params.run_id.as_deref()
+        && event.run_id.as_deref() != Some(run_id)
+    {
+        return false;
+    }
+
+    if let Some(agent_id) = params.agent_id.as_deref()
+        && event.agent_id.as_deref() != Some(agent_id)
+    {
+        return false;
+    }
+
+    if let Some(event_type) = params.event_type.as_deref()
+        && event.event_type != event_type
+    {
+        return false;
+    }
+
+    if let Some(tool_id) = params.tool_id.as_deref()
+        && event_tool_id(event).as_deref() != Some(tool_id)
+    {
+        return false;
+    }
+
+    if let Some(error_contains) = params.error_contains.as_deref() {
+        let needle = error_contains.to_ascii_lowercase();
+        let haystack = event_error_text(event)
+            .unwrap_or_else(|| event.payload.to_string())
+            .to_ascii_lowercase();
+        if !haystack.contains(&needle) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn event_tool_id(event: &ThreadEvent) -> Option<String> {
+    event
+        .payload
+        .get("tool_id")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn event_error_text(event: &ThreadEvent) -> Option<String> {
+    event
+        .payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            event
+                .payload
+                .as_str()
+                .map(ToString::to_string)
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn subagent_report_type(report: &SubAgentReport) -> &'static str {
+    match report {
+        SubAgentReport::Progress { .. } => "progress",
+        SubAgentReport::InputRequired { .. } => "input_required",
+        SubAgentReport::ToolFailure { .. } => "tool_failure",
+        SubAgentReport::PolicyDenied { .. } => "policy_denied",
+        SubAgentReport::Stuck { .. } => "stuck",
+        SubAgentReport::Completed { .. } => "completed",
+        SubAgentReport::Failed { .. } => "failed",
+    }
+}
+
+fn subagent_report_task_id(report: &SubAgentReport) -> String {
+    match report {
+        SubAgentReport::Progress { task_id, .. }
+        | SubAgentReport::InputRequired { task_id, .. }
+        | SubAgentReport::ToolFailure { task_id, .. }
+        | SubAgentReport::PolicyDenied { task_id, .. }
+        | SubAgentReport::Stuck { task_id, .. }
+        | SubAgentReport::Completed { task_id, .. }
+        | SubAgentReport::Failed { task_id, .. } => task_id.to_string(),
     }
 }
 
@@ -2058,6 +2381,12 @@ impl ToolBroker for System0ToolBroker {
                                 "initial_instruction": instruction.clone(),
                             }),
                             redaction_applied: false,
+                            turn_id: Some(turn_id.to_string()),
+                            parent_event_id: None,
+                            call_id: Some(call.id.clone()),
+                            attempt: None,
+                            duration_ms: None,
+                            meta: None,
                         })
                         .await
                     {
@@ -2082,6 +2411,12 @@ impl ToolBroker for System0ToolBroker {
                         run_id: Some(run_id.clone()),
                         payload: serde_json::json!({ "role": "user", "content": instruction.clone() }),
                         redaction_applied: false,
+                        turn_id: Some(turn_id.to_string()),
+                        parent_event_id: None,
+                        call_id: Some(call.id.clone()),
+                        attempt: None,
+                        duration_ms: None,
+                        meta: None,
                     })
                     .await
                 {
@@ -2184,6 +2519,12 @@ impl ToolBroker for System0ToolBroker {
                                     "call_id": call.id.clone(),
                                 }),
                                 redaction_applied: false,
+                                turn_id: Some(turn_id.to_string()),
+                                parent_event_id: None,
+                                call_id: Some(call.id.clone()),
+                                attempt: None,
+                                duration_ms: Some(delegation_started_at.elapsed().as_millis() as u64),
+                                meta: None,
                             })
                             .await
                         {
@@ -2291,6 +2632,12 @@ impl ToolBroker for System0ToolBroker {
                             "error": error,
                         }),
                         redaction_applied: false,
+                        turn_id: Some(turn_id.to_string()),
+                        parent_event_id: None,
+                        call_id: Some(call.id.clone()),
+                        attempt: None,
+                        duration_ms: Some(delegation_started_at.elapsed().as_millis() as u64),
+                        meta: None,
                     })
                     .await
                 {
