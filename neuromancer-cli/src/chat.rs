@@ -580,7 +580,11 @@ impl TimelineItem {
                             .and_then(|value| value.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        let visible = if *expanded { agents.len() } else { agents.len().min(4) };
+                        let visible = if *expanded {
+                            agents.len()
+                        } else {
+                            agents.len().min(4)
+                        };
                         lines.push(Line::from(vec![
                             Span::styled("  agents: ", Style::default().fg(Color::DarkGray)),
                             Span::raw(format!("{} found", agents.len())),
@@ -614,7 +618,10 @@ impl TimelineItem {
                         }
                         if !*expanded && agents.len() > visible {
                             lines.push(Line::from(Span::styled(
-                                format!("  ... {} more (expand for full list)", agents.len() - visible),
+                                format!(
+                                    "  ... {} more (expand for full list)",
+                                    agents.len() - visible
+                                ),
                                 Style::default().fg(Color::DarkGray),
                             )));
                         }
@@ -650,7 +657,11 @@ impl TimelineItem {
                         lines.push(Line::from(vec![
                             Span::styled("  redaction: ", Style::default().fg(Color::DarkGray)),
                             Span::styled(
-                                if contains_redaction_marker(output) { "yes" } else { "no" },
+                                if contains_redaction_marker(output) {
+                                    "yes"
+                                } else {
+                                    "no"
+                                },
                                 Style::default().fg(if contains_redaction_marker(output) {
                                     Color::Yellow
                                 } else {
@@ -878,10 +889,8 @@ impl TimelineItem {
                 if let Some(fill_width) = selected_fill_width {
                     let width = line.width();
                     if fill_width > width {
-                        line.spans.push(Span::styled(
-                            " ".repeat(fill_width - width),
-                            selected_style,
-                        ));
+                        line.spans
+                            .push(Span::styled(" ".repeat(fill_width - width), selected_style));
                     }
                 }
             }
@@ -2234,8 +2243,7 @@ fn item_matches_filter(item: &TimelineItem, filter: MainFilter) -> bool {
         },
         MainFilter::SystemToolsOnly => matches!(
             item,
-            TimelineItem::DelegateInvocation { .. }
-                | TimelineItem::ToolInvocation { .. }
+            TimelineItem::DelegateInvocation { .. } | TimelineItem::ToolInvocation { .. }
         ),
     }
 }
@@ -2435,7 +2443,8 @@ fn timeline_items_from_events(kind: &ThreadKind, events: &[ThreadEvent]) -> Vec<
                     .and_then(|value| value.get("description"))
                     .and_then(|value| value.as_str())
                     .or_else(|| {
-                        event.payload
+                        event
+                            .payload
                             .get("report")
                             .and_then(|value| value.get("summary"))
                             .and_then(|value| value.as_str())

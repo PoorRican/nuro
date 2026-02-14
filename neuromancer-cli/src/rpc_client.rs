@@ -249,7 +249,9 @@ impl RpcClient {
         .await
     }
 
-    pub async fn orchestrator_stats_get(&self) -> Result<OrchestratorStatsGetResult, RpcClientError> {
+    pub async fn orchestrator_stats_get(
+        &self,
+    ) -> Result<OrchestratorStatsGetResult, RpcClientError> {
         self.call_typed("orchestrator.stats.get", None).await
     }
 }

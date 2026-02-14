@@ -220,7 +220,9 @@ async fn op_orchestrator_run_diagnose(
         .map_err(map_message_runtime_error)
 }
 
-async fn op_orchestrator_stats_get(state: &AppState) -> Result<OrchestratorStatsGetResult, RpcMethodError> {
+async fn op_orchestrator_stats_get(
+    state: &AppState,
+) -> Result<OrchestratorStatsGetResult, RpcMethodError> {
     let Some(runtime) = &state.message_runtime else {
         return Err(RpcMethodError::internal(
             "message runtime is not initialized".to_string(),
@@ -429,14 +431,17 @@ async fn dispatch_rpc(
                 Err(err) => Err(err),
             }
         }
-        "orchestrator.events.query" => match parse_params::<OrchestratorEventsQueryParams>(params) {
-            Ok(req) => match op_orchestrator_events_query(state, req).await {
-                Ok(result) => to_value(&result),
+        "orchestrator.events.query" => {
+            match parse_params::<OrchestratorEventsQueryParams>(params) {
+                Ok(req) => match op_orchestrator_events_query(state, req).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                },
                 Err(err) => Err(err),
-            },
-            Err(err) => Err(err),
-        },
-        "orchestrator.runs.diagnose" => match parse_params::<OrchestratorRunDiagnoseParams>(params) {
+            }
+        }
+        "orchestrator.runs.diagnose" => match parse_params::<OrchestratorRunDiagnoseParams>(params)
+        {
             Ok(req) => match op_orchestrator_run_diagnose(state, req).await {
                 Ok(result) => to_value(&result),
                 Err(err) => Err(err),

@@ -457,14 +457,8 @@ mod tests {
 
     #[test]
     fn parses_orchestrator_runs_diagnose_command() {
-        let cli = Cli::try_parse_from([
-            "neuroctl",
-            "orchestrator",
-            "runs",
-            "diagnose",
-            "run-123",
-        ])
-        .expect("cli should parse");
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "runs", "diagnose", "run-123"])
+            .expect("cli should parse");
 
         match cli.command {
             Command::Orchestrator {

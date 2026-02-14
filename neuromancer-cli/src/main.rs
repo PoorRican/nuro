@@ -23,8 +23,8 @@ use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{
     OrchestratorEventsQueryParams, OrchestratorRunDiagnoseParams, OrchestratorRunGetParams,
-    OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
-    OrchestratorThreadResurrectParams, OrchestratorTurnParams,
+    OrchestratorSubagentTurnParams, OrchestratorThreadGetParams, OrchestratorThreadResurrectParams,
+    OrchestratorTurnParams,
 };
 use rpc_client::RpcClient;
 

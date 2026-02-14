@@ -1199,7 +1199,11 @@ impl MessageRuntime {
         events.retain(|event| event_matches_query(event, &params));
 
         let total = events.len();
-        let events = events.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let events = events
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
 
         Ok(OrchestratorEventsQueryResult {
             events,
@@ -1245,7 +1249,9 @@ impl MessageRuntime {
 
         let thread = if let Some(thread_id) = run.thread_id.as_deref() {
             let summaries = self.orchestrator_threads_list().await?;
-            summaries.into_iter().find(|summary| summary.thread_id == thread_id)
+            summaries
+                .into_iter()
+                .find(|summary| summary.thread_id == thread_id)
         } else {
             None
         };
@@ -1260,7 +1266,9 @@ impl MessageRuntime {
         })
     }
 
-    pub async fn orchestrator_stats_get(&self) -> Result<OrchestratorStatsGetResult, MessageRuntimeError> {
+    pub async fn orchestrator_stats_get(
+        &self,
+    ) -> Result<OrchestratorStatsGetResult, MessageRuntimeError> {
         let events = self.thread_journal.read_all_thread_events()?;
         let runs = self.system0_broker.list_runs().await;
         let threads_total = self.orchestrator_threads_list().await?.len();
@@ -2523,7 +2531,9 @@ impl ToolBroker for System0ToolBroker {
                                 parent_event_id: None,
                                 call_id: Some(call.id.clone()),
                                 attempt: None,
-                                duration_ms: Some(delegation_started_at.elapsed().as_millis() as u64),
+                                duration_ms: Some(
+                                    delegation_started_at.elapsed().as_millis() as u64
+                                ),
                                 meta: None,
                             })
                             .await
