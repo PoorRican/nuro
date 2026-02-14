@@ -1995,7 +1995,7 @@ impl ToolBroker for System0ToolBroker {
                 state_entry.updated_at = now.clone();
                 state_entry.latest_run_id = Some(run_id.clone());
                 let session_id = state_entry.session_id;
-                let previous_persisted_count = state_entry.persisted_message_count;
+                let persisted_count_before_turn = state_entry.persisted_message_count;
                 let initial_instruction = state_entry.initial_instruction.clone();
 
                 inner
@@ -2069,6 +2069,7 @@ impl ToolBroker for System0ToolBroker {
                     }
                 }
 
+                let mut persisted_count_before_delta = persisted_count_before_turn;
                 if let Err(err) = thread_journal
                     .append_event(ThreadEvent {
                         event_id: uuid::Uuid::new_v4().to_string(),
@@ -2089,6 +2090,10 @@ impl ToolBroker for System0ToolBroker {
                         error = ?err,
                         "thread_journal_write_failed"
                     );
+                } else {
+                    // Account for the manually persisted user instruction so we do not
+                    // persist the same user message again when writing conversation deltas.
+                    persisted_count_before_delta = persisted_count_before_delta.saturating_add(1);
                 }
 
                 let delegation_started_at = Instant::now();
@@ -2112,7 +2117,7 @@ impl ToolBroker for System0ToolBroker {
                     .await;
 
                 let mut error = None;
-                let mut persisted_message_count = previous_persisted_count;
+                let mut persisted_message_count = persisted_count_before_delta;
                 let (run_state, summary) = match result {
                     Ok(turn_output) => {
                         let response = extract_response_text(&turn_output.output)
@@ -2127,7 +2132,7 @@ impl ToolBroker for System0ToolBroker {
                                 );
                                 let delta = thread_messages
                                     .iter()
-                                    .skip(previous_persisted_count)
+                                    .skip(persisted_count_before_delta)
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 if let Err(err) = thread_journal
