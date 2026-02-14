@@ -129,6 +129,27 @@ pub struct OrchestratorRunGetResult {
     pub run: DelegatedRun,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OrchestratorThreadMessage {
+    Text {
+        role: String,
+        content: String,
+    },
+    ToolInvocation {
+        call_id: String,
+        tool_id: String,
+        arguments: serde_json::Value,
+        status: String,
+        output: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorContextGetResult {
+    pub messages: Vec<OrchestratorThreadMessage>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
