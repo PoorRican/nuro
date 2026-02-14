@@ -12,7 +12,7 @@ use clap::Parser;
 use chat::run_orchestrator_chat;
 use cli::{
     Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
-    OrchestratorRunsCommand, RpcCommand,
+    OrchestratorRunsCommand, OrchestratorSubagentCommand, OrchestratorThreadsCommand, RpcCommand,
 };
 use daemon::{
     DaemonRestartOptions, DaemonStartOptions, DaemonStopOptions, daemon_status, restart_daemon,
@@ -20,7 +20,10 @@ use daemon::{
 };
 use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
-use neuromancer_core::rpc::{OrchestratorRunGetParams, OrchestratorTurnParams};
+use neuromancer_core::rpc::{
+    OrchestratorRunGetParams, OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
+    OrchestratorThreadResurrectParams, OrchestratorTurnParams,
+};
 use rpc_client::RpcClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -215,6 +218,41 @@ async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
                         let response = rpc
                             .orchestrator_run_get(OrchestratorRunGetParams {
                                 run_id: args.run_id,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                },
+                OrchestratorCommand::Threads { command } => match command {
+                    OrchestratorThreadsCommand::List => {
+                        let response = rpc.orchestrator_threads_list().await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                    OrchestratorThreadsCommand::Get(args) => {
+                        let response = rpc
+                            .orchestrator_thread_get(OrchestratorThreadGetParams {
+                                thread_id: args.thread_id,
+                                offset: args.offset,
+                                limit: args.limit,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                    OrchestratorThreadsCommand::Resurrect(args) => {
+                        let response = rpc
+                            .orchestrator_thread_resurrect(OrchestratorThreadResurrectParams {
+                                thread_id: args.thread_id,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                },
+                OrchestratorCommand::Subagent { command } => match command {
+                    OrchestratorSubagentCommand::Turn(args) => {
+                        let response = rpc
+                            .orchestrator_subagent_turn(OrchestratorSubagentTurnParams {
+                                thread_id: args.thread_id,
+                                message: args.message,
                             })
                             .await?;
                         Ok(RunOutcome::Payload(serde_json::json!(response)))

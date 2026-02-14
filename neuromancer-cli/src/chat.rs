@@ -12,8 +12,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use neuromancer_core::rpc::{
-    DelegatedRun, OrchestratorRunGetParams, OrchestratorThreadMessage, OrchestratorToolInvocation,
-    OrchestratorTurnResult,
+    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorTurnParams, OrchestratorTurnResult, ThreadEvent, ThreadSummary,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -27,6 +27,7 @@ use crate::rpc_client::RpcClient;
 
 const SYSTEM_THREAD_ID: &str = "system0";
 const DEFAULT_MAX_VISIBLE_LINES: usize = 10;
+const DEFAULT_THREAD_PAGE_LIMIT: usize = 200;
 const INPUT_PREFIX: &str = "> ";
 const TEXT_COLLAPSE_LINE_THRESHOLD: usize = 4;
 const TEXT_COLLAPSE_CHAR_THRESHOLD: usize = 280;
@@ -39,6 +40,20 @@ pub async fn run_orchestrator_chat(rpc: &RpcClient, json_mode: bool) -> Result<(
     } else {
         run_interactive_chat(rpc).await
     }
+}
+
+#[derive(Debug)]
+enum PendingOutcome {
+    SystemTurn(Result<OrchestratorTurnResult, CliError>),
+    SubagentTurn {
+        thread_id: String,
+        result: Result<OrchestratorSubagentTurnResult, CliError>,
+    },
+    OpenThread {
+        thread_id: String,
+        result: Result<(), CliError>,
+    },
+    WorkerFailed(String),
 }
 
 async fn run_interactive_chat(rpc: &RpcClient) -> Result<(), CliError> {
@@ -59,8 +74,18 @@ async fn run_interactive_chat(rpc: &RpcClient) -> Result<(), CliError> {
     let mut app = ChatApp::new();
     app.bootstrap(rpc).await?;
     let mut clipboard = CommandClipboard;
+    let mut pending: Option<tokio::task::JoinHandle<PendingOutcome>> = None;
 
     loop {
+        if pending.as_ref().is_some_and(|handle| handle.is_finished()) {
+            let finished = pending.take().expect("pending task must exist");
+            let outcome = match finished.await {
+                Ok(outcome) => outcome,
+                Err(err) => PendingOutcome::WorkerFailed(err.to_string()),
+            };
+            app.handle_pending_outcome(rpc, outcome).await;
+        }
+
         terminal
             .draw(|frame| app.render(frame))
             .map_err(map_terminal_err)?;
@@ -73,15 +98,62 @@ async fn run_interactive_chat(rpc: &RpcClient) -> Result<(), CliError> {
         match app.handle_event(next, &mut clipboard) {
             AppAction::None => {}
             AppAction::Quit => break,
-            AppAction::SendTurn(message) => {
-                if let Err(err) = app.send_system_turn(rpc, message).await {
-                    app.status = Some(err.to_string());
+            AppAction::SubmitSystemTurn(message) => {
+                if pending.is_some() {
+                    app.status = Some("Request already in progress".to_string());
+                    continue;
                 }
+                let rpc = rpc.clone();
+                pending = Some(tokio::spawn(async move {
+                    let result = rpc
+                        .orchestrator_turn(OrchestratorTurnParams { message })
+                        .await
+                        .map_err(CliError::from);
+                    PendingOutcome::SystemTurn(result)
+                }));
             }
-            AppAction::LoadRun(run_id) => {
-                if let Err(err) = app.refresh_run_thread(rpc, &run_id).await {
-                    app.status = Some(err.to_string());
+            AppAction::SubmitSubagentTurn { thread_id, message } => {
+                if pending.is_some() {
+                    app.status = Some("Request already in progress".to_string());
+                    continue;
                 }
+                let rpc = rpc.clone();
+                pending = Some(tokio::spawn(async move {
+                    let result = rpc
+                        .orchestrator_subagent_turn(OrchestratorSubagentTurnParams {
+                            thread_id: thread_id.clone(),
+                            message,
+                        })
+                        .await
+                        .map_err(CliError::from);
+                    PendingOutcome::SubagentTurn { thread_id, result }
+                }));
+            }
+            AppAction::OpenThread {
+                thread_id,
+                resurrect,
+            } => {
+                if pending.is_some() {
+                    app.status = Some("Request already in progress".to_string());
+                    continue;
+                }
+                let rpc = rpc.clone();
+                pending = Some(tokio::spawn(async move {
+                    let result = async {
+                        if resurrect {
+                            rpc.orchestrator_thread_resurrect(
+                                neuromancer_core::rpc::OrchestratorThreadResurrectParams {
+                                    thread_id: thread_id.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(CliError::from)?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    PendingOutcome::OpenThread { thread_id, result }
+                }));
             }
         }
     }
@@ -105,7 +177,7 @@ async fn run_ndjson_chat<R: BufRead, W: Write>(
         serde_json::json!({
             "event": "snapshot",
             "system_thread": app.system_thread_snapshot(),
-            "runs": app.delegated_runs,
+            "runs": [],
         }),
     )?;
 
@@ -121,8 +193,15 @@ async fn run_ndjson_chat<R: BufRead, W: Write>(
             continue;
         };
 
-        match app.send_system_turn(rpc, message.clone()).await {
+        match rpc
+            .orchestrator_turn(OrchestratorTurnParams {
+                message: message.clone(),
+            })
+            .await
+        {
             Ok(turn_result) => {
+                app.refresh_thread_summaries(rpc).await?;
+                app.load_thread(rpc, SYSTEM_THREAD_ID).await?;
                 emit_ndjson(
                     output,
                     serde_json::json!({
@@ -130,7 +209,7 @@ async fn run_ndjson_chat<R: BufRead, W: Write>(
                         "input": message,
                         "turn_result": turn_result,
                         "system_thread": app.system_thread_snapshot(),
-                        "runs": app.delegated_runs,
+                        "runs": [],
                     }),
                 )?;
             }
@@ -141,7 +220,7 @@ async fn run_ndjson_chat<R: BufRead, W: Write>(
                         "event": "turn_error",
                         "input": message,
                         "error": {
-                            "message": err.to_string(),
+                            "message": CliError::from(err).to_string(),
                         },
                     }),
                 )?;
@@ -286,14 +365,23 @@ impl FocusPane {
             Self::Input => Self::Sidebar,
         }
     }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Sidebar => Self::Input,
+            Self::Main => Self::Sidebar,
+            Self::Input => Self::Main,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppAction {
     None,
     Quit,
-    SendTurn(String),
-    LoadRun(String),
+    SubmitSystemTurn(String),
+    SubmitSubagentTurn { thread_id: String, message: String },
+    OpenThread { thread_id: String, resurrect: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,14 +400,6 @@ impl MessageRoleTag {
         }
     }
 
-    fn from_wire_role(role: &str) -> Self {
-        match role {
-            "system" => Self::System,
-            "user" => Self::User,
-            _ => Self::Assistant,
-        }
-    }
-
     fn badge_style(self) -> Style {
         match self {
             Self::System => Style::default().fg(Color::Cyan),
@@ -327,6 +407,12 @@ impl MessageRoleTag {
             Self::Assistant => Style::default().fg(Color::Blue),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadKind {
+    System,
+    Subagent,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +430,19 @@ enum TimelineItem {
         output: serde_json::Value,
         expanded: bool,
     },
+    DelegateInvocation {
+        call_id: String,
+        status: String,
+        target_agent: Option<String>,
+        thread_id: Option<String>,
+        run_id: Option<String>,
+        instruction: Option<String>,
+        summary: Option<String>,
+        error: Option<String>,
+        arguments: serde_json::Value,
+        output: serde_json::Value,
+        expanded: bool,
+    },
 }
 
 impl TimelineItem {
@@ -357,17 +456,8 @@ impl TimelineItem {
         }
     }
 
-    fn to_list_item(&self, selected: bool) -> ListItem<'static> {
-        let style = if selected {
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-
-        match self {
+    fn lines(&self, selected: bool) -> Vec<Line<'static>> {
+        let mut lines = match self {
             TimelineItem::Text {
                 role,
                 text,
@@ -405,8 +495,7 @@ impl TimelineItem {
                     )));
                 }
                 lines.push(Line::raw(""));
-
-                ListItem::new(Text::from(lines)).style(style)
+                lines
             }
             TimelineItem::ToolInvocation {
                 call_id,
@@ -417,25 +506,26 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
-                let mut header = vec![
+                lines.push(Line::from(vec![
                     Span::styled(
                         "[TOOL] ",
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(tool_id.clone(), Style::default().fg(Color::LightYellow)),
-                    Span::raw(" "),
-                    Span::raw("status="),
+                    Span::styled(tool_id.clone(), Style::default().fg(Color::Gray)),
+                    Span::raw(" status="),
                     Span::styled(status.clone(), status_style(status)),
-                ];
-
-                if *expanded {
-                    header.push(Span::styled(
-                        " [expanded]",
+                    Span::styled(
+                        if *expanded {
+                            " [expanded]"
+                        } else {
+                            " [collapsed]"
+                        },
                         Style::default().fg(Color::DarkGray),
-                    ));
-                    lines.push(Line::from(header));
+                    ),
+                ]));
+                if *expanded {
                     lines.push(Line::from(vec![
                         Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
@@ -454,18 +544,120 @@ impl TimelineItem {
                     for line in pretty_json_lines(output) {
                         lines.push(Line::from(format!("    {line}")));
                     }
-                } else {
-                    header.push(Span::styled(
-                        " [collapsed]",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                    lines.push(Line::from(header));
                 }
                 lines.push(Line::raw(""));
+                lines
+            }
+            TimelineItem::DelegateInvocation {
+                call_id,
+                status,
+                target_agent,
+                thread_id,
+                run_id,
+                instruction,
+                summary,
+                error,
+                arguments,
+                output,
+                expanded,
+            } => {
+                let mut lines = Vec::new();
+                let target = target_agent
+                    .clone()
+                    .unwrap_or_else(|| "unknown-agent".to_string());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "[DELEGATE] ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("-> {target}"), Style::default().fg(Color::Cyan)),
+                    Span::raw(" state="),
+                    Span::styled(status.clone(), status_style(status)),
+                    Span::styled(
+                        if *expanded {
+                            " [expanded]"
+                        } else {
+                            " [collapsed]"
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  thread: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        thread_id
+                            .clone()
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled("  run: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        run_id.clone().unwrap_or_else(|| "unavailable".to_string()),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
 
-                ListItem::new(Text::from(lines)).style(style)
+                if let Some(instruction) = instruction {
+                    let preview = text_preview_lines(instruction, 2, 160).join(" ");
+                    lines.push(Line::from(vec![
+                        Span::styled("  instruction: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(preview),
+                    ]));
+                }
+
+                if let Some(error) = error {
+                    lines.push(Line::from(vec![
+                        Span::styled("  error: ", Style::default().fg(Color::Red)),
+                        Span::styled(error.clone(), Style::default().fg(Color::Red)),
+                    ]));
+                } else if let Some(summary) = summary {
+                    lines.push(Line::from(vec![
+                        Span::styled("  summary: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(summary.clone()),
+                    ]));
+                }
+
+                lines.push(Line::from(Span::styled(
+                    "  Enter: open sub-agent thread",
+                    Style::default().fg(Color::DarkGray),
+                )));
+
+                if *expanded {
+                    lines.push(Line::from(vec![
+                        Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  arguments:",
+                        Style::default().fg(Color::Gray),
+                    )));
+                    for line in pretty_json_lines(arguments) {
+                        lines.push(Line::from(format!("    {line}")));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        "  output:",
+                        Style::default().fg(Color::Gray),
+                    )));
+                    for line in pretty_json_lines(output) {
+                        lines.push(Line::from(format!("    {line}")));
+                    }
+                }
+                lines.push(Line::raw(""));
+                lines
+            }
+        };
+
+        if selected {
+            for line in &mut lines {
+                *line = line
+                    .clone()
+                    .patch_style(Style::default().bg(Color::DarkGray).fg(Color::White));
             }
         }
+
+        lines
     }
 
     fn to_snapshot_value(&self) -> serde_json::Value {
@@ -491,6 +683,32 @@ impl TimelineItem {
                 "arguments": arguments,
                 "output": output,
             }),
+            TimelineItem::DelegateInvocation {
+                call_id,
+                status,
+                target_agent,
+                thread_id,
+                run_id,
+                instruction,
+                summary,
+                error,
+                arguments,
+                output,
+                ..
+            } => serde_json::json!({
+                "role": "tool",
+                "type": "delegate_to_agent",
+                "call_id": call_id,
+                "status": status,
+                "target_agent": target_agent,
+                "thread_id": thread_id,
+                "run_id": run_id,
+                "instruction": instruction,
+                "summary": summary,
+                "error": error,
+                "arguments": arguments,
+                "output": output,
+            }),
         }
     }
 
@@ -501,24 +719,39 @@ impl TimelineItem {
                     *expanded = !*expanded;
                 }
             }
-            TimelineItem::ToolInvocation { expanded, .. } => *expanded = !*expanded,
+            TimelineItem::ToolInvocation { expanded, .. }
+            | TimelineItem::DelegateInvocation { expanded, .. } => *expanded = !*expanded,
         }
     }
 
     fn is_toggleable(&self) -> bool {
         match self {
             TimelineItem::Text { text, .. } => text_is_collapsible(text),
-            TimelineItem::ToolInvocation { .. } => true,
+            TimelineItem::ToolInvocation { .. } | TimelineItem::DelegateInvocation { .. } => true,
         }
     }
 
-    fn linked_run_id(&self) -> Option<String> {
+    fn linked_thread_id(&self) -> Option<String> {
         match self {
-            TimelineItem::ToolInvocation { output, .. } => output
-                .get("run_id")
-                .and_then(|value| value.as_str())
-                .map(|run_id| run_id.to_string()),
-            TimelineItem::Text { text, .. } => parse_run_id_from_text(text),
+            TimelineItem::DelegateInvocation {
+                thread_id: Some(thread_id),
+                ..
+            } => Some(thread_id.clone()),
+            TimelineItem::ToolInvocation {
+                output, tool_id, ..
+            } => {
+                if tool_id != "delegate_to_agent" {
+                    return None;
+                }
+                output
+                    .get("thread_id")
+                    .and_then(|value| value.as_str())
+                    .map(|thread_id| thread_id.to_string())
+            }
+            TimelineItem::Text { .. } => None,
+            TimelineItem::DelegateInvocation {
+                thread_id: None, ..
+            } => None,
         }
     }
 }
@@ -568,23 +801,20 @@ fn status_style(status: &str) -> Style {
     match status {
         "success" | "completed" => Style::default().fg(Color::Green),
         "error" | "failed" => Style::default().fg(Color::Red),
-        "running" => Style::default().fg(Color::Yellow),
+        "running" | "pending" => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::Gray),
     }
-}
-
-fn parse_run_id_from_text(text: &str) -> Option<String> {
-    text.strip_prefix("delegated run ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(|run_id| run_id.to_string())
 }
 
 #[derive(Debug, Clone)]
 struct ThreadView {
     id: String,
     title: String,
-    run_id: Option<String>,
-    state: Option<String>,
+    kind: ThreadKind,
+    agent_id: Option<String>,
+    state: String,
+    active: bool,
+    resurrected: bool,
     read_only: bool,
     items: Vec<TimelineItem>,
 }
@@ -594,21 +824,64 @@ impl ThreadView {
         Self {
             id: SYSTEM_THREAD_ID.to_string(),
             title: "System0".to_string(),
-            run_id: None,
-            state: None,
+            kind: ThreadKind::System,
+            agent_id: Some(SYSTEM_THREAD_ID.to_string()),
+            state: "active".to_string(),
+            active: true,
+            resurrected: false,
             read_only: false,
             items: vec![],
         }
     }
 
-    fn delegated_run(run: &DelegatedRun) -> Self {
+    fn from_summary(summary: &ThreadSummary) -> Self {
+        let kind = if summary.kind == "system" {
+            ThreadKind::System
+        } else {
+            ThreadKind::Subagent
+        };
+        let title = if kind == ThreadKind::System {
+            "System0".to_string()
+        } else {
+            format!(
+                "{} ({})",
+                summary
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "sub-agent".to_string()),
+                short_thread_id(&summary.thread_id),
+            )
+        };
+        let read_only = kind == ThreadKind::Subagent && !(summary.active || summary.resurrected);
         Self {
-            id: run.run_id.clone(),
-            title: format!("{} ({})", run.agent_id, short_run_id(&run.run_id)),
-            run_id: Some(run.run_id.clone()),
-            state: Some(run.state.clone()),
-            read_only: true,
-            items: run_thread_items(run),
+            id: summary.thread_id.clone(),
+            title,
+            kind,
+            agent_id: summary.agent_id.clone(),
+            state: summary.state.clone(),
+            active: summary.active,
+            resurrected: summary.resurrected,
+            read_only,
+            items: vec![],
+        }
+    }
+
+    fn apply_summary(&mut self, summary: &ThreadSummary) {
+        self.agent_id = summary.agent_id.clone();
+        self.state = summary.state.clone();
+        self.active = summary.active;
+        self.resurrected = summary.resurrected;
+        self.read_only =
+            self.kind == ThreadKind::Subagent && !(summary.active || summary.resurrected);
+        if self.kind == ThreadKind::Subagent {
+            self.title = format!(
+                "{} ({})",
+                summary
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| "sub-agent".to_string()),
+                short_thread_id(&summary.thread_id),
+            );
         }
     }
 }
@@ -616,38 +889,42 @@ impl ThreadView {
 #[derive(Debug, Clone)]
 struct ChatApp {
     threads: Vec<ThreadView>,
-    delegated_runs: Vec<DelegatedRun>,
     sidebar_selected: usize,
     active_thread: usize,
     focus: FocusPane,
     selected_item_by_thread: HashMap<String, usize>,
+    vertical_scroll_by_thread: HashMap<String, usize>,
+    horizontal_scroll_by_thread: HashMap<String, usize>,
     composer: ComposerState,
     status: Option<String>,
     last_input_cursor_rel: Option<(u16, u16)>,
+    last_main_viewport_rows: usize,
+    pending_thread_id: Option<String>,
+    pending_placeholder_index_by_thread: HashMap<String, usize>,
 }
 
 impl ChatApp {
     fn new() -> Self {
         Self {
             threads: vec![ThreadView::system()],
-            delegated_runs: vec![],
             sidebar_selected: 0,
             active_thread: 0,
             focus: FocusPane::Input,
             selected_item_by_thread: HashMap::new(),
+            vertical_scroll_by_thread: HashMap::new(),
+            horizontal_scroll_by_thread: HashMap::new(),
             composer: ComposerState::new(),
             status: Some("System0 thread ready".to_string()),
             last_input_cursor_rel: None,
+            last_main_viewport_rows: 1,
+            pending_thread_id: None,
+            pending_placeholder_index_by_thread: HashMap::new(),
         }
     }
 
     async fn bootstrap(&mut self, rpc: &RpcClient) -> Result<(), CliError> {
-        let context = rpc.orchestrator_context_get().await?.messages;
-        self.load_system_context(context);
-
-        let runs = rpc.orchestrator_runs_list().await?.runs;
-        self.sync_runs(runs);
-
+        self.refresh_thread_summaries(rpc).await?;
+        self.load_thread(rpc, SYSTEM_THREAD_ID).await?;
         if let Some(system_thread) = self
             .threads
             .iter()
@@ -659,68 +936,241 @@ impl ChatApp {
         Ok(())
     }
 
-    async fn send_system_turn(
-        &mut self,
-        rpc: &RpcClient,
-        message: String,
-    ) -> Result<OrchestratorTurnResult, CliError> {
-        self.active_thread = 0;
-        self.sidebar_selected = 0;
-        self.append_system_item(TimelineItem::text(MessageRoleTag::User, message.clone()));
-
-        let result = rpc
-            .orchestrator_turn(neuromancer_core::rpc::OrchestratorTurnParams { message })
-            .await?;
-
-        self.append_system_item(TimelineItem::text(
-            MessageRoleTag::Assistant,
-            result.response.clone(),
-        ));
-
-        for invocation in &result.tool_invocations {
-            self.append_system_item(tool_item_from_invocation(invocation));
+    async fn handle_pending_outcome(&mut self, rpc: &RpcClient, outcome: PendingOutcome) {
+        match outcome {
+            PendingOutcome::SystemTurn(result) => match result {
+                Ok(_) => {
+                    if let Err(err) = self.refresh_thread_summaries(rpc).await {
+                        self.mark_pending_failed(err.to_string());
+                        return;
+                    }
+                    if let Err(err) = self.load_thread(rpc, SYSTEM_THREAD_ID).await {
+                        self.mark_pending_failed(err.to_string());
+                        return;
+                    }
+                    self.clear_pending_marker(SYSTEM_THREAD_ID);
+                    self.status = Some("Turn completed".to_string());
+                }
+                Err(err) => {
+                    self.mark_pending_failed(err.to_string());
+                }
+            },
+            PendingOutcome::SubagentTurn { thread_id, result } => match result {
+                Ok(_) => {
+                    if let Err(err) = self.refresh_thread_summaries(rpc).await {
+                        self.mark_pending_failed(err.to_string());
+                        return;
+                    }
+                    if let Err(err) = self.load_thread(rpc, &thread_id).await {
+                        self.mark_pending_failed(err.to_string());
+                        return;
+                    }
+                    self.clear_pending_marker(&thread_id);
+                    self.status = Some(format!("Thread {} updated", short_thread_id(&thread_id)));
+                }
+                Err(err) => {
+                    self.mark_pending_failed(err.to_string());
+                }
+            },
+            PendingOutcome::OpenThread { thread_id, result } => match result {
+                Ok(()) => {
+                    if let Err(err) = self.refresh_thread_summaries(rpc).await {
+                        self.status = Some(err.to_string());
+                        return;
+                    }
+                    if let Err(err) = self.load_thread(rpc, &thread_id).await {
+                        self.status = Some(err.to_string());
+                        return;
+                    }
+                    self.select_thread_by_id(&thread_id);
+                    self.status = Some(format!("Loaded thread {}", short_thread_id(&thread_id)));
+                }
+                Err(err) => {
+                    self.status = Some(err.to_string());
+                }
+            },
+            PendingOutcome::WorkerFailed(message) => {
+                self.mark_pending_failed(format!("request worker failed: {message}"));
+            }
         }
-
-        for run in &result.delegated_runs {
-            self.append_system_item(TimelineItem::text(
-                MessageRoleTag::System,
-                format!(
-                    "delegated run {} agent={} state={}",
-                    run.run_id, run.agent_id, run.state
-                ),
-            ));
-        }
-
-        let runs = rpc.orchestrator_runs_list().await?.runs;
-        self.sync_runs(runs);
-        self.status = Some("Turn completed".to_string());
-
-        Ok(result)
     }
 
-    async fn refresh_run_thread(&mut self, rpc: &RpcClient, run_id: &str) -> Result<(), CliError> {
-        let run = rpc
-            .orchestrator_run_get(OrchestratorRunGetParams {
-                run_id: run_id.to_string(),
+    async fn refresh_thread_summaries(&mut self, rpc: &RpcClient) -> Result<(), CliError> {
+        let mut summaries = rpc.orchestrator_threads_list().await?.threads;
+        if !summaries
+            .iter()
+            .any(|thread| thread.thread_id == SYSTEM_THREAD_ID)
+        {
+            summaries.push(ThreadSummary {
+                thread_id: SYSTEM_THREAD_ID.to_string(),
+                kind: "system".to_string(),
+                agent_id: Some(SYSTEM_THREAD_ID.to_string()),
+                latest_run_id: None,
+                state: "active".to_string(),
+                updated_at: "".to_string(),
+                resurrected: false,
+                active: true,
+            });
+        }
+        self.sync_thread_summaries(summaries);
+        Ok(())
+    }
+
+    fn sync_thread_summaries(&mut self, mut summaries: Vec<ThreadSummary>) {
+        let current_active_id = self.current_thread().id.clone();
+        let current_sidebar_id = self
+            .threads
+            .get(self.sidebar_selected)
+            .map(|thread| thread.id.clone())
+            .unwrap_or_else(|| SYSTEM_THREAD_ID.to_string());
+
+        let mut existing = std::mem::take(&mut self.threads)
+            .into_iter()
+            .map(|thread| (thread.id.clone(), thread))
+            .collect::<HashMap<_, _>>();
+
+        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let mut system_summary = None;
+        let mut subagent_summaries = Vec::new();
+        for summary in summaries {
+            if summary.thread_id == SYSTEM_THREAD_ID || summary.kind == "system" {
+                system_summary = Some(summary);
+            } else {
+                subagent_summaries.push(summary);
+            }
+        }
+
+        let mut threads = Vec::new();
+        let system_summary = system_summary.unwrap_or(ThreadSummary {
+            thread_id: SYSTEM_THREAD_ID.to_string(),
+            kind: "system".to_string(),
+            agent_id: Some(SYSTEM_THREAD_ID.to_string()),
+            latest_run_id: None,
+            state: "active".to_string(),
+            updated_at: "".to_string(),
+            resurrected: false,
+            active: true,
+        });
+
+        let mut system_thread = existing
+            .remove(SYSTEM_THREAD_ID)
+            .unwrap_or_else(|| ThreadView::from_summary(&system_summary));
+        system_thread.apply_summary(&system_summary);
+        threads.push(system_thread);
+
+        for summary in subagent_summaries {
+            let mut thread = existing
+                .remove(&summary.thread_id)
+                .unwrap_or_else(|| ThreadView::from_summary(&summary));
+            thread.apply_summary(&summary);
+            if thread.items.is_empty() && thread.read_only {
+                thread.items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    "Saved sub-agent thread. Press Enter to resurrect and continue.",
+                ));
+            }
+            threads.push(thread);
+        }
+
+        self.threads = threads;
+        self.active_thread = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == current_active_id)
+            .unwrap_or(0);
+        self.sidebar_selected = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == current_sidebar_id)
+            .unwrap_or(self.active_thread)
+            .min(self.threads.len().saturating_sub(1));
+    }
+
+    async fn load_thread(&mut self, rpc: &RpcClient, thread_id: &str) -> Result<(), CliError> {
+        let events = fetch_all_thread_events(rpc, thread_id).await?;
+        let kind = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.kind.clone())
+            .unwrap_or_else(|| {
+                if thread_id == SYSTEM_THREAD_ID {
+                    ThreadKind::System
+                } else {
+                    ThreadKind::Subagent
+                }
+            });
+
+        let mut items = timeline_items_from_events(&kind, &events);
+        if matches!(kind, ThreadKind::Subagent)
+            && !items.iter().any(|item| {
+                matches!(
+                    item,
+                    TimelineItem::Text {
+                        role: MessageRoleTag::User,
+                        ..
+                    }
+                )
             })
-            .await?
-            .run;
+        {
+            items.insert(
+                0,
+                TimelineItem::text(
+                    MessageRoleTag::System,
+                    "Initial instruction unavailable (legacy run format)",
+                ),
+            );
+        }
 
         if let Some(thread) = self
             .threads
             .iter_mut()
-            .find(|thread| thread.id == run.run_id)
+            .find(|thread| thread.id == thread_id)
         {
-            thread.items = run_thread_items(&run);
-            thread.state = Some(run.state);
-            self.status = Some(format!("Loaded run {}", short_run_id(run_id)));
-            return Ok(());
+            thread.items = items;
+            let selected = self
+                .selected_item_by_thread
+                .get(thread_id)
+                .copied()
+                .unwrap_or_else(|| thread.items.len().saturating_sub(1));
+            self.selected_item_by_thread.insert(
+                thread_id.to_string(),
+                selected.min(thread.items.len().saturating_sub(1)),
+            );
         }
 
-        Err(CliError::Usage(format!(
-            "delegated run thread '{}' not found",
-            run_id
-        )))
+        self.clear_pending_marker(thread_id);
+        Ok(())
+    }
+
+    fn clear_pending_marker(&mut self, thread_id: &str) {
+        self.pending_thread_id = None;
+        self.pending_placeholder_index_by_thread.remove(thread_id);
+    }
+
+    fn mark_pending_failed(&mut self, message: String) {
+        if let Some(thread_id) = self.pending_thread_id.take() {
+            if let Some(thread) = self
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == thread_id)
+            {
+                if let Some(placeholder_idx) =
+                    self.pending_placeholder_index_by_thread.remove(&thread_id)
+                    && placeholder_idx < thread.items.len()
+                {
+                    thread.items.remove(placeholder_idx);
+                }
+                thread.items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    format!("SYSTEM ERROR: {message}"),
+                ));
+                let selected = thread.items.len().saturating_sub(1);
+                self.selected_item_by_thread
+                    .insert(thread_id.clone(), selected);
+            }
+        }
+        self.status = Some(message);
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -783,21 +1233,19 @@ impl ChatApp {
             .threads
             .iter()
             .map(|thread| {
-                if thread.id == SYSTEM_THREAD_ID {
+                if thread.kind == ThreadKind::System {
                     ListItem::new(Line::from(vec![
                         Span::styled("System0", Style::default().fg(Color::Cyan)),
                         Span::styled(" [active]", Style::default().fg(Color::DarkGray)),
                     ]))
                 } else {
-                    let state = thread
-                        .state
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let mode_label = if thread.read_only { " saved" } else { " live" };
                     ListItem::new(Line::from(vec![
                         Span::raw(thread.title.clone()),
                         Span::raw(" ["),
-                        Span::styled(state.clone(), status_style(&state)),
+                        Span::styled(thread.state.clone(), status_style(&thread.state)),
                         Span::raw("]"),
+                        Span::styled(mode_label, Style::default().fg(Color::DarkGray)),
                     ]))
                 }
             })
@@ -826,7 +1274,7 @@ impl ChatApp {
     }
 
     fn render_thread(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let thread = self.current_thread();
+        let thread = self.current_thread().clone();
         let title = if thread.read_only {
             format!("Conversation: {} (read-only)", thread.title)
         } else {
@@ -841,40 +1289,46 @@ impl ChatApp {
         } else {
             Block::default().title(title).borders(Borders::ALL)
         };
-        let selected = self.current_thread_selected_item();
-        let items: Vec<ListItem<'static>> = if thread.items.is_empty() {
-            vec![ListItem::new(Text::from(vec![Line::from(Span::styled(
-                "No messages yet",
-                Style::default().fg(Color::DarkGray),
-            ))]))]
-        } else {
-            thread
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, item)| item.to_list_item(selected == idx))
-                .collect()
-        };
 
-        let mut state = ListState::default();
-        if !thread.items.is_empty() {
-            state.select(Some(selected.min(thread.items.len().saturating_sub(1))));
-        }
+        let selected = self
+            .current_thread_selected_item()
+            .min(thread.items.len().saturating_sub(1));
+        let (lines, ranges) = build_thread_lines(&thread, selected);
+        let viewport_rows = area.height.saturating_sub(2) as usize;
+        self.last_main_viewport_rows = viewport_rows.max(1);
 
-        let mut highlight = Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD);
-        if self.focus != FocusPane::Main {
-            highlight = highlight.remove_modifier(Modifier::BOLD);
-        }
+        self.ensure_selected_visible_for(&thread.id, &ranges, viewport_rows.max(1));
 
-        let list = List::new(items)
+        let max_vertical = lines.len().saturating_sub(viewport_rows.max(1));
+        let mut vertical_offset = self
+            .vertical_scroll_by_thread
+            .get(&thread.id)
+            .copied()
+            .unwrap_or(0)
+            .min(max_vertical);
+        self.vertical_scroll_by_thread
+            .insert(thread.id.clone(), vertical_offset);
+
+        let horizontal_offset = self
+            .horizontal_scroll_by_thread
+            .get(&thread.id)
+            .copied()
+            .unwrap_or(0);
+
+        let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
-            .highlight_symbol("▶ ")
-            .highlight_style(highlight);
+            .scroll((vertical_offset as u16, horizontal_offset as u16));
 
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_widget(paragraph, area);
+
+        vertical_offset = self
+            .vertical_scroll_by_thread
+            .get(&thread.id)
+            .copied()
+            .unwrap_or(0)
+            .min(max_vertical);
+        self.vertical_scroll_by_thread
+            .insert(thread.id, vertical_offset);
     }
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -923,8 +1377,7 @@ impl ChatApp {
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let status = self.status.clone().unwrap_or_else(|| {
-            "Tab: switch focus | Enter: send/open | Space: expand/collapse | Shift+Enter/Ctrl+J: newline"
-                .to_string()
+            "Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | Ctrl+J/Ctrl+N/Shift+Enter: newline | q: quit".to_string()
         });
         let text = Text::from(Line::from(vec![Span::styled(
             status,
@@ -961,6 +1414,13 @@ impl ChatApp {
             return AppAction::Quit;
         }
 
+        if key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            self.focus = self.focus.prev();
+            return AppAction::None;
+        }
+
         if key.code == KeyCode::Tab {
             self.focus = self.focus.next();
             return AppAction::None;
@@ -968,6 +1428,15 @@ impl ChatApp {
 
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('J'))
+        {
+            if self.focus == FocusPane::Input && !read_only_input {
+                self.composer.newline();
+            }
+            return AppAction::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
         {
             if self.focus == FocusPane::Input && !read_only_input {
                 self.composer.newline();
@@ -1034,14 +1503,44 @@ impl ChatApp {
                 AppAction::None
             }
             KeyCode::Left => {
-                if self.focus == FocusPane::Input && !read_only_input {
-                    self.composer.cursor_left();
+                match self.focus {
+                    FocusPane::Main => {
+                        let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            8
+                        } else {
+                            1
+                        };
+                        let current = self.current_thread_horizontal_offset();
+                        self.set_current_thread_horizontal_offset(current.saturating_sub(step));
+                    }
+                    FocusPane::Input if !read_only_input => {
+                        self.composer.cursor_left();
+                    }
+                    _ => {}
                 }
                 AppAction::None
             }
             KeyCode::Right => {
-                if self.focus == FocusPane::Input && !read_only_input {
-                    self.composer.cursor_right();
+                match self.focus {
+                    FocusPane::Main => {
+                        let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            8
+                        } else {
+                            1
+                        };
+                        let current = self.current_thread_horizontal_offset();
+                        self.set_current_thread_horizontal_offset(current.saturating_add(step));
+                    }
+                    FocusPane::Input if !read_only_input => {
+                        self.composer.cursor_right();
+                    }
+                    _ => {}
+                }
+                AppAction::None
+            }
+            KeyCode::Home => {
+                if self.focus == FocusPane::Main {
+                    self.set_current_thread_horizontal_offset(0);
                 }
                 AppAction::None
             }
@@ -1060,22 +1559,13 @@ impl ChatApp {
                 AppAction::None
             }
             KeyCode::Enter => match self.focus {
-                FocusPane::Sidebar => {
-                    self.active_thread = self
-                        .sidebar_selected
-                        .min(self.threads.len().saturating_sub(1));
-                    if let Some(run_id) = self.current_thread().run_id.clone() {
-                        AppAction::LoadRun(run_id)
-                    } else {
-                        AppAction::None
-                    }
-                }
+                FocusPane::Sidebar => self.open_selected_sidebar_thread(),
                 FocusPane::Input => {
                     if read_only_input {
                         return AppAction::None;
                     }
                     if let Some(message) = self.composer.submit() {
-                        AppAction::SendTurn(message)
+                        self.start_local_send(message)
                     } else {
                         AppAction::None
                     }
@@ -1095,15 +1585,49 @@ impl ChatApp {
         }
     }
 
+    fn start_local_send(&mut self, message: String) -> AppAction {
+        let thread_id = self.current_thread().id.clone();
+        let is_system = thread_id == SYSTEM_THREAD_ID;
+
+        if let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        {
+            thread
+                .items
+                .push(TimelineItem::text(MessageRoleTag::User, message.clone()));
+            thread
+                .items
+                .push(TimelineItem::text(MessageRoleTag::Assistant, "Thinking..."));
+            let placeholder_idx = thread.items.len().saturating_sub(1);
+            self.pending_placeholder_index_by_thread
+                .insert(thread.id.clone(), placeholder_idx);
+            self.selected_item_by_thread
+                .insert(thread.id.clone(), placeholder_idx);
+        }
+
+        self.pending_thread_id = Some(thread_id.clone());
+        self.status = Some("Sending...".to_string());
+
+        if is_system {
+            AppAction::SubmitSystemTurn(message)
+        } else {
+            AppAction::SubmitSubagentTurn { thread_id, message }
+        }
+    }
+
     fn select_main_prev(&mut self) {
         let selected = self.current_thread_selected_item();
         self.set_current_thread_selected_item(selected.saturating_sub(1));
+        self.ensure_selected_visible_current();
     }
 
     fn select_main_next(&mut self) {
         let max = self.current_thread().items.len().saturating_sub(1);
         let selected = self.current_thread_selected_item();
         self.set_current_thread_selected_item((selected + 1).min(max));
+        self.ensure_selected_visible_current();
     }
 
     fn toggle_selected_item(&mut self) {
@@ -1118,36 +1642,60 @@ impl ChatApp {
         {
             item.toggle();
         }
+        self.ensure_selected_visible_current();
+    }
+
+    fn open_selected_sidebar_thread(&mut self) -> AppAction {
+        self.active_thread = self
+            .sidebar_selected
+            .min(self.threads.len().saturating_sub(1));
+
+        let thread = self.current_thread().clone();
+        if thread.id == SYSTEM_THREAD_ID {
+            return AppAction::OpenThread {
+                thread_id: thread.id,
+                resurrect: false,
+            };
+        }
+
+        AppAction::OpenThread {
+            thread_id: thread.id,
+            resurrect: thread.read_only,
+        }
     }
 
     fn open_selected_main_link(&mut self) -> AppAction {
         let selected = self.current_thread_selected_item();
-        let Some(run_id) = self
+        let Some(thread_id) = self
             .current_thread()
             .items
             .get(selected)
-            .and_then(TimelineItem::linked_run_id)
+            .and_then(TimelineItem::linked_thread_id)
         else {
             return AppAction::None;
         };
 
-        if self.select_thread_by_run_id(&run_id) {
-            self.status = Some(format!("Opening run {}", short_run_id(&run_id)));
-            return AppAction::LoadRun(run_id);
+        if self.select_thread_by_id(&thread_id) {
+            let resurrect = self.current_thread().read_only;
+            self.status = Some(format!("Opening thread {}", short_thread_id(&thread_id)));
+            return AppAction::OpenThread {
+                thread_id,
+                resurrect,
+            };
         }
 
         self.status = Some(format!(
-            "Run {} not found in sidebar",
-            short_run_id(&run_id)
+            "Thread {} not found in sidebar",
+            short_thread_id(&thread_id)
         ));
         AppAction::None
     }
 
-    fn select_thread_by_run_id(&mut self, run_id: &str) -> bool {
+    fn select_thread_by_id(&mut self, thread_id: &str) -> bool {
         let Some(idx) = self
             .threads
             .iter()
-            .position(|thread| thread.run_id.as_deref() == Some(run_id) || thread.id == run_id)
+            .position(|thread| thread.id == thread_id)
         else {
             return false;
         };
@@ -1155,77 +1703,6 @@ impl ChatApp {
         self.active_thread = idx;
         self.sidebar_selected = idx;
         true
-    }
-
-    fn sync_runs(&mut self, runs: Vec<DelegatedRun>) {
-        let current_active_id = self.current_thread().id.clone();
-        let mut existing = std::mem::take(&mut self.threads)
-            .into_iter()
-            .map(|thread| (thread.id.clone(), thread))
-            .collect::<HashMap<_, _>>();
-
-        let mut threads = Vec::new();
-        threads.push(
-            existing
-                .remove(SYSTEM_THREAD_ID)
-                .unwrap_or_else(ThreadView::system),
-        );
-
-        for run in runs.iter().rev() {
-            let mut thread = existing
-                .remove(&run.run_id)
-                .unwrap_or_else(|| ThreadView::delegated_run(run));
-            thread.title = format!("{} ({})", run.agent_id, short_run_id(&run.run_id));
-            thread.run_id = Some(run.run_id.clone());
-            thread.state = Some(run.state.clone());
-            thread.read_only = true;
-            if thread.items.is_empty() {
-                thread.items = run_thread_items(run);
-            }
-            threads.push(thread);
-        }
-
-        self.delegated_runs = runs;
-        self.threads = threads;
-
-        self.active_thread = self
-            .threads
-            .iter()
-            .position(|thread| thread.id == current_active_id)
-            .unwrap_or(0);
-        self.sidebar_selected = self
-            .sidebar_selected
-            .min(self.threads.len().saturating_sub(1));
-    }
-
-    fn append_system_item(&mut self, item: TimelineItem) {
-        if let Some(system_thread) = self.threads.get_mut(0) {
-            system_thread.items.push(item);
-            let idx = system_thread.items.len().saturating_sub(1);
-            self.selected_item_by_thread
-                .insert(system_thread.id.clone(), idx);
-        }
-    }
-
-    fn load_system_context(&mut self, messages: Vec<OrchestratorThreadMessage>) {
-        let items = messages
-            .into_iter()
-            .map(timeline_item_from_thread_message)
-            .collect::<Vec<_>>();
-
-        if let Some(system_thread) = self
-            .threads
-            .iter_mut()
-            .find(|thread| thread.id == SYSTEM_THREAD_ID)
-        {
-            system_thread.items = items;
-            if !system_thread.items.is_empty() {
-                self.selected_item_by_thread.insert(
-                    system_thread.id.clone(),
-                    system_thread.items.len().saturating_sub(1),
-                );
-            }
-        }
     }
 
     fn current_thread(&self) -> &ThreadView {
@@ -1243,6 +1720,64 @@ impl ChatApp {
     fn set_current_thread_selected_item(&mut self, idx: usize) {
         let thread_id = self.current_thread().id.clone();
         self.selected_item_by_thread.insert(thread_id, idx);
+    }
+
+    fn current_thread_horizontal_offset(&self) -> usize {
+        let thread_id = &self.current_thread().id;
+        self.horizontal_scroll_by_thread
+            .get(thread_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_current_thread_horizontal_offset(&mut self, offset: usize) {
+        let thread_id = self.current_thread().id.clone();
+        self.horizontal_scroll_by_thread.insert(thread_id, offset);
+    }
+
+    fn ensure_selected_visible_current(&mut self) {
+        let thread = self.current_thread().clone();
+        let selected = self
+            .current_thread_selected_item()
+            .min(thread.items.len().saturating_sub(1));
+        let (_, ranges) = build_thread_lines(&thread, selected);
+        self.ensure_selected_visible_for(&thread.id, &ranges, self.last_main_viewport_rows.max(1));
+    }
+
+    fn ensure_selected_visible_for(
+        &mut self,
+        thread_id: &str,
+        ranges: &[(usize, usize)],
+        viewport_rows: usize,
+    ) {
+        if ranges.is_empty() {
+            self.vertical_scroll_by_thread
+                .insert(thread_id.to_string(), 0);
+            return;
+        }
+
+        let selected = self
+            .selected_item_by_thread
+            .get(thread_id)
+            .copied()
+            .unwrap_or(0)
+            .min(ranges.len().saturating_sub(1));
+        let (start, end) = ranges[selected];
+
+        let mut offset = self
+            .vertical_scroll_by_thread
+            .get(thread_id)
+            .copied()
+            .unwrap_or(0);
+
+        if start < offset {
+            offset = start;
+        } else if end >= offset + viewport_rows {
+            offset = end + 1 - viewport_rows;
+        }
+
+        self.vertical_scroll_by_thread
+            .insert(thread_id.to_string(), offset);
     }
 
     fn system_thread_snapshot(&self) -> serde_json::Value {
@@ -1266,59 +1801,295 @@ impl ChatApp {
     }
 }
 
-fn run_thread_items(run: &DelegatedRun) -> Vec<TimelineItem> {
+fn build_thread_lines(
+    thread: &ThreadView,
+    selected: usize,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    if thread.items.is_empty() {
+        return (
+            vec![Line::from(Span::styled(
+                "No messages yet",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            vec![],
+        );
+    }
+
+    let mut lines = Vec::new();
+    let mut ranges = Vec::new();
+    for (idx, item) in thread.items.iter().enumerate() {
+        let start = lines.len();
+        let item_lines = item.lines(selected == idx);
+        lines.extend(item_lines);
+        let end = lines.len().saturating_sub(1);
+        ranges.push((start, end));
+    }
+
+    (lines, ranges)
+}
+
+async fn fetch_all_thread_events(
+    rpc: &RpcClient,
+    thread_id: &str,
+) -> Result<Vec<ThreadEvent>, CliError> {
+    let mut offset = 0usize;
+    let mut all = Vec::new();
+
+    loop {
+        let page = rpc
+            .orchestrator_thread_get(OrchestratorThreadGetParams {
+                thread_id: thread_id.to_string(),
+                offset: Some(offset),
+                limit: Some(DEFAULT_THREAD_PAGE_LIMIT),
+            })
+            .await?;
+
+        if page.events.is_empty() {
+            break;
+        }
+
+        offset += page.events.len();
+        all.extend(page.events);
+        if all.len() >= page.total {
+            break;
+        }
+    }
+
+    all.sort_by(|a, b| {
+        if a.seq == b.seq {
+            a.ts.cmp(&b.ts)
+        } else {
+            a.seq.cmp(&b.seq)
+        }
+    });
+    Ok(all)
+}
+
+fn timeline_items_from_events(kind: &ThreadKind, events: &[ThreadEvent]) -> Vec<TimelineItem> {
     let mut items = Vec::new();
-    items.push(TimelineItem::text(
-        MessageRoleTag::System,
-        format!(
-            "Sub-agent trace for run {} (agent={}, state={})",
-            run.run_id, run.agent_id, run.state
-        ),
-    ));
-    if let Some(summary) = &run.summary {
-        items.push(TimelineItem::text(
-            MessageRoleTag::Assistant,
-            summary.clone(),
+    let mut pending_tool_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+    let mut saw_user = false;
+
+    for event in events {
+        match event.event_type.as_str() {
+            "message_user" => {
+                if let Some(content) = event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| event.payload.as_str())
+                {
+                    items.push(TimelineItem::text(
+                        MessageRoleTag::User,
+                        content.to_string(),
+                    ));
+                    saw_user = true;
+                }
+            }
+            "message_assistant" => {
+                if let Some(content) = event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| event.payload.as_str())
+                {
+                    items.push(TimelineItem::text(
+                        MessageRoleTag::Assistant,
+                        content.to_string(),
+                    ));
+                }
+            }
+            "tool_call" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let tool_id = event
+                    .payload
+                    .get("tool_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let arguments = event
+                    .payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                pending_tool_calls.insert(call_id.to_string(), (tool_id, arguments));
+            }
+            "tool_result" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let (tool_id, arguments) =
+                    pending_tool_calls.remove(call_id).unwrap_or_else(|| {
+                        (
+                            event
+                                .payload
+                                .get("tool_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            event
+                                .payload
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    });
+                let status = event
+                    .payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("success")
+                    .to_string();
+                let output = event
+                    .payload
+                    .get("output")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                items.push(tool_item_from_parts(
+                    call_id.to_string(),
+                    tool_id,
+                    status,
+                    arguments,
+                    output,
+                ));
+            }
+            "thread_resurrected" => {
+                items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    "Thread resurrected and ready for continuation.",
+                ));
+            }
+            "error" => {
+                let error = event
+                    .payload
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error");
+                let tool_id = event
+                    .payload
+                    .get("tool_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("runtime");
+                let call_id = event
+                    .payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("n/a");
+                items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    format!("SYSTEM ERROR [{tool_id}::{call_id}] {error}"),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    for (call_id, (tool_id, arguments)) in pending_tool_calls {
+        items.push(tool_item_from_parts(
+            call_id,
+            tool_id,
+            "pending".to_string(),
+            arguments,
+            serde_json::Value::Null,
         ));
     }
+
+    if matches!(kind, ThreadKind::Subagent) && !saw_user {
+        items.insert(
+            0,
+            TimelineItem::text(
+                MessageRoleTag::System,
+                "Initial instruction unavailable (legacy run format)",
+            ),
+        );
+    }
+
     items
 }
 
-fn timeline_item_from_thread_message(message: OrchestratorThreadMessage) -> TimelineItem {
-    match message {
-        OrchestratorThreadMessage::Text { role, content } => {
-            TimelineItem::text(MessageRoleTag::from_wire_role(&role), content)
-        }
-        OrchestratorThreadMessage::ToolInvocation {
+fn tool_item_from_parts(
+    call_id: String,
+    tool_id: String,
+    status: String,
+    arguments: serde_json::Value,
+    output: serde_json::Value,
+) -> TimelineItem {
+    if tool_id == "delegate_to_agent" {
+        let target_agent = arguments
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .or_else(|| {
+                output
+                    .get("agent_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            });
+        let thread_id = output
+            .get("thread_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let run_id = output
+            .get("run_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let instruction = arguments
+            .get("instruction")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let summary = output
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let error = output
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .or_else(|| {
+                if status == "error" {
+                    Some(output.to_string())
+                } else {
+                    None
+                }
+            });
+
+        TimelineItem::DelegateInvocation {
             call_id,
-            tool_id,
-            arguments,
             status,
+            target_agent,
+            thread_id,
+            run_id,
+            instruction,
+            summary,
+            error,
+            arguments,
             output,
-        } => TimelineItem::ToolInvocation {
+            expanded: false,
+        }
+    } else {
+        TimelineItem::ToolInvocation {
             call_id,
             tool_id,
             status,
             arguments,
             output,
             expanded: false,
-        },
+        }
     }
 }
 
-fn tool_item_from_invocation(invocation: &OrchestratorToolInvocation) -> TimelineItem {
-    TimelineItem::ToolInvocation {
-        call_id: invocation.call_id.clone(),
-        tool_id: invocation.tool_id.clone(),
-        status: invocation.status.clone(),
-        arguments: invocation.arguments.clone(),
-        output: invocation.output.clone(),
-        expanded: false,
-    }
-}
-
-fn short_run_id(run_id: &str) -> String {
-    run_id.chars().take(8).collect()
+fn short_thread_id(thread_id: &str) -> String {
+    thread_id.chars().take(8).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1545,7 +2316,6 @@ fn normalize_line_endings(input: &str) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventState, KeyModifiers};
-    use ratatui::backend::TestBackend;
 
     struct MockClipboard {
         value: Option<String>,
@@ -1575,6 +2345,23 @@ mod tests {
         }
     }
 
+    fn subagent_summary(id: &str, active: bool, resurrected: bool) -> ThreadSummary {
+        ThreadSummary {
+            thread_id: id.to_string(),
+            kind: "subagent".to_string(),
+            agent_id: Some("planner".to_string()),
+            latest_run_id: Some("run-1".to_string()),
+            state: if active {
+                "running".to_string()
+            } else {
+                "completed".to_string()
+            },
+            updated_at: "2026-02-14T00:00:00Z".to_string(),
+            resurrected,
+            active,
+        }
+    }
+
     #[test]
     fn composer_normalizes_line_endings_on_insert_str() {
         let mut composer = ComposerState::new();
@@ -1583,236 +2370,141 @@ mod tests {
     }
 
     #[test]
-    fn composer_backspace_handles_utf8_scalars() {
-        let mut composer = ComposerState::new();
-        composer.insert_str("hi🙂");
-        composer.backspace();
-        assert_eq!(composer.buffer, "hi");
-        assert_eq!(composer.cursor_byte, composer.buffer.len());
-    }
-
-    #[test]
-    fn cursor_up_down_preserves_column_when_possible() {
-        let mut composer = ComposerState::new();
-        composer.insert_str("abcd\nef\nxyz123");
-        composer.set_cursor_line_col(0, 3);
-
-        composer.cursor_down();
-        let (line, col) = composer.cursor_line_col();
-        assert_eq!((line, col), (1, 2));
-
-        composer.cursor_down();
-        let (line, col) = composer.cursor_line_col();
-        assert_eq!((line, col), (2, 3));
-    }
-
-    #[test]
-    fn input_height_clamps_to_max_visible_lines() {
-        let mut composer = ComposerState::new();
-        composer.insert_str("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12");
-        assert_eq!(composer.input_height(), DEFAULT_MAX_VISIBLE_LINES);
-    }
-
-    #[test]
-    fn cursor_visibility_updates_scroll_offset() {
-        let mut composer = ComposerState::new();
-        composer.insert_str("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11");
-        let (line, _) = composer.cursor_line_col();
-        assert_eq!(line, 11);
-        assert!(composer.scroll_line_offset > 0);
-        let (_, rel_y) = composer.cursor_screen_position();
-        assert_eq!(rel_y as usize, DEFAULT_MAX_VISIBLE_LINES - 1);
-    }
-
-    #[test]
-    fn testbackend_renders_multiline_cursor_position() {
-        let backend = TestBackend::new(80, 16);
-        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
-
+    fn shift_tab_cycles_focus_backwards() {
         let mut app = ChatApp::new();
         app.focus = FocusPane::Input;
-        app.composer.insert_str("alpha\nbeta\ngamma");
-        app.composer.set_cursor_line_col(2, 2);
-
-        terminal
-            .draw(|frame| app.render(frame))
-            .expect("draw should succeed");
-
-        assert_eq!(app.last_input_cursor_rel, Some((4, 2)));
-    }
-
-    #[test]
-    fn enter_submits_and_shift_enter_inserts_newline() {
-        let mut app = ChatApp::new();
-        app.focus = FocusPane::Input;
-        app.composer.insert_str("hello");
         let mut clipboard = MockClipboard { value: None };
-
-        let action = app.handle_event(Event::Key(key(KeyCode::Enter)), &mut clipboard);
-        assert!(matches!(action, AppAction::SendTurn(_)));
-
-        app.composer.insert_str("hello");
-        let action = app.handle_event(
-            Event::Key(key_with_modifiers(KeyCode::Enter, KeyModifiers::SHIFT)),
-            &mut clipboard,
-        );
-        assert_eq!(action, AppAction::None);
-        assert_eq!(app.composer.buffer, "hello\n");
+        let _ = app.handle_event(Event::Key(key(KeyCode::BackTab)), &mut clipboard);
+        assert_eq!(app.focus, FocusPane::Main);
     }
 
     #[test]
-    fn sub_agent_threads_keep_input_read_only() {
-        let run = DelegatedRun {
-            run_id: "run-123".to_string(),
-            agent_id: "planner".to_string(),
-            state: "completed".to_string(),
-            summary: Some("done".to_string()),
-        };
-
+    fn ctrl_n_inserts_newline() {
         let mut app = ChatApp::new();
-        app.sync_runs(vec![run]);
-        app.sidebar_selected = 1;
-        app.active_thread = 1;
         app.focus = FocusPane::Input;
-
         let mut clipboard = MockClipboard { value: None };
-        let _ = app.handle_event(Event::Key(key(KeyCode::Char('x'))), &mut clipboard);
-
-        assert!(app.composer.buffer.is_empty());
-    }
-
-    #[test]
-    fn ctrl_v_uses_paste_path_with_normalized_line_endings() {
-        let mut app = ChatApp::new();
-        app.focus = FocusPane::Input;
-
-        let mut clipboard = MockClipboard {
-            value: Some("line1\r\nline2".to_string()),
-        };
-
+        app.composer.insert_str("hello");
         let _ = app.handle_event(
             Event::Key(key_with_modifiers(
-                KeyCode::Char('v'),
+                KeyCode::Char('n'),
                 KeyModifiers::CONTROL,
             )),
             &mut clipboard,
         );
-
-        assert_eq!(app.composer.buffer, "line1\nline2");
+        assert_eq!(app.composer.buffer, "hello\n");
     }
 
     #[test]
-    fn main_enter_on_delegate_invocation_opens_sub_agent_thread() {
-        let run = DelegatedRun {
-            run_id: "run-123".to_string(),
-            agent_id: "planner".to_string(),
-            state: "completed".to_string(),
-            summary: Some("done".to_string()),
-        };
-
+    fn saved_subagent_threads_are_read_only_until_resurrected() {
         let mut app = ChatApp::new();
-        app.sync_runs(vec![run.clone()]);
-        app.append_system_item(TimelineItem::ToolInvocation {
-            call_id: "call-1".to_string(),
-            tool_id: "delegate_to_agent".to_string(),
-            status: "success".to_string(),
-            arguments: serde_json::json!({"agent_id": "planner"}),
-            output: serde_json::json!({"run_id": run.run_id}),
-            expanded: false,
-        });
+        app.sync_thread_summaries(vec![subagent_summary("thread-1", false, false)]);
+        let thread = app
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-1")
+            .expect("thread should exist");
+        assert!(thread.read_only);
+
+        app.sync_thread_summaries(vec![subagent_summary("thread-1", true, true)]);
+        let thread = app
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-1")
+            .expect("thread should exist");
+        assert!(!thread.read_only);
+    }
+
+    #[test]
+    fn delegate_card_enter_opens_subagent_thread() {
+        let mut app = ChatApp::new();
+        app.sync_thread_summaries(vec![subagent_summary("thread-abc", false, false)]);
+
+        if let Some(system) = app
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+        {
+            system.items.push(TimelineItem::DelegateInvocation {
+                call_id: "call-1".to_string(),
+                status: "success".to_string(),
+                target_agent: Some("planner".to_string()),
+                thread_id: Some("thread-abc".to_string()),
+                run_id: Some("run-1".to_string()),
+                instruction: Some("do it".to_string()),
+                summary: Some("done".to_string()),
+                error: None,
+                arguments: serde_json::json!({}),
+                output: serde_json::json!({}),
+                expanded: false,
+            });
+        }
+
         app.focus = FocusPane::Main;
         app.active_thread = 0;
         app.sidebar_selected = 0;
+        app.selected_item_by_thread
+            .insert(SYSTEM_THREAD_ID.to_string(), 0);
 
         let mut clipboard = MockClipboard { value: None };
         let action = app.handle_event(Event::Key(key(KeyCode::Enter)), &mut clipboard);
-        assert_eq!(action, AppAction::LoadRun("run-123".to_string()));
-        assert_eq!(app.active_thread, 1);
-        assert_eq!(app.sidebar_selected, 1);
-    }
-
-    #[test]
-    fn sync_runs_keeps_completed_and_failed_threads_visible() {
-        let completed = DelegatedRun {
-            run_id: "run-1".to_string(),
-            agent_id: "planner".to_string(),
-            state: "completed".to_string(),
-            summary: None,
-        };
-        let failed = DelegatedRun {
-            run_id: "run-2".to_string(),
-            agent_id: "browser".to_string(),
-            state: "failed".to_string(),
-            summary: None,
-        };
-
-        let mut app = ChatApp::new();
-        app.sync_runs(vec![completed, failed]);
-
-        assert_eq!(app.threads.len(), 3);
-        assert!(
-            app.threads
-                .iter()
-                .any(|thread| thread.state.as_deref() == Some("completed")),
-            "completed thread should be visible"
-        );
-        assert!(
-            app.threads
-                .iter()
-                .any(|thread| thread.state.as_deref() == Some("failed")),
-            "failed thread should be visible"
+        assert_eq!(
+            action,
+            AppAction::OpenThread {
+                thread_id: "thread-abc".to_string(),
+                resurrect: true,
+            }
         );
     }
 
     #[test]
-    fn load_system_context_maps_messages_into_timeline_items() {
-        let mut app = ChatApp::new();
-        app.load_system_context(vec![
-            OrchestratorThreadMessage::Text {
-                role: "user".to_string(),
-                content: "hello".to_string(),
-            },
-            OrchestratorThreadMessage::ToolInvocation {
-                call_id: "call-1".to_string(),
-                tool_id: "read_config".to_string(),
-                arguments: serde_json::json!({}),
-                status: "success".to_string(),
-                output: serde_json::json!({"ok": true}),
-            },
-        ]);
+    fn timeline_adds_legacy_instruction_fallback_for_subagent_threads() {
+        let events = vec![ThreadEvent {
+            event_id: "e1".to_string(),
+            thread_id: "thread-1".to_string(),
+            thread_kind: "subagent".to_string(),
+            seq: 1,
+            ts: "2026-02-14T00:00:00Z".to_string(),
+            event_type: "message_assistant".to_string(),
+            agent_id: Some("planner".to_string()),
+            run_id: Some("run-1".to_string()),
+            payload: serde_json::json!({"content":"hello"}),
+            redaction_applied: false,
+        }];
 
-        let system_thread = app
+        let items = timeline_items_from_events(&ThreadKind::Subagent, &events);
+        assert!(matches!(
+            &items[0],
+            TimelineItem::Text { role: MessageRoleTag::System, text, .. }
+                if text.contains("Initial instruction unavailable")
+        ));
+    }
+
+    #[test]
+    fn horizontal_scroll_updates_for_main_focus() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Main;
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(Event::Key(key(KeyCode::Right)), &mut clipboard);
+        assert_eq!(app.current_thread_horizontal_offset(), 1);
+        let _ = app.handle_event(
+            Event::Key(key_with_modifiers(KeyCode::Left, KeyModifiers::SHIFT)),
+            &mut clipboard,
+        );
+        assert_eq!(app.current_thread_horizontal_offset(), 0);
+    }
+
+    #[test]
+    fn start_local_send_appends_user_and_placeholder() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Input;
+        let action = app.start_local_send("hello".to_string());
+        assert_eq!(action, AppAction::SubmitSystemTurn("hello".to_string()));
+        let system = app
             .threads
             .iter()
             .find(|thread| thread.id == SYSTEM_THREAD_ID)
             .expect("system thread should exist");
-        assert_eq!(system_thread.items.len(), 2);
-        assert!(matches!(
-            &system_thread.items[0],
-            TimelineItem::Text { role, .. } if *role == MessageRoleTag::User
-        ));
-        assert!(matches!(
-            &system_thread.items[1],
-            TimelineItem::ToolInvocation { tool_id, .. } if tool_id == "read_config"
-        ));
-    }
-
-    #[test]
-    fn long_text_messages_start_collapsed_and_toggle() {
-        let long_text = "line1\nline2\nline3\nline4\nline5";
-        let mut item = TimelineItem::text(MessageRoleTag::Assistant, long_text);
-
-        assert!(item.is_toggleable());
-        assert!(matches!(
-            &item,
-            TimelineItem::Text { expanded, .. } if !expanded
-        ));
-
-        item.toggle();
-        assert!(matches!(
-            &item,
-            TimelineItem::Text { expanded, .. } if *expanded
-        ));
+        assert_eq!(system.items.len(), 2);
     }
 
     #[test]

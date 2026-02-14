@@ -166,12 +166,32 @@ pub enum OrchestratorCommand {
         #[command(subcommand)]
         command: OrchestratorRunsCommand,
     },
+    Threads {
+        #[command(subcommand)]
+        command: OrchestratorThreadsCommand,
+    },
+    Subagent {
+        #[command(subcommand)]
+        command: OrchestratorSubagentCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorRunsCommand {
     List,
     Get(OrchestratorRunGetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorThreadsCommand {
+    List,
+    Get(OrchestratorThreadGetArgs),
+    Resurrect(OrchestratorThreadResurrectArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorSubagentCommand {
+    Turn(OrchestratorSubagentTurnArgs),
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +207,30 @@ pub struct OrchestratorChatArgs {}
 pub struct OrchestratorRunGetArgs {
     /// Delegated run id returned by `orchestrator turn`.
     pub run_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorThreadGetArgs {
+    pub thread_id: String,
+
+    #[arg(long)]
+    pub offset: Option<usize>,
+
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorThreadResurrectArgs {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorSubagentTurnArgs {
+    #[arg(long)]
+    pub thread_id: String,
+
+    pub message: String,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -354,6 +398,56 @@ mod tests {
             } => match command {
                 OrchestratorRunsCommand::List => {}
                 other => panic!("unexpected runs command parsed: {other:?}"),
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_threads_resurrect_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "threads",
+            "resurrect",
+            "thread-123",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Threads { command },
+            } => match command {
+                OrchestratorThreadsCommand::Resurrect(args) => {
+                    assert_eq!(args.thread_id, "thread-123")
+                }
+                other => panic!("unexpected threads command parsed: {other:?}"),
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_subagent_turn_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "subagent",
+            "turn",
+            "--thread-id",
+            "thread-123",
+            "continue from here",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Subagent { command },
+            } => match command {
+                OrchestratorSubagentCommand::Turn(args) => {
+                    assert_eq!(args.thread_id, "thread-123");
+                    assert_eq!(args.message, "continue from here");
+                }
             },
             other => panic!("unexpected command parsed: {other:?}"),
         }
