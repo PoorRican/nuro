@@ -196,7 +196,8 @@ impl MessageRuntime {
         let config_snapshot = serde_json::to_value(config)
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
-        let system0_broker = System0ToolBroker::new(subagents, config_snapshot, &allowlisted_system0_tools);
+        let system0_broker =
+            System0ToolBroker::new(subagents, config_snapshot, &allowlisted_system0_tools);
         let runtime_broker = system0_broker.clone();
 
         let orchestrator_prompt_path = resolve_path(
@@ -564,8 +565,8 @@ impl ToolBroker for System0ToolBroker {
                 let result = ToolResult {
                     call_id: call.id.clone(),
                     output: ToolOutput::Success(serde_json::json!({
-                    "agents": inner.subagents.keys().cloned().collect::<Vec<_>>()
-                })),
+                        "agents": inner.subagents.keys().cloned().collect::<Vec<_>>()
+                    })),
                 };
                 Self::record_invocation(&mut inner, turn_id, &call, &result.output);
                 Ok(result)
@@ -596,9 +597,9 @@ impl ToolBroker for System0ToolBroker {
                     .and_then(|value| value.as_str())
                 else {
                     let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
-                            tool_id: "modify_skill".to_string(),
-                            message: "missing 'skill_id'".to_string(),
-                        });
+                        tool_id: "modify_skill".to_string(),
+                        message: "missing 'skill_id'".to_string(),
+                    });
                     Self::record_invocation_err(&mut inner, turn_id, &call, &err);
                     return Err(err);
                 };
@@ -620,9 +621,9 @@ impl ToolBroker for System0ToolBroker {
                     .and_then(|value| value.as_str())
                 else {
                     let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
-                            tool_id: "delegate_to_agent".to_string(),
-                            message: "missing 'agent_id'".to_string(),
-                        });
+                        tool_id: "delegate_to_agent".to_string(),
+                        message: "missing 'agent_id'".to_string(),
+                    });
                     Self::record_invocation_err(&mut inner, turn_id, &call, &err);
                     return Err(err);
                 };
@@ -634,9 +635,9 @@ impl ToolBroker for System0ToolBroker {
                     .and_then(|value| value.as_str())
                 else {
                     let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
-                            tool_id: "delegate_to_agent".to_string(),
-                            message: "missing 'instruction'".to_string(),
-                        });
+                        tool_id: "delegate_to_agent".to_string(),
+                        message: "missing 'instruction'".to_string(),
+                    });
                     Self::record_invocation_err(&mut inner, turn_id, &call, &err);
                     return Err(err);
                 };
@@ -765,7 +766,10 @@ fn effective_system0_tool_allowlist(configured: &[String]) -> Vec<String> {
 fn load_system_prompt_file(path: &Path) -> Result<String, MessageRuntimeError> {
     validate_markdown_prompt_file(path).map_err(map_xdg_err)?;
     fs::read_to_string(path).map_err(|err| {
-        MessageRuntimeError::Config(format!("failed to read system prompt '{}': {err}", path.display()))
+        MessageRuntimeError::Config(format!(
+            "failed to read system prompt '{}': {err}",
+            path.display()
+        ))
     })
 }
 
@@ -906,8 +910,9 @@ impl LlmClient for TwoStepMockLlmClient {
 
 fn mock_delegate_call(messages: &[rig::completion::Message]) -> ToolCall {
     let user_text = mock_last_user_text(messages).to_ascii_lowercase();
-    let is_finance_request =
-        user_text.contains("finance") || user_text.contains("bill") || user_text.contains("account");
+    let is_finance_request = user_text.contains("finance")
+        || user_text.contains("bill")
+        || user_text.contains("account");
 
     if is_finance_request {
         ToolCall {
@@ -935,11 +940,12 @@ fn mock_last_user_text(messages: &[rig::completion::Message]) -> String {
         .iter()
         .rev()
         .find_map(|msg| match msg {
-            rig::completion::Message::User { content } => content.iter().find_map(|part| match part
-            {
-                rig::message::UserContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
+            rig::completion::Message::User { content } => {
+                content.iter().find_map(|part| match part {
+                    rig::message::UserContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+            }
             _ => None,
         })
         .unwrap_or_default()
@@ -1144,7 +1150,7 @@ impl ToolBroker for SkillToolBroker {
         tracing::info!(
             agent_id = %ctx.agent_id,
             task_id = %ctx.task_id,
-            tool_id = %call.tool_id,
+            tool_id = %requested_tool_id,
             call_id = %call.id,
             "skill_tool_started"
         );
@@ -1159,6 +1165,10 @@ impl ToolBroker for SkillToolBroker {
             tracing::warn!(
                 agent_id = %ctx.agent_id,
                 task_id = %ctx.task_id,
+                requested_tool_id = %requested_tool_id,
+                canonical_tool_id = %canonical_tool_id,
+                "skill_tool_alias_used"
+            );
         }
 
         let Some(tool) = self.tools.get(&canonical_tool_id) else {
@@ -1173,7 +1183,7 @@ impl ToolBroker for SkillToolBroker {
                 .map_err(map_tool_err(&canonical_tool_id))?;
             let content = fs::read_to_string(&path).map_err(|err| {
                 NeuromancerError::Tool(ToolError::ExecutionFailed {
-                    tool_id: call.tool_id.clone(),
+                    tool_id: canonical_tool_id.clone(),
                     message: err.to_string(),
                 })
             })?;
@@ -1189,7 +1199,7 @@ impl ToolBroker for SkillToolBroker {
                 .map_err(map_tool_err(&canonical_tool_id))?;
             let content = fs::read_to_string(&path).map_err(|err| {
                 NeuromancerError::Tool(ToolError::ExecutionFailed {
-                    tool_id: call.tool_id.clone(),
+                    tool_id: canonical_tool_id.clone(),
                     message: err.to_string(),
                 })
             })?;
@@ -1208,7 +1218,7 @@ impl ToolBroker for SkillToolBroker {
 
         let script_result = if let Some(relative_script_path) = tool.script_path.as_deref() {
             let script_path = resolve_skill_script_path(&tool.skill_root, relative_script_path)
-                .map_err(map_tool_err(&call.tool_id))?;
+                .map_err(map_tool_err(&canonical_tool_id))?;
 
             let payload = serde_json::json!({
                 "local_root": self.local_root.display().to_string(),
@@ -1227,10 +1237,10 @@ impl ToolBroker for SkillToolBroker {
                     tool.script_timeout,
                     &ctx.agent_id,
                     &ctx.task_id.to_string(),
-                    &call.tool_id,
+                    &canonical_tool_id,
                 )
                 .await
-                .map_err(map_tool_err(&call.tool_id))?,
+                .map_err(map_tool_err(&canonical_tool_id))?,
             )
         } else {
             None
@@ -1239,7 +1249,8 @@ impl ToolBroker for SkillToolBroker {
         tracing::info!(
             agent_id = %ctx.agent_id,
             task_id = %ctx.task_id,
-            tool_id = %call.tool_id,
+            tool_id = %requested_tool_id,
+            skill_id = %canonical_tool_id,
             call_id = %call.id,
             duration_ms = started_at.elapsed().as_millis(),
             "skill_tool_finished"
@@ -1422,7 +1433,10 @@ async fn run_skill_script(
     );
 
     let stdin_payload = serde_json::to_vec(payload).map_err(|err| {
-        script_runtime_error("io_error", format!("failed to encode script input payload: {err}"))
+        script_runtime_error(
+            "io_error",
+            format!("failed to encode script input payload: {err}"),
+        )
     })?;
 
     let mut child = TokioCommand::new("python3")
@@ -1445,7 +1459,10 @@ async fn run_skill_script(
     let mut stdin = child.stdin.take().ok_or_else(|| {
         script_runtime_error(
             "io_error",
-            format!("script stdin is unavailable for '{}'", script_path.display()),
+            format!(
+                "script stdin is unavailable for '{}'",
+                script_path.display()
+            ),
         )
     })?;
     stdin.write_all(&stdin_payload).await.map_err(|err| {
@@ -1462,13 +1479,19 @@ async fn run_skill_script(
     let mut stdout = child.stdout.take().ok_or_else(|| {
         script_runtime_error(
             "io_error",
-            format!("script stdout is unavailable for '{}'", script_path.display()),
+            format!(
+                "script stdout is unavailable for '{}'",
+                script_path.display()
+            ),
         )
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
         script_runtime_error(
             "io_error",
-            format!("script stderr is unavailable for '{}'", script_path.display()),
+            format!(
+                "script stderr is unavailable for '{}'",
+                script_path.display()
+            ),
         )
     })?;
 
@@ -1485,7 +1508,10 @@ async fn run_skill_script(
         Ok(result) => result.map_err(|err| {
             script_runtime_error(
                 "io_error",
-                format!("failed waiting for script '{}': {err}", script_path.display()),
+                format!(
+                    "failed waiting for script '{}': {err}",
+                    script_path.display()
+                ),
             )
         })?,
         Err(_) => {
@@ -1516,7 +1542,10 @@ async fn run_skill_script(
         .map_err(|err| {
             script_runtime_error(
                 "io_error",
-                format!("failed reading script stdout '{}': {err}", script_path.display()),
+                format!(
+                    "failed reading script stdout '{}': {err}",
+                    script_path.display()
+                ),
             )
         })?;
     let stderr_bytes = stderr_task
@@ -1533,7 +1562,10 @@ async fn run_skill_script(
         .map_err(|err| {
             script_runtime_error(
                 "io_error",
-                format!("failed reading script stderr '{}': {err}", script_path.display()),
+                format!(
+                    "failed reading script stderr '{}': {err}",
+                    script_path.display()
+                ),
             )
         })?;
 
@@ -1553,7 +1585,10 @@ async fn run_skill_script(
     let stdout = String::from_utf8(stdout_bytes).map_err(|err| {
         script_runtime_error(
             "invalid_json",
-            format!("script '{}' emitted non-utf8 stdout: {err}", script_path.display()),
+            format!(
+                "script '{}' emitted non-utf8 stdout: {err}",
+                script_path.display()
+            ),
         )
     })?;
     let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|err| {

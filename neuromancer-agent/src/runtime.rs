@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
-use neuromancer_core::error::{AgentError, NeuromancerError};
+use neuromancer_core::error::{AgentError, LlmError, NeuromancerError};
 use neuromancer_core::task::{
     Artifact, ArtifactKind, Checkpoint, Task, TaskOutput, TaskState, TokenUsage,
 };
@@ -641,6 +641,48 @@ mod tests {
         }
     }
 
+    enum SequenceItem {
+        Response(LlmResponse),
+        Error(NeuromancerError),
+    }
+
+    struct SequenceLlmClient {
+        items: std::sync::Mutex<Vec<SequenceItem>>,
+    }
+
+    impl SequenceLlmClient {
+        fn new(items: Vec<SequenceItem>) -> Self {
+            Self {
+                items: std::sync::Mutex::new(items),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for SequenceLlmClient {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _messages: Vec<rig::completion::Message>,
+            _tool_definitions: Vec<rig::completion::ToolDefinition>,
+        ) -> Result<LlmResponse, NeuromancerError> {
+            let mut items = self.items.lock().expect("sequence lock");
+            if items.is_empty() {
+                return Ok(LlmResponse {
+                    text: Some("sequence empty".into()),
+                    tool_calls: vec![],
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                });
+            }
+
+            match items.remove(0) {
+                SequenceItem::Response(response) => Ok(response),
+                SequenceItem::Error(err) => Err(err),
+            }
+        }
+    }
+
     fn test_config() -> AgentConfig {
         AgentConfig {
             id: "test-agent".into(),
@@ -652,6 +694,14 @@ mod tests {
             system_prompt: "You are a test agent.".into(),
             max_iterations: 5,
         }
+    }
+
+    fn invalid_tool_call_error(tool_name: &str) -> NeuromancerError {
+        NeuromancerError::Llm(LlmError::InvalidResponse {
+            reason: format!(
+                "Tool call validation failed: attempted to call tool '{tool_name}' which was not in request.tools"
+            ),
+        })
     }
 
     #[tokio::test]
