@@ -13,6 +13,8 @@ use crossterm::terminal::{
 };
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorRunGetParams, OrchestratorToolInvocation, OrchestratorTurnResult,
+    DelegatedRun, OrchestratorRunGetParams, OrchestratorThreadMessage, OrchestratorToolInvocation,
+    OrchestratorTurnResult,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -27,6 +29,8 @@ use crate::rpc_client::RpcClient;
 const SYSTEM_THREAD_ID: &str = "system0";
 const DEFAULT_MAX_VISIBLE_LINES: usize = 10;
 const INPUT_PREFIX: &str = "> ";
+const TEXT_COLLAPSE_LINE_THRESHOLD: usize = 4;
+const TEXT_COLLAPSE_CHAR_THRESHOLD: usize = 280;
 
 pub async fn run_orchestrator_chat(rpc: &RpcClient, json_mode: bool) -> Result<(), CliError> {
     if json_mode {
@@ -308,6 +312,22 @@ impl MessageRoleTag {
             Self::Assistant => "ASSISTANT",
         }
     }
+
+    fn from_wire_role(role: &str) -> Self {
+        match role {
+            "system" => Self::System,
+            "user" => Self::User,
+            _ => Self::Assistant,
+        }
+    }
+
+    fn badge_style(self) -> Style {
+        match self {
+            Self::System => Style::default().fg(Color::Cyan),
+            Self::User => Style::default().fg(Color::Green),
+            Self::Assistant => Style::default().fg(Color::Blue),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +335,7 @@ enum TimelineItem {
     Text {
         role: MessageRoleTag,
         text: String,
+        expanded: bool,
     },
     ToolInvocation {
         call_id: String,
@@ -327,20 +348,66 @@ enum TimelineItem {
 }
 
 impl TimelineItem {
+    fn text(role: MessageRoleTag, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let expanded = !text_is_collapsible(&text);
+        Self::Text {
+            role,
+            text,
+            expanded,
+        }
+    }
+
     fn to_list_item(&self, selected: bool) -> ListItem<'static> {
         let style = if selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
+                .fg(Color::White)
+                .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
 
         match self {
-            TimelineItem::Text { role, text } => {
-                let content = format!("[{}] {}", role.label(), text);
-                ListItem::new(Text::from(content)).style(style)
+            TimelineItem::Text {
+                role,
+                text,
+                expanded,
+            } => {
+                let mut lines = Vec::new();
+                let role_prefix = Span::styled(
+                    format!("[{}] ", role.label()),
+                    role.badge_style().add_modifier(Modifier::BOLD),
+                );
+
+                let full_lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
+                let preview_lines = text_preview_lines(text, 3, 220);
+                let source = if *expanded || !text_is_collapsible(text) {
+                    &full_lines
+                } else {
+                    &preview_lines
+                };
+                let mut iter = source.iter();
+                let first = iter.next().cloned().unwrap_or_default();
+                lines.push(Line::from(vec![role_prefix, Span::raw(first)]));
+                for line in iter {
+                    lines.push(Line::from(format!("           {line}")));
+                }
+
+                if text_is_collapsible(text) {
+                    let hint = if *expanded {
+                        "           [expanded] Space to collapse"
+                    } else {
+                        "           [collapsed] Space to expand"
+                    };
+                    lines.push(Line::from(Span::styled(
+                        hint,
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::raw(""));
+
+                ListItem::new(Text::from(lines)).style(style)
             }
             TimelineItem::ToolInvocation {
                 call_id,
@@ -351,25 +418,51 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
+                let mut header = vec![
+                    Span::styled(
+                        "[TOOL] ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(tool_id.clone(), Style::default().fg(Color::LightYellow)),
+                    Span::raw(" "),
+                    Span::raw("status="),
+                    Span::styled(status.clone(), status_style(status)),
+                ];
+
                 if *expanded {
-                    lines.push(Line::from(format!(
-                        "[TOOL] tool={} call={} status={} [expanded]",
-                        tool_id, call_id, status
+                    header.push(Span::styled(
+                        " [expanded]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    lines.push(Line::from(header));
+                    lines.push(Line::from(vec![
+                        Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  arguments:",
+                        Style::default().fg(Color::Gray),
                     )));
-                    lines.push(Line::from("  arguments:"));
                     for line in pretty_json_lines(arguments) {
                         lines.push(Line::from(format!("    {line}")));
                     }
-                    lines.push(Line::from("  output:"));
+                    lines.push(Line::from(Span::styled(
+                        "  output:",
+                        Style::default().fg(Color::Gray),
+                    )));
                     for line in pretty_json_lines(output) {
                         lines.push(Line::from(format!("    {line}")));
                     }
                 } else {
-                    lines.push(Line::from(format!(
-                        "[TOOL] tool={} call={} status={} [collapsed]",
-                        tool_id, call_id, status
-                    )));
+                    header.push(Span::styled(
+                        " [collapsed]",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    lines.push(Line::from(header));
                 }
+                lines.push(Line::raw(""));
 
                 ListItem::new(Text::from(lines)).style(style)
             }
@@ -378,7 +471,7 @@ impl TimelineItem {
 
     fn to_snapshot_value(&self) -> serde_json::Value {
         match self {
-            TimelineItem::Text { role, text } => serde_json::json!({
+            TimelineItem::Text { role, text, .. } => serde_json::json!({
                 "role": role.label().to_lowercase(),
                 "type": "text",
                 "content": text,
@@ -403,19 +496,80 @@ impl TimelineItem {
     }
 
     fn toggle(&mut self) {
-        if let TimelineItem::ToolInvocation { expanded, .. } = self {
-            *expanded = !*expanded;
+        match self {
+            TimelineItem::Text { text, expanded, .. } => {
+                if text_is_collapsible(text) {
+                    *expanded = !*expanded;
+                }
+            }
+            TimelineItem::ToolInvocation { expanded, .. } => *expanded = !*expanded,
         }
     }
 
     fn is_toggleable(&self) -> bool {
-        matches!(self, TimelineItem::ToolInvocation { .. })
+        match self {
+            TimelineItem::Text { text, .. } => text_is_collapsible(text),
+            TimelineItem::ToolInvocation { .. } => true,
+        }
+    }
+
     }
 }
 
 fn pretty_json_lines(value: &serde_json::Value) -> Vec<String> {
     let rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     rendered.lines().map(|line| line.to_string()).collect()
+}
+
+fn text_is_collapsible(text: &str) -> bool {
+    text.lines().count() > TEXT_COLLAPSE_LINE_THRESHOLD
+        || text.chars().count() > TEXT_COLLAPSE_CHAR_THRESHOLD
+}
+
+fn text_preview_lines(text: &str, max_lines: usize, max_chars: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut consumed = 0usize;
+    for line in text.lines() {
+        if out.len() >= max_lines {
+            break;
+        }
+
+        let remaining = max_chars.saturating_sub(consumed);
+        if remaining == 0 {
+            break;
+        }
+
+        let mut clipped = line.chars().take(remaining).collect::<String>();
+        let clipped_len = clipped.chars().count();
+        consumed += clipped_len;
+        if clipped_len < line.chars().count() {
+            clipped.push_str("...");
+            out.push(clipped);
+            break;
+        }
+
+        out.push(clipped);
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn status_style(status: &str) -> Style {
+    match status {
+        "success" | "completed" => Style::default().fg(Color::Green),
+        "error" | "failed" => Style::default().fg(Color::Red),
+        "running" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn parse_run_id_from_text(text: &str) -> Option<String> {
+    text.strip_prefix("delegated run ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|run_id| run_id.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -555,7 +709,19 @@ impl ChatApp {
 
     fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let input_box_height = (self.composer.input_height() as u16).saturating_add(2);
+        self.composer.max_visible_lines = if area.height < 22 {
+            4
+        } else if area.height < 34 {
+            6
+        } else {
+            DEFAULT_MAX_VISIBLE_LINES
+        };
+        self.composer.ensure_cursor_visible();
+
+        let max_input_height = area.height.saturating_sub(6).max(3);
+        let input_box_height = (self.composer.input_height() as u16)
+            .saturating_add(2)
+            .clamp(3, max_input_height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -565,10 +731,22 @@ impl ChatApp {
             ])
             .split(area);
 
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(32), Constraint::Min(20)])
-            .split(chunks[0]);
+        let body = if chunks[0].width < 84 {
+            let sidebar_height = (chunks[0].height / 3).clamp(5, 10);
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(sidebar_height), Constraint::Min(6)])
+                .split(chunks[0])
+        } else {
+            let max_sidebar = chunks[0].width.saturating_sub(20).max(18);
+            let sidebar_width = (((chunks[0].width as f32) * 0.30) as u16)
+                .clamp(18, 38)
+                .min(max_sidebar);
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(sidebar_width), Constraint::Min(20)])
+                .split(chunks[0])
+        };
 
         self.render_sidebar(frame, body[0]);
         self.render_thread(frame, body[1]);
@@ -577,21 +755,35 @@ impl ChatApp {
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = Block::default().title("Threads").borders(Borders::ALL);
+        let block = if self.focus == FocusPane::Sidebar {
+            Block::default()
+                .title("Threads")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+        } else {
+            Block::default().title("Threads").borders(Borders::ALL)
+        };
         let items: Vec<ListItem<'static>> = self
             .threads
             .iter()
             .map(|thread| {
-                let label = if thread.id == SYSTEM_THREAD_ID {
-                    "System0".to_string()
+                if thread.id == SYSTEM_THREAD_ID {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("System0", Style::default().fg(Color::Cyan)),
+                        Span::styled(" [active]", Style::default().fg(Color::DarkGray)),
+                    ]))
                 } else {
                     let state = thread
                         .state
                         .clone()
                         .unwrap_or_else(|| "unknown".to_string());
-                    format!("{} [{}]", thread.title, state)
-                };
-                ListItem::new(Text::from(label))
+                    ListItem::new(Line::from(vec![
+                        Span::raw(thread.title.clone()),
+                        Span::raw(" ["),
+                        Span::styled(state.clone(), status_style(&state)),
+                        Span::raw("]"),
+                    ]))
+                }
             })
             .collect();
 
@@ -602,8 +794,8 @@ impl ChatApp {
         ));
 
         let mut highlight = Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
+            .fg(Color::White)
+            .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
         if self.focus != FocusPane::Sidebar {
             highlight = highlight.remove_modifier(Modifier::BOLD);
@@ -625,14 +817,28 @@ impl ChatApp {
             format!("Conversation: {}", thread.title)
         };
 
-        let block = Block::default().title(title).borders(Borders::ALL);
+        let block = if self.focus == FocusPane::Main {
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue))
+        } else {
+            Block::default().title(title).borders(Borders::ALL)
+        };
         let selected = self.current_thread_selected_item();
-        let items: Vec<ListItem<'static>> = thread
-            .items
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| item.to_list_item(selected == idx))
-            .collect();
+        let items: Vec<ListItem<'static>> = if thread.items.is_empty() {
+            vec![ListItem::new(Text::from(vec![Line::from(Span::styled(
+                "No messages yet",
+                Style::default().fg(Color::DarkGray),
+            ))]))]
+        } else {
+            thread
+                .items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| item.to_list_item(selected == idx))
+                .collect()
+        };
 
         let mut state = ListState::default();
         if !thread.items.is_empty() {
@@ -640,8 +846,8 @@ impl ChatApp {
         }
 
         let mut highlight = Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
+            .fg(Color::White)
+            .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD);
         if self.focus != FocusPane::Main {
             highlight = highlight.remove_modifier(Modifier::BOLD);
@@ -664,7 +870,9 @@ impl ChatApp {
         };
 
         let mut block = Block::default().title(title).borders(Borders::ALL);
-        if read_only {
+        if self.focus == FocusPane::Input && !read_only {
+            block = block.border_style(Style::default().fg(Color::Green));
+        } else if read_only {
             block = block.border_style(Style::default().fg(Color::DarkGray));
         }
 
@@ -699,7 +907,7 @@ impl ChatApp {
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let status = self.status.clone().unwrap_or_else(|| {
-            "Tab: switch focus | Enter: send/select | Shift+Enter/Ctrl+J: newline | Space: toggle tool"
+            "Tab: switch focus | Enter: send/open | Space: expand/collapse | Shift+Enter/Ctrl+J: newline"
                 .to_string()
         });
         let text = Text::from(Line::from(vec![Span::styled(
@@ -829,7 +1037,7 @@ impl ChatApp {
             }
             KeyCode::Char(' ') => {
                 if self.focus == FocusPane::Main {
-                    self.toggle_selected_tool_item();
+                    self.toggle_selected_item();
                 } else if self.focus == FocusPane::Input && !read_only_input {
                     self.composer.insert_char(' ');
                 }
@@ -882,7 +1090,7 @@ impl ChatApp {
         self.set_current_thread_selected_item((selected + 1).min(max));
     }
 
-    fn toggle_selected_tool_item(&mut self) {
+    fn toggle_selected_item(&mut self) {
         let selected = self.current_thread_selected_item();
         let thread_id = self.current_thread().id.clone();
         if let Some(item) = self
