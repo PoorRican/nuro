@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use neuromancer_agent::llm::{LlmClient, RigLlmClient};
 use neuromancer_agent::runtime::AgentRuntime;
@@ -87,6 +87,13 @@ impl RuntimeCore {
         trigger_type: TriggerType,
     ) -> Result<OrchestratorTurnResult, MessageRuntimeError> {
         let turn_id = uuid::Uuid::new_v4();
+        let turn_started_at = Instant::now();
+        tracing::info!(
+            turn_id = %turn_id,
+            trigger_type = ?trigger_type,
+            message_chars = message.len(),
+            "orchestrator_turn_started"
+        );
         self.system0_broker
             .set_turn_context(turn_id, trigger_type)
             .await;
@@ -101,7 +108,12 @@ impl RuntimeCore {
             )
             .await
             .map_err(|err| {
-                tracing::error!(error = ?err, "orchestrator turn failed");
+                tracing::error!(
+                    turn_id = %turn_id,
+                    error = ?err,
+                    duration_ms = turn_started_at.elapsed().as_millis(),
+                    "orchestrator_turn_failed"
+                );
                 MessageRuntimeError::Internal(err.to_string())
             })?;
 
@@ -109,6 +121,13 @@ impl RuntimeCore {
             extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
         let delegated_runs = self.system0_broker.take_runs(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
+        tracing::info!(
+            turn_id = %turn_id,
+            delegated_runs = delegated_runs.len(),
+            tool_invocations = tool_invocations.len(),
+            duration_ms = turn_started_at.elapsed().as_millis(),
+            "orchestrator_turn_finished"
+        );
 
         Ok(OrchestratorTurnResult {
             turn_id: turn_id.to_string(),
@@ -619,6 +638,14 @@ impl ToolBroker for System0ToolBroker {
                 inner.runs_order.push(run_id.clone());
                 drop(inner);
 
+                let delegation_started_at = Instant::now();
+                tracing::info!(
+                    turn_id = %turn_id,
+                    run_id = %run_id,
+                    agent_id = %agent_id,
+                    tool_id = %call.tool_id,
+                    "delegation_started"
+                );
                 let mut task = Task::new(TriggerSource::Internal, instruction, agent_id.clone());
                 let result = runtime.execute(&mut task).await;
 
@@ -657,6 +684,14 @@ impl ToolBroker for System0ToolBroker {
                     })),
                 };
                 Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                tracing::info!(
+                    turn_id = %turn_id,
+                    run_id = %run_id,
+                    agent_id = %agent_id,
+                    state = %run.state,
+                    duration_ms = delegation_started_at.elapsed().as_millis(),
+                    "delegation_finished"
+                );
                 Ok(result)
             }
             _ => {
@@ -915,6 +950,15 @@ impl ToolBroker for SkillToolBroker {
         ctx: &AgentContext,
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
+        let started_at = Instant::now();
+        tracing::info!(
+            agent_id = %ctx.agent_id,
+            task_id = %ctx.task_id,
+            tool_id = %call.tool_id,
+            call_id = %call.id,
+            "skill_tool_started"
+        );
+
         if !ctx.allowed_tools.iter().any(|tool| tool == &call.tool_id) {
             return Err(NeuromancerError::Tool(ToolError::NotFound {
                 tool_id: call.tool_id,
