@@ -5,12 +5,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use neuromancer_core::config::NeuromancerConfig;
+use neuromancer_core::rpc::JSON_RPC_METHOD_NOT_FOUND;
 use neuromancer_core::xdg::XdgLayout;
 use serde::Serialize;
 
 use crate::CliError;
 use crate::provider_keys::{provider_credential_targets, read_nonempty_env, read_nonempty_file};
-use crate::rpc_client::RpcClient;
+use crate::rpc_client::{RpcClient, RpcClientError};
 
 #[derive(Debug, Clone)]
 pub struct DaemonStartOptions {
@@ -132,6 +133,7 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
         readiness_timeout,
     )
     .await?;
+    verify_daemon_rpc_compat(&options.addr, options.timeout, &daemon_bin).await?;
     let healthy = Some(true);
 
     Ok(DaemonStartResult {
@@ -385,8 +387,13 @@ pub fn resolve_daemon_bin(explicit: Option<&Path>) -> Result<PathBuf, CliError> 
         return Ok(PathBuf::from(path));
     }
 
-    if let Some(path) = find_in_path("neuromancerd") {
-        return Ok(path);
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let sibling = dir.join("neuromancerd");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
     }
 
     let fallback = PathBuf::from("target/debug/neuromancerd");
@@ -394,9 +401,34 @@ pub fn resolve_daemon_bin(explicit: Option<&Path>) -> Result<PathBuf, CliError> 
         return Ok(fallback);
     }
 
+    if let Some(path) = find_in_path("neuromancerd") {
+        return Ok(path);
+    }
+
     Err(CliError::Lifecycle(
         "unable to resolve neuromancerd binary (use --daemon-bin or NEUROMANCERD_BIN)".to_string(),
     ))
+}
+
+async fn verify_daemon_rpc_compat(
+    addr: &str,
+    timeout: Duration,
+    daemon_bin: &Path,
+) -> Result<(), CliError> {
+    let rpc = RpcClient::new(addr, std::cmp::min(timeout, Duration::from_secs(2)))?;
+    match rpc.orchestrator_threads_list().await {
+        Ok(_) => Ok(()),
+        Err(RpcClientError::Rpc(code, message))
+            if code == JSON_RPC_METHOD_NOT_FOUND
+                && message.contains("orchestrator.threads.list") =>
+        {
+            Err(CliError::Lifecycle(format!(
+                "started daemon '{}' but required RPC method 'orchestrator.threads.list' is missing. This usually means an older neuromancerd binary was launched. Rebuild neuromancerd and restart with --daemon-bin target/debug/neuromancerd.",
+                daemon_bin.display()
+            )))
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 fn find_in_path(binary: &str) -> Option<PathBuf> {
