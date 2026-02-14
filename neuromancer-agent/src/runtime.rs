@@ -431,10 +431,12 @@ fn specs_to_rig_definitions(specs: &[ToolSpec]) -> Vec<rig::completion::ToolDefi
 /// Truncate text to at most `max_len` characters for summaries.
 // NOTE: [low pri] ideally this would use another utility LLM
 fn truncate_summary(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    let char_count = text.chars().count();
+    if char_count <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len])
+        let truncated: String = text.chars().take(max_len).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -580,5 +582,13 @@ mod tests {
             result.unwrap_err(),
             NeuromancerError::Agent(AgentError::MaxIterationsExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn truncate_summary_handles_multibyte_unicode_safely() {
+        let input = "I’m testing — unicode boundaries";
+        let output = truncate_summary(input, 10);
+        assert!(output.ends_with("..."));
+        assert!(output.starts_with("I’m testi"));
     }
 }
