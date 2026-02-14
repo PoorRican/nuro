@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, Utc};
+use neuromancer_agent::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use neuromancer_agent::llm::{LlmClient, RigLlmClient};
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
@@ -11,9 +14,10 @@ use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentMo
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
-    DelegatedRun, OrchestratorThreadMessage, OrchestratorToolInvocation, OrchestratorTurnResult,
+    DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorThreadGetResult, OrchestratorThreadMessage, OrchestratorThreadResurrectResult,
+    OrchestratorToolInvocation, OrchestratorTurnResult, ThreadEvent, ThreadSummary,
 };
-use neuromancer_core::task::Task;
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
 };
@@ -27,6 +31,302 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM0_AGENT_ID: &str = "system0";
 const DEFAULT_SKILL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_THREAD_PAGE_LIMIT: usize = 100;
+
+#[derive(Debug, Clone)]
+struct SubAgentThreadState {
+    thread_id: String,
+    agent_id: String,
+    session_id: AgentSessionId,
+    latest_run_id: Option<String>,
+    state: String,
+    summary: Option<String>,
+    initial_instruction: Option<String>,
+    resurrected: bool,
+    active: bool,
+    updated_at: String,
+    persisted_message_count: usize,
+}
+
+#[derive(Clone)]
+struct ThreadJournal {
+    base_dir: PathBuf,
+    index_file: PathBuf,
+    lock: Arc<AsyncMutex<()>>,
+    seq_cache: Arc<AsyncMutex<HashMap<String, u64>>>,
+    secret_values: Arc<Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ThreadIndexEntry {
+    event_id: String,
+    ts: String,
+    thread: ThreadSummary,
+}
+
+impl ThreadJournal {
+    fn new(base_dir: PathBuf) -> Result<Self, MessageRuntimeError> {
+        let system_dir = base_dir.join("system0");
+        let subagents_dir = base_dir.join("subagents");
+        fs::create_dir_all(&system_dir).map_err(|err| {
+            MessageRuntimeError::Internal(format!(
+                "failed to create thread journal system dir '{}': {err}",
+                system_dir.display()
+            ))
+        })?;
+        fs::create_dir_all(&subagents_dir).map_err(|err| {
+            MessageRuntimeError::Internal(format!(
+                "failed to create thread journal subagent dir '{}': {err}",
+                subagents_dir.display()
+            ))
+        })?;
+
+        let index_file = base_dir.join("index.jsonl");
+        if !index_file.exists() {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&index_file)
+                .map_err(|err| {
+                    MessageRuntimeError::Internal(format!(
+                        "failed to create thread index '{}': {err}",
+                        index_file.display()
+                    ))
+                })?;
+        }
+
+        Ok(Self {
+            base_dir,
+            index_file,
+            lock: Arc::new(AsyncMutex::new(())),
+            seq_cache: Arc::new(AsyncMutex::new(HashMap::new())),
+            secret_values: Arc::new(collect_secret_values()),
+        })
+    }
+
+    fn system_thread_file(&self) -> PathBuf {
+        self.base_dir.join("system0").join("system0.jsonl")
+    }
+
+    fn subagent_thread_file(&self, thread_id: &str) -> PathBuf {
+        let safe = sanitize_thread_file_component(thread_id);
+        self.base_dir
+            .join("subagents")
+            .join(format!("{safe}.jsonl"))
+    }
+
+    fn thread_file_for_id(&self, thread_id: &str) -> PathBuf {
+        if thread_id == SYSTEM0_AGENT_ID {
+            self.system_thread_file()
+        } else {
+            self.subagent_thread_file(thread_id)
+        }
+    }
+
+    fn thread_file_for_event(&self, event: &ThreadEvent) -> PathBuf {
+        if event.thread_kind == "system" || event.thread_id == SYSTEM0_AGENT_ID {
+            self.system_thread_file()
+        } else {
+            self.subagent_thread_file(&event.thread_id)
+        }
+    }
+
+    async fn append_event(&self, mut event: ThreadEvent) -> Result<(), MessageRuntimeError> {
+        let _guard = self.lock.lock().await;
+        let path = self.thread_file_for_event(&event);
+        let current_seq = self.current_seq_for_locked(&event.thread_id, &path)?;
+        event.seq = if event.seq == 0 {
+            current_seq + 1
+        } else {
+            event.seq.max(current_seq + 1)
+        };
+
+        let (payload, redacted, safe) = sanitize_event_payload(
+            &event.event_type,
+            event.payload,
+            self.secret_values.as_ref(),
+        );
+        if safe {
+            event.payload = payload;
+            event.redaction_applied = event.redaction_applied || redacted;
+        } else {
+            event.payload = serde_json::json!({ "omitted": "sensitive_payload" });
+            event.redaction_applied = true;
+        }
+
+        append_jsonl_line(&path, &event)?;
+        let mut cache = self.seq_cache.lock().await;
+        cache.insert(event.thread_id, event.seq);
+        Ok(())
+    }
+
+    async fn append_index_snapshot(
+        &self,
+        summary: &ThreadSummary,
+    ) -> Result<(), MessageRuntimeError> {
+        let _guard = self.lock.lock().await;
+        let entry = ThreadIndexEntry {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            ts: now_rfc3339(),
+            thread: summary.clone(),
+        };
+        append_jsonl_line(&self.index_file, &entry)
+    }
+
+    fn load_latest_thread_summaries(
+        &self,
+    ) -> Result<HashMap<String, ThreadSummary>, MessageRuntimeError> {
+        let mut by_thread = HashMap::<String, ThreadSummary>::new();
+        if self.index_file.exists() {
+            for line in read_jsonl_lines(&self.index_file)? {
+                if let Ok(entry) = serde_json::from_str::<ThreadIndexEntry>(&line) {
+                    by_thread.insert(entry.thread.thread_id.clone(), entry.thread);
+                    continue;
+                }
+                if let Ok(summary) = serde_json::from_str::<ThreadSummary>(&line) {
+                    by_thread.insert(summary.thread_id.clone(), summary);
+                }
+            }
+        }
+
+        let subagents_dir = self.base_dir.join("subagents");
+        if subagents_dir.exists() {
+            for dir_entry in fs::read_dir(&subagents_dir).map_err(|err| {
+                MessageRuntimeError::Internal(format!(
+                    "failed to read subagent thread dir '{}': {err}",
+                    subagents_dir.display()
+                ))
+            })? {
+                let Ok(dir_entry) = dir_entry else { continue };
+                let path = dir_entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let events = read_thread_events_from_path(&path)?;
+                let Some(last) = events.last() else { continue };
+                let thread_id = events
+                    .first()
+                    .map(|event| event.thread_id.clone())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    });
+                by_thread
+                    .entry(thread_id.clone())
+                    .or_insert_with(|| ThreadSummary {
+                        thread_id,
+                        kind: "subagent".to_string(),
+                        agent_id: last.agent_id.clone(),
+                        latest_run_id: last.run_id.clone(),
+                        state: infer_thread_state_from_events(&events),
+                        updated_at: last.ts.clone(),
+                        resurrected: false,
+                        active: false,
+                    });
+            }
+        }
+
+        Ok(by_thread)
+    }
+
+    fn read_thread_events(&self, thread_id: &str) -> Result<Vec<ThreadEvent>, MessageRuntimeError> {
+        let path = self.thread_file_for_id(thread_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_thread_events_from_path(&path)
+    }
+
+    async fn append_messages(
+        &self,
+        thread_id: &str,
+        thread_kind: &str,
+        agent_id: Option<&str>,
+        run_id: Option<&str>,
+        messages: &[OrchestratorThreadMessage],
+    ) -> Result<(), MessageRuntimeError> {
+        for message in messages {
+            let (event_type, payload) = match message {
+                OrchestratorThreadMessage::Text { role, content } => {
+                    let event_type = if role == "user" {
+                        "message_user"
+                    } else if role == "assistant" {
+                        "message_assistant"
+                    } else {
+                        "message_system"
+                    };
+                    (
+                        event_type.to_string(),
+                        serde_json::json!({
+                            "role": role,
+                            "content": content,
+                        }),
+                    )
+                }
+                OrchestratorThreadMessage::ToolInvocation {
+                    call_id,
+                    tool_id,
+                    arguments,
+                    status,
+                    output,
+                } => (
+                    "tool_result".to_string(),
+                    serde_json::json!({
+                        "call_id": call_id,
+                        "tool_id": tool_id,
+                        "arguments": arguments,
+                        "status": status,
+                        "output": output,
+                    }),
+                ),
+            };
+
+            self.append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: thread_id.to_string(),
+                thread_kind: thread_kind.to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type,
+                agent_id: agent_id.map(|value| value.to_string()),
+                run_id: run_id.map(|value| value.to_string()),
+                payload,
+                redaction_applied: false,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn current_seq_for_locked(
+        &self,
+        thread_id: &str,
+        path: &Path,
+    ) -> Result<u64, MessageRuntimeError> {
+        if let Some(seq) = self
+            .seq_cache
+            .try_lock()
+            .ok()
+            .and_then(|cache| cache.get(thread_id).copied())
+        {
+            return Ok(seq);
+        }
+
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut max_seq = 0_u64;
+        for line in read_jsonl_lines(path)? {
+            let Ok(event) = serde_json::from_str::<ThreadEvent>(&line) else {
+                continue;
+            };
+            max_seq = max_seq.max(event.seq);
+        }
+        Ok(max_seq)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageRuntimeError {
@@ -65,8 +365,7 @@ impl MessageRuntimeError {
 pub struct MessageRuntime {
     turn_tx: mpsc::Sender<TurnRequest>,
     system0_broker: System0ToolBroker,
-    session_store: InMemorySessionStore,
-    session_id: AgentSessionId,
+    thread_journal: ThreadJournal,
     _turn_worker: tokio::task::JoinHandle<()>,
     _report_worker: tokio::task::JoinHandle<()>,
 }
@@ -82,6 +381,7 @@ struct RuntimeCore {
     session_store: InMemorySessionStore,
     session_id: AgentSessionId,
     system0_broker: System0ToolBroker,
+    thread_journal: ThreadJournal,
 }
 
 impl RuntimeCore {
@@ -102,29 +402,125 @@ impl RuntimeCore {
             .set_turn_context(turn_id, trigger_type)
             .await;
 
-        let output = self
+        let _ = self
+            .thread_journal
+            .append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: SYSTEM0_AGENT_ID.to_string(),
+                thread_kind: "system".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "message_user".to_string(),
+                agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                run_id: Some(turn_id.to_string()),
+                payload: serde_json::json!({ "role": "user", "content": message.clone() }),
+                redaction_applied: false,
+            })
+            .await;
+
+        let output = match self
             .orchestrator_runtime
             .execute_turn(
                 &self.session_store,
                 self.session_id,
                 TriggerSource::Cli,
-                message,
+                message.clone(),
             )
             .await
-            .map_err(|err| {
+        {
+            Ok(output) => output,
+            Err(err) => {
+                let normalized = normalize_error_message(err.to_string());
+                let _ = self
+                    .thread_journal
+                    .append_event(ThreadEvent {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        thread_id: SYSTEM0_AGENT_ID.to_string(),
+                        thread_kind: "system".to_string(),
+                        seq: 0,
+                        ts: now_rfc3339(),
+                        event_type: "error".to_string(),
+                        agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                        run_id: Some(turn_id.to_string()),
+                        payload: serde_json::json!({
+                            "error": normalized,
+                            "message": "orchestrator turn failed",
+                        }),
+                        redaction_applied: false,
+                    })
+                    .await;
                 tracing::error!(
                     turn_id = %turn_id,
                     error = ?err,
                     duration_ms = turn_started_at.elapsed().as_millis(),
                     "orchestrator_turn_failed"
                 );
-                MessageRuntimeError::Internal(err.to_string())
-            })?;
+                return Err(MessageRuntimeError::Internal(err.to_string()));
+            }
+        };
 
         let response =
             extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
         let delegated_runs = self.system0_broker.take_runs(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
+
+        let _ = self
+            .thread_journal
+            .append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: SYSTEM0_AGENT_ID.to_string(),
+                thread_kind: "system".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "message_assistant".to_string(),
+                agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                run_id: Some(turn_id.to_string()),
+                payload: serde_json::json!({ "role": "assistant", "content": response.clone() }),
+                redaction_applied: false,
+            })
+            .await;
+
+        for invocation in &tool_invocations {
+            let _ = self
+                .thread_journal
+                .append_event(ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: SYSTEM0_AGENT_ID.to_string(),
+                    thread_kind: "system".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "tool_call".to_string(),
+                    agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                    run_id: Some(turn_id.to_string()),
+                    payload: serde_json::json!({
+                        "call_id": invocation.call_id,
+                        "tool_id": invocation.tool_id,
+                        "arguments": invocation.arguments,
+                    }),
+                    redaction_applied: false,
+                })
+                .await;
+            let _ = self
+                .thread_journal
+                .append_event(ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: SYSTEM0_AGENT_ID.to_string(),
+                    thread_kind: "system".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "tool_result".to_string(),
+                    agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                    run_id: Some(turn_id.to_string()),
+                    payload: serde_json::json!({
+                        "call_id": invocation.call_id,
+                        "tool_id": invocation.tool_id,
+                        "status": invocation.status,
+                        "output": invocation.output,
+                    }),
+                    redaction_applied: false,
+                })
+                .await;
+        }
         tracing::info!(
             turn_id = %turn_id,
             delegated_runs = delegated_runs.len(),
@@ -150,10 +546,13 @@ impl MessageRuntime {
         let layout = XdgLayout::from_env().map_err(map_xdg_err)?;
         let skills_dir = layout.skills_dir();
         let local_root = layout.runtime_root();
+        let threads_root = layout.runtime_root().join("threads");
         let config_dir = config_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
+
+        let thread_journal = ThreadJournal::new(threads_root)?;
 
         let mut skill_registry = SkillRegistry::new(vec![skills_dir.clone()]);
         skill_registry
@@ -163,6 +562,8 @@ impl MessageRuntime {
 
         let (report_tx, mut report_rx) = mpsc::channel(256);
         let report_worker = tokio::spawn(async move { while report_rx.recv().await.is_some() {} });
+        let session_store = InMemorySessionStore::new();
+        let session_id = uuid::Uuid::new_v4();
 
         let allowlisted_system0_tools =
             effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
@@ -200,8 +601,13 @@ impl MessageRuntime {
         let config_snapshot = serde_json::to_value(config)
             .map_err(|err| MessageRuntimeError::Config(err.to_string()))?;
 
-        let system0_broker =
-            System0ToolBroker::new(subagents, config_snapshot, &allowlisted_system0_tools);
+        let system0_broker = System0ToolBroker::new(
+            subagents,
+            config_snapshot,
+            &allowlisted_system0_tools,
+            session_store.clone(),
+            thread_journal.clone(),
+        );
         let runtime_broker = system0_broker.clone();
 
         let orchestrator_prompt_path = resolve_path(
@@ -231,13 +637,12 @@ impl MessageRuntime {
             orchestrator_tool_call_retry_limit,
         ));
 
-        let session_store = InMemorySessionStore::new();
-        let session_id = uuid::Uuid::new_v4();
         let core = Arc::new(AsyncMutex::new(RuntimeCore {
             orchestrator_runtime,
             session_store: session_store.clone(),
             session_id,
             system0_broker,
+            thread_journal: thread_journal.clone(),
         }));
 
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnRequest>(128);
@@ -279,8 +684,7 @@ impl MessageRuntime {
         Ok(Self {
             turn_tx,
             system0_broker: runtime_broker,
-            session_store,
-            session_id,
+            thread_journal,
             _turn_worker: turn_worker,
             _report_worker: report_worker,
         })
@@ -338,12 +742,324 @@ impl MessageRuntime {
     pub async fn orchestrator_context_get(
         &self,
     ) -> Result<Vec<OrchestratorThreadMessage>, MessageRuntimeError> {
-        let session = self.session_store.get(self.session_id).await;
-        let messages = match session {
-            Some(state) => conversation_to_thread_messages(&state.conversation.messages),
-            None => Vec::new(),
+        let events = self.thread_journal.read_thread_events(SYSTEM0_AGENT_ID)?;
+        Ok(thread_events_to_thread_messages(&events))
+    }
+
+    pub async fn orchestrator_threads_list(
+        &self,
+    ) -> Result<Vec<ThreadSummary>, MessageRuntimeError> {
+        let mut summaries = self.thread_journal.load_latest_thread_summaries()?;
+        summaries
+            .entry(SYSTEM0_AGENT_ID.to_string())
+            .or_insert_with(|| ThreadSummary {
+                thread_id: SYSTEM0_AGENT_ID.to_string(),
+                kind: "system".to_string(),
+                agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                latest_run_id: None,
+                state: "active".to_string(),
+                updated_at: now_rfc3339(),
+                resurrected: false,
+                active: true,
+            });
+
+        let active_threads = self.system0_broker.list_thread_states().await;
+        for state in active_threads {
+            summaries.insert(
+                state.thread_id.clone(),
+                ThreadSummary {
+                    thread_id: state.thread_id,
+                    kind: "subagent".to_string(),
+                    agent_id: Some(state.agent_id),
+                    latest_run_id: state.latest_run_id,
+                    state: state.state,
+                    updated_at: state.updated_at,
+                    resurrected: state.resurrected,
+                    active: state.active,
+                },
+            );
+        }
+
+        let mut out = summaries.into_values().collect::<Vec<_>>();
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(out)
+    }
+
+    pub async fn orchestrator_thread_get(
+        &self,
+        params: OrchestratorThreadGetParams,
+    ) -> Result<OrchestratorThreadGetResult, MessageRuntimeError> {
+        if params.thread_id.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "thread_id must not be empty".to_string(),
+            ));
+        }
+        let offset = params.offset.unwrap_or(0);
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_THREAD_PAGE_LIMIT)
+            .clamp(1, 500);
+
+        let events = self.thread_journal.read_thread_events(&params.thread_id)?;
+        let total = events.len();
+        let page = events
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        Ok(OrchestratorThreadGetResult {
+            thread_id: params.thread_id,
+            events: page,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub async fn orchestrator_thread_resurrect(
+        &self,
+        thread_id: String,
+    ) -> Result<OrchestratorThreadResurrectResult, MessageRuntimeError> {
+        if thread_id.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "thread_id must not be empty".to_string(),
+            ));
+        }
+        if thread_id == SYSTEM0_AGENT_ID {
+            return Ok(OrchestratorThreadResurrectResult {
+                thread: ThreadSummary {
+                    thread_id: SYSTEM0_AGENT_ID.to_string(),
+                    kind: "system".to_string(),
+                    agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                    latest_run_id: None,
+                    state: "active".to_string(),
+                    updated_at: now_rfc3339(),
+                    resurrected: false,
+                    active: true,
+                },
+            });
+        }
+
+        let summaries = self.thread_journal.load_latest_thread_summaries()?;
+        let Some(summary) = summaries.get(&thread_id).cloned() else {
+            return Err(MessageRuntimeError::ResourceNotFound(format!(
+                "thread '{thread_id}'"
+            )));
         };
-        Ok(messages)
+        let Some(agent_id) = summary.agent_id.clone() else {
+            return Err(MessageRuntimeError::InvalidRequest(format!(
+                "thread '{thread_id}' is not a sub-agent thread"
+            )));
+        };
+
+        let _runtime = self
+            .system0_broker
+            .runtime_for_agent(&agent_id)
+            .await
+            .ok_or_else(|| {
+                MessageRuntimeError::ResourceNotFound(format!(
+                    "agent '{agent_id}' for thread '{thread_id}'"
+                ))
+            })?;
+
+        let events = self.thread_journal.read_thread_events(&thread_id)?;
+        let session_id = uuid::Uuid::new_v4();
+        let reconstructed = reconstruct_subagent_conversation(&events);
+        self.system0_broker
+            .session_store()
+            .await
+            .save_conversation(session_id, reconstructed.clone())
+            .await;
+
+        let thread_state = SubAgentThreadState {
+            thread_id: thread_id.clone(),
+            agent_id: agent_id.clone(),
+            session_id,
+            latest_run_id: summary.latest_run_id.clone(),
+            state: "active".to_string(),
+            summary: None,
+            initial_instruction: None,
+            resurrected: true,
+            active: true,
+            updated_at: now_rfc3339(),
+            persisted_message_count: conversation_to_thread_messages(&reconstructed.messages).len(),
+        };
+        self.system0_broker.upsert_thread_state(thread_state).await;
+
+        let resurrected = ThreadSummary {
+            resurrected: true,
+            active: true,
+            updated_at: now_rfc3339(),
+            ..summary
+        };
+        self.thread_journal
+            .append_index_snapshot(&resurrected)
+            .await?;
+        self.thread_journal
+            .append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: thread_id.clone(),
+                thread_kind: "subagent".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "thread_resurrected".to_string(),
+                agent_id: Some(agent_id),
+                run_id: resurrected.latest_run_id.clone(),
+                payload: serde_json::json!({"resurrected": true}),
+                redaction_applied: false,
+            })
+            .await?;
+
+        Ok(OrchestratorThreadResurrectResult {
+            thread: resurrected,
+        })
+    }
+
+    pub async fn orchestrator_subagent_turn(
+        &self,
+        thread_id: String,
+        message: String,
+    ) -> Result<OrchestratorSubagentTurnResult, MessageRuntimeError> {
+        if thread_id.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "thread_id must not be empty".to_string(),
+            ));
+        }
+        if message.trim().is_empty() {
+            return Err(MessageRuntimeError::InvalidRequest(
+                "message must not be empty".to_string(),
+            ));
+        }
+
+        let state = self
+            .system0_broker
+            .get_thread_state(&thread_id)
+            .await
+            .ok_or_else(|| {
+                MessageRuntimeError::ResourceNotFound(format!("thread '{thread_id}'"))
+            })?;
+
+        let runtime = self
+            .system0_broker
+            .runtime_for_agent(&state.agent_id)
+            .await
+            .ok_or_else(|| {
+                MessageRuntimeError::ResourceNotFound(format!("agent '{}'", state.agent_id))
+            })?;
+        let session_store = self.system0_broker.session_store().await;
+        let run_result = runtime
+            .execute_turn(
+                &session_store,
+                state.session_id,
+                TriggerSource::Internal,
+                message.clone(),
+            )
+            .await;
+        let run_id = run_result
+            .as_ref()
+            .map(|run| run.task_id.to_string())
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let (run_state, response, error) = match run_result {
+            Ok(run) => (
+                "completed".to_string(),
+                extract_response_text(&run.output).unwrap_or_else(|| run.output.summary.clone()),
+                None,
+            ),
+            Err(err) => {
+                let normalized = normalize_error_message(err.to_string());
+                ("failed".to_string(), normalized.clone(), Some(normalized))
+            }
+        };
+
+        let conversation = session_store.get(state.session_id).await.ok_or_else(|| {
+            MessageRuntimeError::Internal(format!("missing conversation for thread '{thread_id}'"))
+        })?;
+        let thread_messages = conversation_to_thread_messages(&conversation.conversation.messages);
+        let delta = thread_messages
+            .iter()
+            .skip(state.persisted_message_count)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        self.thread_journal
+            .append_messages(
+                &thread_id,
+                "subagent",
+                Some(&state.agent_id),
+                Some(&run_id),
+                &delta,
+            )
+            .await?;
+        if let Some(err) = &error {
+            self.thread_journal
+                .append_event(ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: thread_id.clone(),
+                    thread_kind: "subagent".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "error".to_string(),
+                    agent_id: Some(state.agent_id.clone()),
+                    run_id: Some(run_id.clone()),
+                    payload: serde_json::json!({
+                        "error": err,
+                        "tool_id": "orchestrator.subagent.turn",
+                    }),
+                    redaction_applied: false,
+                })
+                .await?;
+        }
+
+        let delegated_run = DelegatedRun {
+            run_id: run_id.clone(),
+            agent_id: state.agent_id.clone(),
+            state: run_state.clone(),
+            summary: Some(response.clone()),
+            thread_id: Some(thread_id.clone()),
+            initial_instruction: Some(message),
+            error: error.clone(),
+        };
+        self.system0_broker
+            .record_subagent_turn_result(&thread_id, delegated_run.clone(), thread_messages.len())
+            .await;
+
+        let snapshot = ThreadSummary {
+            thread_id: thread_id.clone(),
+            kind: "subagent".to_string(),
+            agent_id: Some(state.agent_id.clone()),
+            latest_run_id: Some(run_id.clone()),
+            state: run_state.clone(),
+            updated_at: now_rfc3339(),
+            resurrected: state.resurrected,
+            active: true,
+        };
+        self.thread_journal.append_index_snapshot(&snapshot).await?;
+        self.thread_journal
+            .append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: thread_id.clone(),
+                thread_kind: "subagent".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "run_state_changed".to_string(),
+                agent_id: Some(state.agent_id),
+                run_id: Some(run_id),
+                payload: serde_json::json!({
+                    "state": run_state,
+                    "summary": delegated_run.summary,
+                    "error": delegated_run.error,
+                }),
+                redaction_applied: false,
+            })
+            .await?;
+
+        Ok(OrchestratorSubagentTurnResult {
+            thread_id,
+            run: delegated_run,
+            response,
+            tool_invocations: Vec::new(),
+        })
     }
 }
 
@@ -429,6 +1145,422 @@ fn flush_pending_tool_calls(
     }
 }
 
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn sanitize_thread_file_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "thread".to_string()
+    } else {
+        out
+    }
+}
+
+fn append_jsonl_line<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), MessageRuntimeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            MessageRuntimeError::Internal(format!(
+                "failed to create directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| {
+            MessageRuntimeError::Internal(format!(
+                "failed to open jsonl file '{}': {err}",
+                path.display()
+            ))
+        })?;
+    serde_json::to_writer(&mut file, value).map_err(|err| {
+        MessageRuntimeError::Internal(format!("failed to encode jsonl event: {err}"))
+    })?;
+    file.write_all(b"\n").map_err(|err| {
+        MessageRuntimeError::Internal(format!("failed to write jsonl newline: {err}"))
+    })?;
+    file.flush().map_err(|err| {
+        MessageRuntimeError::Internal(format!("failed to flush jsonl file: {err}"))
+    })?;
+    Ok(())
+}
+
+fn read_jsonl_lines(path: &Path) -> Result<Vec<String>, MessageRuntimeError> {
+    let file = fs::File::open(path).map_err(|err| {
+        MessageRuntimeError::Internal(format!(
+            "failed to open jsonl file '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|err| {
+            MessageRuntimeError::Internal(format!(
+                "failed to read jsonl file '{}': {err}",
+                path.display()
+            ))
+        })?;
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+    Ok(lines)
+}
+
+fn read_thread_events_from_path(path: &Path) -> Result<Vec<ThreadEvent>, MessageRuntimeError> {
+    let mut events = Vec::<ThreadEvent>::new();
+    for line in read_jsonl_lines(path)? {
+        match serde_json::from_str::<ThreadEvent>(&line) {
+            Ok(event) => events.push(event),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "skipping_malformed_thread_event"
+                );
+            }
+        }
+    }
+    events.sort_by(|a, b| {
+        if a.seq == b.seq {
+            a.ts.cmp(&b.ts)
+        } else {
+            a.seq.cmp(&b.seq)
+        }
+    });
+    Ok(events)
+}
+
+fn collect_secret_values() -> Vec<String> {
+    let mut values = Vec::new();
+    for (key, value) in std::env::vars() {
+        if is_sensitive_key(&key) && !value.trim().is_empty() && value.trim().len() >= 6 {
+            values.push(value);
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("auth")
+        || key.contains("credential")
+        || key.contains("bearer")
+}
+
+fn sanitize_event_payload(
+    event_type: &str,
+    payload: serde_json::Value,
+    secret_values: &[String],
+) -> (serde_json::Value, bool, bool) {
+    let mut redacted = false;
+    let Ok(sanitized) = sanitize_json_value(payload, secret_values, &mut redacted, 0) else {
+        return (
+            serde_json::json!({ "omitted": "sensitive_payload" }),
+            true,
+            false,
+        );
+    };
+
+    if !tool_payload_shape_allowed(event_type, &sanitized) {
+        return (
+            serde_json::json!({ "omitted": "sensitive_payload" }),
+            true,
+            false,
+        );
+    }
+
+    (sanitized, redacted, true)
+}
+
+fn sanitize_json_value(
+    value: serde_json::Value,
+    secret_values: &[String],
+    redacted: &mut bool,
+    depth: usize,
+) -> Result<serde_json::Value, ()> {
+    if depth > 24 {
+        return Err(());
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, inner) in map {
+                if is_sensitive_key(&key) {
+                    *redacted = true;
+                    out.insert(key, serde_json::Value::String("[REDACTED]".to_string()));
+                    continue;
+                }
+                out.insert(
+                    key,
+                    sanitize_json_value(inner, secret_values, redacted, depth + 1)?,
+                );
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        serde_json::Value::Array(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for inner in values {
+                out.push(sanitize_json_value(
+                    inner,
+                    secret_values,
+                    redacted,
+                    depth + 1,
+                )?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        serde_json::Value::String(mut text) => {
+            for secret in secret_values {
+                if secret.is_empty() {
+                    continue;
+                }
+                if text.contains(secret) {
+                    text = text.replace(secret, "[REDACTED]");
+                    *redacted = true;
+                }
+            }
+            Ok(serde_json::Value::String(text))
+        }
+        other => Ok(other),
+    }
+}
+
+fn tool_payload_shape_allowed(event_type: &str, payload: &serde_json::Value) -> bool {
+    if event_type != "tool_call" && event_type != "tool_result" {
+        return true;
+    }
+
+    let Some(map) = payload.as_object() else {
+        return false;
+    };
+    let allowed: &[&str] = if event_type == "tool_call" {
+        &["call_id", "tool_id", "arguments"]
+    } else {
+        &[
+            "call_id",
+            "tool_id",
+            "arguments",
+            "status",
+            "output",
+            "error",
+        ]
+    };
+    map.keys()
+        .all(|key| allowed.iter().any(|allowed_key| key == allowed_key))
+}
+
+fn infer_thread_state_from_events(events: &[ThreadEvent]) -> String {
+    for event in events.iter().rev() {
+        if event.event_type == "error" {
+            return "failed".to_string();
+        }
+        if event.event_type == "run_state_changed" {
+            if let Some(state) = event.payload.get("state").and_then(|value| value.as_str()) {
+                return state.to_string();
+            }
+        }
+    }
+    "completed".to_string()
+}
+
+fn normalize_error_message(message: impl Into<String>) -> String {
+    let mut text = message.into().replace('\n', " ");
+    if text.len() > 512 {
+        text.truncate(512);
+        text.push_str("...");
+    }
+    text
+}
+
+fn reconstruct_subagent_conversation(events: &[ThreadEvent]) -> ConversationContext {
+    let mut conversation = ConversationContext::new(
+        u32::MAX,
+        TruncationStrategy::SlidingWindow { keep_last: 50 },
+    );
+
+    for message in thread_events_to_thread_messages(events) {
+        match message {
+            OrchestratorThreadMessage::Text { role, content } => {
+                if role == "user" {
+                    conversation.add_message(ChatMessage::user(content));
+                } else if role == "assistant" {
+                    conversation.add_message(ChatMessage::assistant_text(content));
+                }
+            }
+            OrchestratorThreadMessage::ToolInvocation {
+                call_id,
+                tool_id: _,
+                arguments: _,
+                status,
+                output,
+            } => {
+                let tool_output = if status == "error" {
+                    let text = output
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| output.to_string());
+                    ToolOutput::Error(text)
+                } else {
+                    ToolOutput::Success(output)
+                };
+                conversation.add_message(ChatMessage::tool_result(ToolResult {
+                    call_id,
+                    output: tool_output,
+                }));
+            }
+        }
+    }
+
+    conversation
+}
+
+fn thread_events_to_thread_messages(events: &[ThreadEvent]) -> Vec<OrchestratorThreadMessage> {
+    let mut out = Vec::new();
+    let mut pending_tool_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+
+    for event in events {
+        match event.event_type.as_str() {
+            "message_user" => {
+                if let Some(content) = event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                {
+                    out.push(OrchestratorThreadMessage::Text {
+                        role: "user".to_string(),
+                        content: content.to_string(),
+                    });
+                }
+            }
+            "message_assistant" => {
+                if let Some(content) = event
+                    .payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                {
+                    out.push(OrchestratorThreadMessage::Text {
+                        role: "assistant".to_string(),
+                        content: content.to_string(),
+                    });
+                }
+            }
+            "tool_call" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let tool_id = event
+                    .payload
+                    .get("tool_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let arguments = event
+                    .payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                pending_tool_calls.insert(call_id.to_string(), (tool_id, arguments));
+            }
+            "tool_result" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("call_id")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let (tool_id, arguments) =
+                    pending_tool_calls.remove(call_id).unwrap_or_else(|| {
+                        (
+                            event
+                                .payload
+                                .get("tool_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            event
+                                .payload
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    });
+                let status = event
+                    .payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("success")
+                    .to_string();
+                let output = event
+                    .payload
+                    .get("output")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                out.push(OrchestratorThreadMessage::ToolInvocation {
+                    call_id: call_id.to_string(),
+                    tool_id,
+                    arguments,
+                    status,
+                    output,
+                });
+            }
+            "error" => {
+                let err = event
+                    .payload
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown runtime error");
+                out.push(OrchestratorThreadMessage::Text {
+                    role: "system".to_string(),
+                    content: format!("SYSTEM ERROR: {err}"),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for (call_id, (tool_id, arguments)) in pending_tool_calls {
+        out.push(OrchestratorThreadMessage::ToolInvocation {
+            call_id,
+            tool_id,
+            arguments,
+            status: "pending".to_string(),
+            output: serde_json::Value::Null,
+        });
+    }
+
+    out
+}
+
 fn build_orchestrator_config(
     config: &NeuromancerConfig,
     allowlisted_tools: Vec<String>,
@@ -461,6 +1593,8 @@ struct System0BrokerInner {
     subagents: HashMap<String, Arc<AgentRuntime>>,
     config_snapshot: serde_json::Value,
     allowlisted_tools: HashSet<String>,
+    session_store: InMemorySessionStore,
+    thread_journal: ThreadJournal,
     current_trigger_type: TriggerType,
     current_turn_id: uuid::Uuid,
     runs_by_turn: HashMap<uuid::Uuid, Vec<DelegatedRun>>,
@@ -468,6 +1602,8 @@ struct System0BrokerInner {
     runs_index: HashMap<String, DelegatedRun>,
     runs_order: Vec<String>,
     running_agents: HashMap<String, String>,
+    thread_states: HashMap<String, SubAgentThreadState>,
+    thread_id_by_agent: HashMap<String, String>,
 }
 
 impl System0ToolBroker {
@@ -475,6 +1611,8 @@ impl System0ToolBroker {
         subagents: HashMap<String, Arc<AgentRuntime>>,
         config_snapshot: serde_json::Value,
         allowlisted_tools: &[String],
+        session_store: InMemorySessionStore,
+        thread_journal: ThreadJournal,
     ) -> Self {
         let allowlisted_tools = if allowlisted_tools.is_empty() {
             default_system0_tools().into_iter().collect()
@@ -487,6 +1625,8 @@ impl System0ToolBroker {
                 subagents,
                 config_snapshot,
                 allowlisted_tools,
+                session_store,
+                thread_journal,
                 current_trigger_type: TriggerType::Admin,
                 current_turn_id: uuid::Uuid::nil(),
                 runs_by_turn: HashMap::new(),
@@ -494,6 +1634,8 @@ impl System0ToolBroker {
                 runs_index: HashMap::new(),
                 runs_order: Vec::new(),
                 running_agents: HashMap::new(),
+                thread_states: HashMap::new(),
+                thread_id_by_agent: HashMap::new(),
             })),
         }
     }
@@ -531,6 +1673,60 @@ impl System0ToolBroker {
     async fn get_run(&self, run_id: &str) -> Option<DelegatedRun> {
         let inner = self.inner.lock().await;
         inner.runs_index.get(run_id).cloned()
+    }
+
+    async fn session_store(&self) -> InMemorySessionStore {
+        let inner = self.inner.lock().await;
+        inner.session_store.clone()
+    }
+
+    async fn runtime_for_agent(&self, agent_id: &str) -> Option<Arc<AgentRuntime>> {
+        let inner = self.inner.lock().await;
+        inner.subagents.get(agent_id).cloned()
+    }
+
+    async fn list_thread_states(&self) -> Vec<SubAgentThreadState> {
+        let inner = self.inner.lock().await;
+        let mut states = inner.thread_states.values().cloned().collect::<Vec<_>>();
+        states.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        states
+    }
+
+    async fn get_thread_state(&self, thread_id: &str) -> Option<SubAgentThreadState> {
+        let inner = self.inner.lock().await;
+        inner.thread_states.get(thread_id).cloned()
+    }
+
+    async fn upsert_thread_state(&self, state: SubAgentThreadState) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .thread_id_by_agent
+            .insert(state.agent_id.clone(), state.thread_id.clone());
+        inner.thread_states.insert(state.thread_id.clone(), state);
+    }
+
+    async fn record_subagent_turn_result(
+        &self,
+        thread_id: &str,
+        run: DelegatedRun,
+        persisted_message_count: usize,
+    ) {
+        let mut inner = self.inner.lock().await;
+        inner.runs_index.insert(run.run_id.clone(), run.clone());
+        if !inner.runs_order.iter().any(|id| id == &run.run_id) {
+            inner.runs_order.push(run.run_id.clone());
+        }
+        if let Some(state) = inner.thread_states.get_mut(thread_id) {
+            state.latest_run_id = Some(run.run_id.clone());
+            state.state = run.state.clone();
+            state.summary = run.summary.clone();
+            if state.initial_instruction.is_none() {
+                state.initial_instruction = run.initial_instruction.clone();
+            }
+            state.active = true;
+            state.updated_at = now_rfc3339();
+            state.persisted_message_count = persisted_message_count;
+        }
     }
 
     fn build_tool_specs() -> Vec<ToolSpec> {
@@ -753,6 +1949,58 @@ impl ToolBroker for System0ToolBroker {
                 };
 
                 let run_id = uuid::Uuid::new_v4().to_string();
+                let now = now_rfc3339();
+                let thread_id = inner
+                    .thread_id_by_agent
+                    .get(&agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}-{}",
+                            sanitize_thread_file_component(&agent_id),
+                            uuid::Uuid::new_v4()
+                                .to_string()
+                                .chars()
+                                .take(8)
+                                .collect::<String>()
+                        )
+                    });
+                let mut is_new_thread = false;
+                let state_entry =
+                    inner
+                        .thread_states
+                        .entry(thread_id.clone())
+                        .or_insert_with(|| {
+                            is_new_thread = true;
+                            SubAgentThreadState {
+                                thread_id: thread_id.clone(),
+                                agent_id: agent_id.clone(),
+                                session_id: uuid::Uuid::new_v4(),
+                                latest_run_id: None,
+                                state: "running".to_string(),
+                                summary: None,
+                                initial_instruction: Some(instruction.clone()),
+                                resurrected: false,
+                                active: true,
+                                updated_at: now.clone(),
+                                persisted_message_count: 0,
+                            }
+                        });
+
+                if state_entry.initial_instruction.is_none() {
+                    state_entry.initial_instruction = Some(instruction.clone());
+                }
+                state_entry.active = true;
+                state_entry.state = "running".to_string();
+                state_entry.updated_at = now.clone();
+                state_entry.latest_run_id = Some(run_id.clone());
+                let session_id = state_entry.session_id;
+                let previous_persisted_count = state_entry.persisted_message_count;
+                let initial_instruction = state_entry.initial_instruction.clone();
+
+                inner
+                    .thread_id_by_agent
+                    .insert(agent_id.clone(), thread_id.clone());
                 inner
                     .running_agents
                     .insert(agent_id.clone(), run_id.clone());
@@ -763,74 +2011,303 @@ impl ToolBroker for System0ToolBroker {
                         agent_id: agent_id.clone(),
                         state: "running".to_string(),
                         summary: None,
+                        thread_id: Some(thread_id.clone()),
+                        initial_instruction: initial_instruction.clone(),
+                        error: None,
                     },
                 );
-                inner.runs_order.push(run_id.clone());
+                if !inner.runs_order.iter().any(|id| id == &run_id) {
+                    inner.runs_order.push(run_id.clone());
+                }
+
+                let session_store = inner.session_store.clone();
+                let thread_journal = inner.thread_journal.clone();
+                let current_trigger_type = inner.current_trigger_type;
                 drop(inner);
+
+                if is_new_thread {
+                    let created = ThreadSummary {
+                        thread_id: thread_id.clone(),
+                        kind: "subagent".to_string(),
+                        agent_id: Some(agent_id.clone()),
+                        latest_run_id: Some(run_id.clone()),
+                        state: "running".to_string(),
+                        updated_at: now_rfc3339(),
+                        resurrected: false,
+                        active: true,
+                    };
+                    if let Err(err) = thread_journal.append_index_snapshot(&created).await {
+                        tracing::error!(
+                            thread_id = %thread_id,
+                            error = ?err,
+                            "thread_journal_index_write_failed"
+                        );
+                    }
+                    if let Err(err) = thread_journal
+                        .append_event(ThreadEvent {
+                            event_id: uuid::Uuid::new_v4().to_string(),
+                            thread_id: thread_id.clone(),
+                            thread_kind: "subagent".to_string(),
+                            seq: 0,
+                            ts: now_rfc3339(),
+                            event_type: "thread_created".to_string(),
+                            agent_id: Some(agent_id.clone()),
+                            run_id: Some(run_id.clone()),
+                            payload: serde_json::json!({
+                                "agent_id": agent_id.clone(),
+                                "initial_instruction": instruction.clone(),
+                            }),
+                            redaction_applied: false,
+                        })
+                        .await
+                    {
+                        tracing::error!(
+                            thread_id = %thread_id,
+                            error = ?err,
+                            "thread_journal_write_failed"
+                        );
+                    }
+                }
+
+                if let Err(err) = thread_journal
+                    .append_event(ThreadEvent {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        thread_id: thread_id.clone(),
+                        thread_kind: "subagent".to_string(),
+                        seq: 0,
+                        ts: now_rfc3339(),
+                        event_type: "message_user".to_string(),
+                        agent_id: Some(agent_id.clone()),
+                        run_id: Some(run_id.clone()),
+                        payload: serde_json::json!({ "role": "user", "content": instruction.clone() }),
+                        redaction_applied: false,
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        thread_id = %thread_id,
+                        error = ?err,
+                        "thread_journal_write_failed"
+                    );
+                }
 
                 let delegation_started_at = Instant::now();
                 tracing::info!(
                     turn_id = %turn_id,
                     run_id = %run_id,
                     agent_id = %agent_id,
+                    thread_id = %thread_id,
                     tool_id = %call.tool_id,
+                    trigger_type = ?current_trigger_type,
                     "delegation_started"
                 );
-                let mut task = Task::new(TriggerSource::Internal, instruction, agent_id.clone());
-                let result = runtime.execute(&mut task).await;
 
-                let mut inner = self.inner.lock().await;
-                inner.running_agents.remove(&agent_id);
+                let result = runtime
+                    .execute_turn(
+                        &session_store,
+                        session_id,
+                        TriggerSource::Internal,
+                        instruction.clone(),
+                    )
+                    .await;
 
-                let run = match result {
-                    Ok(output) => {
-                        let full_response = extract_response_text(&output)
-                            .unwrap_or_else(|| output.summary.clone());
-                        DelegatedRun {
-                            run_id: run_id.clone(),
-                            agent_id: agent_id.clone(),
-                            state: "completed".to_string(),
-                            summary: Some(full_response),
+                let mut error = None;
+                let mut persisted_message_count = previous_persisted_count;
+                let (run_state, summary) = match result {
+                    Ok(turn_output) => {
+                        let response = extract_response_text(&turn_output.output)
+                            .unwrap_or_else(|| turn_output.output.summary.clone());
+                        let mut run_state = "completed".to_string();
+                        let mut summary = Some(response);
+
+                        match session_store.get(session_id).await {
+                            Some(conversation) => {
+                                let thread_messages = conversation_to_thread_messages(
+                                    &conversation.conversation.messages,
+                                );
+                                let delta = thread_messages
+                                    .iter()
+                                    .skip(previous_persisted_count)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                if let Err(err) = thread_journal
+                                    .append_messages(
+                                        &thread_id,
+                                        "subagent",
+                                        Some(&agent_id),
+                                        Some(&run_id),
+                                        &delta,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        thread_id = %thread_id,
+                                        run_id = %run_id,
+                                        error = ?err,
+                                        "thread_journal_delta_write_failed"
+                                    );
+                                }
+                                persisted_message_count = thread_messages.len();
+                            }
+                            None => {
+                                error = Some(format!(
+                                    "missing sub-agent conversation state for thread '{}'",
+                                    thread_id
+                                ));
+                                run_state = "failed".to_string();
+                                summary = error.clone();
+                            }
                         }
+                        (run_state, summary)
                     }
-                    Err(err) => DelegatedRun {
-                        run_id: run_id.clone(),
-                        agent_id: agent_id.clone(),
-                        state: "failed".to_string(),
-                        summary: Some(err.to_string()),
-                    },
+                    Err(err) => {
+                        let normalized = normalize_error_message(err.to_string());
+                        error = Some(normalized.clone());
+                        if let Err(journal_err) = thread_journal
+                            .append_event(ThreadEvent {
+                                event_id: uuid::Uuid::new_v4().to_string(),
+                                thread_id: thread_id.clone(),
+                                thread_kind: "subagent".to_string(),
+                                seq: 0,
+                                ts: now_rfc3339(),
+                                event_type: "error".to_string(),
+                                agent_id: Some(agent_id.clone()),
+                                run_id: Some(run_id.clone()),
+                                payload: serde_json::json!({
+                                    "error": normalized,
+                                    "tool_id": "delegate_to_agent",
+                                    "call_id": call.id.clone(),
+                                }),
+                                redaction_applied: false,
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                thread_id = %thread_id,
+                                run_id = %run_id,
+                                error = ?journal_err,
+                                "thread_journal_error_write_failed"
+                            );
+                        }
+                        ("failed".to_string(), error.clone())
+                    }
                 };
 
+                let run = DelegatedRun {
+                    run_id: run_id.clone(),
+                    agent_id: agent_id.clone(),
+                    state: run_state.clone(),
+                    summary: summary.clone(),
+                    thread_id: Some(thread_id.clone()),
+                    initial_instruction: initial_instruction.clone(),
+                    error: error.clone(),
+                };
+
+                let mut thread_summary = None::<ThreadSummary>;
+                let mut inner = self.inner.lock().await;
+                inner.running_agents.remove(&agent_id);
                 inner
                     .runs_by_turn
                     .entry(turn_id)
                     .or_default()
                     .push(run.clone());
                 inner.runs_index.insert(run.run_id.clone(), run.clone());
+                if !inner.runs_order.iter().any(|id| id == &run.run_id) {
+                    inner.runs_order.push(run.run_id.clone());
+                }
+                if let Some(state) = inner.thread_states.get_mut(&thread_id) {
+                    state.latest_run_id = Some(run_id.clone());
+                    state.state = run_state.clone();
+                    state.summary = summary.clone();
+                    if state.initial_instruction.is_none() {
+                        state.initial_instruction = initial_instruction.clone();
+                    }
+                    state.updated_at = now_rfc3339();
+                    state.persisted_message_count = persisted_message_count;
+                    state.active = true;
+                    thread_summary = Some(ThreadSummary {
+                        thread_id: thread_id.clone(),
+                        kind: "subagent".to_string(),
+                        agent_id: Some(agent_id.clone()),
+                        latest_run_id: Some(run_id.clone()),
+                        state: state.state.clone(),
+                        updated_at: state.updated_at.clone(),
+                        resurrected: state.resurrected,
+                        active: state.active,
+                    });
+                }
 
-                let run_id_out = run.run_id.clone();
-                let agent_id_out = run.agent_id.clone();
-                let state_out = run.state.clone();
-                let summary_out = run.summary.clone();
-                let result = ToolResult {
-                    call_id: call.id.clone(),
-                    output: ToolOutput::Success(serde_json::json!({
-                        "run_id": run_id_out,
-                        "agent_id": agent_id_out,
-                        "state": state_out,
-                        "summary": summary_out,
-                    })),
+                let tool_output = if run_state == "failed" {
+                    ToolOutput::Error(
+                        error
+                            .clone()
+                            .unwrap_or_else(|| "delegation failed".to_string()),
+                    )
+                } else {
+                    ToolOutput::Success(serde_json::json!({
+                        "run_id": run.run_id,
+                        "thread_id": thread_id,
+                        "agent_id": run.agent_id,
+                        "state": run.state,
+                        "summary": run.summary,
+                        "error": run.error,
+                    }))
                 };
-                Self::record_invocation(&mut inner, turn_id, &call, &result.output);
+                let tool_result = ToolResult {
+                    call_id: call.id.clone(),
+                    output: tool_output.clone(),
+                };
+                Self::record_invocation(&mut inner, turn_id, &call, &tool_result.output);
+                drop(inner);
+
+                if let Some(snapshot) = thread_summary {
+                    if let Err(err) = thread_journal.append_index_snapshot(&snapshot).await {
+                        tracing::error!(
+                            thread_id = %snapshot.thread_id,
+                            run_id = %run_id,
+                            error = ?err,
+                            "thread_journal_index_write_failed"
+                        );
+                    }
+                }
+                if let Err(err) = thread_journal
+                    .append_event(ThreadEvent {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        thread_id: thread_id.clone(),
+                        thread_kind: "subagent".to_string(),
+                        seq: 0,
+                        ts: now_rfc3339(),
+                        event_type: "run_state_changed".to_string(),
+                        agent_id: Some(agent_id.clone()),
+                        run_id: Some(run_id.clone()),
+                        payload: serde_json::json!({
+                            "state": run_state,
+                            "summary": summary,
+                            "error": error,
+                        }),
+                        redaction_applied: false,
+                    })
+                    .await
+                {
+                    tracing::error!(
+                        thread_id = %thread_id,
+                        run_id = %run_id,
+                        error = ?err,
+                        "thread_journal_state_write_failed"
+                    );
+                }
+
                 tracing::info!(
                     turn_id = %turn_id,
                     run_id = %run_id,
                     agent_id = %agent_id,
+                    thread_id = %thread_id,
                     state = %run.state,
                     duration_ms = delegation_started_at.elapsed().as_millis(),
                     "delegation_finished"
                 );
-                Ok(result)
+
+                Ok(tool_result)
             }
             _ => {
                 let err = NeuromancerError::Tool(ToolError::NotFound {
