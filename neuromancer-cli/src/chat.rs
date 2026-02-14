@@ -620,9 +620,10 @@ impl TimelineItem {
                         Span::styled(error.clone(), Style::default().fg(Color::Red)),
                     ]));
                 } else if let Some(summary) = summary {
+                    let preview = text_preview_lines(summary, 2, 180).join(" ");
                     lines.push(Line::from(vec![
                         Span::styled("  summary: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(summary.clone()),
+                        Span::raw(preview),
                     ]));
                 }
 
@@ -1332,9 +1333,17 @@ impl ChatApp {
             .copied()
             .unwrap_or(0);
 
-        let paragraph = Paragraph::new(Text::from(lines))
+        let horizontal_scroll = if thread.kind == ThreadKind::System {
+            0
+        } else {
+            horizontal_offset
+        };
+        let mut paragraph = Paragraph::new(Text::from(lines))
             .block(block)
-            .scroll((vertical_offset as u16, horizontal_offset as u16));
+            .scroll((vertical_offset as u16, horizontal_scroll as u16));
+        if thread.kind == ThreadKind::System {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
 
         frame.render_widget(paragraph, area);
 
@@ -2525,6 +2534,35 @@ mod tests {
         assert!(
             line_text(&subagent_lines[0]).starts_with("[planner] "),
             "sub-agent assistant label should use the agent id"
+        );
+    }
+
+    #[test]
+    fn delegate_summary_is_previewed_when_collapsed() {
+        let item = TimelineItem::DelegateInvocation {
+            call_id: "call-1".to_string(),
+            status: "success".to_string(),
+            target_agent: Some("planner".to_string()),
+            thread_id: Some("thread-abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            instruction: Some("Summarize the request".to_string()),
+            summary: Some("x".repeat(500)),
+            error: None,
+            arguments: serde_json::json!({}),
+            output: serde_json::json!({}),
+            expanded: false,
+        };
+
+        let lines = item.lines(false, "System0");
+        let summary_line = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("  summary: "))
+            .expect("summary line should exist");
+        assert!(
+            summary_line.len() < 250,
+            "summary line should be previewed, got {} chars",
+            summary_line.len()
         );
     }
 
