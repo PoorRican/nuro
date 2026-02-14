@@ -129,6 +129,175 @@ enabled = true
     config_path
 }
 
+fn write_finance_config(dir: &Path, bind_addr: &str) -> PathBuf {
+    let config_path = dir.join("neuromancer.toml");
+    let config = format!(
+        r#"
+[global]
+instance_id = "test-instance"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[orchestrator]
+model_slot = "executor"
+
+[agents.finance-manager]
+models.executor = "executor"
+capabilities.skills = ["manage-bills", "manage-accounts"]
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+
+[admin_api]
+bind_addr = "{}"
+enabled = true
+"#,
+        bind_addr
+    );
+
+    fs::write(&config_path, config).expect("config should be written");
+    config_path
+}
+
+fn write_finance_skill_fixtures(xdg_config_home: &Path, xdg_data_home: &Path) {
+    let skills_root = xdg_config_home.join("neuromancer/skills");
+    let bills_skill = skills_root.join("manage-bills");
+    let accounts_skill = skills_root.join("manage-accounts");
+    fs::create_dir_all(bills_skill.join("scripts")).expect("bills scripts dir");
+    fs::create_dir_all(accounts_skill.join("scripts")).expect("accounts scripts dir");
+
+    fs::write(
+        bills_skill.join("SKILL.md"),
+        r#"---
+name: "manage-bills"
+version: "0.1.0"
+description: "Compute bill totals and due-date priorities from markdown data"
+metadata:
+  neuromancer:
+    data_sources:
+      markdown: ["data/bills.md"]
+    execution:
+      script: "scripts/manage_bills.py"
+      timeout_ms: 3000
+---
+Summarize bill obligations with totals and upcoming due dates.
+"#,
+    )
+    .expect("bills SKILL.md");
+    fs::write(
+        bills_skill.join("scripts/manage_bills.py"),
+        r#"import json
+import re
+from pathlib import Path
+import sys
+
+payload = json.loads(sys.stdin.read())
+local_root = Path(payload["local_root"])
+markdown_paths = payload.get("data_sources", {}).get("markdown", [])
+target = local_root / markdown_paths[0]
+text = target.read_text(encoding="utf-8")
+
+entries = []
+for line in text.splitlines():
+    line = line.strip()
+    if not line.startswith("-"):
+        continue
+    amount_match = re.search(r"\$([0-9]+(?:\.[0-9]{1,2})?)", line)
+    due_match = re.search(r"due\s+([0-9]{4}-[0-9]{2}-[0-9]{2})", line)
+    if amount_match and due_match:
+        entries.append(
+            {
+                "amount": float(amount_match.group(1)),
+                "due": due_match.group(1),
+            }
+        )
+
+entries.sort(key=lambda item: item["due"])
+total_due = round(sum(item["amount"] for item in entries), 2)
+next_due = entries[0]["due"] if entries else None
+next_due_amount = entries[0]["amount"] if entries else 0.0
+
+print(
+    json.dumps(
+        {
+            "bill_count": len(entries),
+            "total_due": total_due,
+            "next_due_date": next_due,
+            "next_due_amount": next_due_amount,
+        }
+    )
+)
+"#,
+    )
+    .expect("bills script");
+
+    fs::write(
+        accounts_skill.join("SKILL.md"),
+        r#"---
+name: "manage-accounts"
+version: "0.1.0"
+description: "Compute liquidity summary from CSV account balances"
+metadata:
+  neuromancer:
+    data_sources:
+      csv: ["data/accounts.csv"]
+    execution:
+      script: "scripts/manage_accounts.py"
+      timeout_ms: 3000
+---
+Summarize account balances and available liquidity.
+"#,
+    )
+    .expect("accounts SKILL.md");
+    fs::write(
+        accounts_skill.join("scripts/manage_accounts.py"),
+        r#"import csv
+import json
+from pathlib import Path
+import sys
+
+payload = json.loads(sys.stdin.read())
+local_root = Path(payload["local_root"])
+csv_paths = payload.get("data_sources", {}).get("csv", [])
+target = local_root / csv_paths[0]
+
+total_balance = 0.0
+rows = 0
+with target.open("r", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    for row in reader:
+        rows += 1
+        total_balance += float(row.get("balance", "0") or "0")
+
+print(json.dumps({"account_count": rows, "total_balance": round(total_balance, 2)}))
+"#,
+    )
+    .expect("accounts script");
+
+    let data_root = xdg_data_home.join("neuromancer/data");
+    fs::create_dir_all(&data_root).expect("data root");
+    fs::write(
+        data_root.join("bills.md"),
+        r#"# Bills
+- rent: $1200 due 2026-03-01
+- electricity: $95 due 2026-02-18
+- phone: $65 due 2026-02-15
+"#,
+    )
+    .expect("bills data");
+    fs::write(
+        data_root.join("accounts.csv"),
+        "account,balance\nchecking,3400.50\nsavings,1200.00\n",
+    )
+    .expect("accounts data");
+}
+
 fn parse_json_output(output: &[u8]) -> Value {
     serde_json::from_slice(output).expect("command output should be valid json")
 }
@@ -371,6 +540,135 @@ fn orchestrator_turn_command_routes_via_rpc() {
         run_get_json["result"]["run"]["run_id"].as_str(),
         Some(run_id.as_str())
     );
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("stop")
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .assert()
+        .success();
+}
+
+#[test]
+fn orchestrator_turn_routes_finance_queries_to_finance_manager_with_numeric_summary() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_finance_config(temp.path(), &bind_addr);
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+    let xdg_config_home = temp.path().join("xdg-config-home");
+    let xdg_data_home = temp.path().join("xdg-data-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&home_dir).expect("home dir");
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("install")
+        .arg("--config")
+        .arg(&config)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
+
+    write_finance_skill_fixtures(&xdg_config_home, &xdg_data_home);
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
+
+    let output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("orchestrator")
+        .arg("turn")
+        .arg("Please review my finance status and summarize bills versus account balance.")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json = parse_json_output(&output);
+    assert_eq!(json["ok"], Value::Bool(true));
+
+    let delegated_runs = json["result"]["delegated_runs"]
+        .as_array()
+        .expect("delegated runs should exist");
+    let finance_run = delegated_runs
+        .first()
+        .expect("finance run should exist");
+    assert_eq!(
+        finance_run["agent_id"].as_str(),
+        Some("finance-manager"),
+        "finance queries should be delegated to finance-manager"
+    );
+    let run_summary = finance_run["summary"]
+        .as_str()
+        .expect("delegated run summary should exist");
+    assert!(
+        run_summary.contains("1360.00"),
+        "bill total should appear in summary: {run_summary}"
+    );
+    assert!(
+        run_summary.contains("4600.50"),
+        "account total should appear in summary: {run_summary}"
+    );
+
+    let tool_invocations = json["result"]["tool_invocations"]
+        .as_array()
+        .expect("tool invocations should exist");
+    let delegate_call = tool_invocations
+        .iter()
+        .find(|invocation| invocation["tool_id"] == Value::String("delegate_to_agent".into()))
+        .expect("delegate_to_agent invocation should exist");
+    assert_eq!(
+        delegate_call["arguments"]["agent_id"].as_str(),
+        Some("finance-manager")
+    );
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("stop")
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("XDG_DATA_HOME", &xdg_data_home)
+        .env("HOME", &home_dir)
+        .assert()
+        .success();
+}
 
     neuroctl()
         .arg("--json")
