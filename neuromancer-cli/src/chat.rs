@@ -1702,6 +1702,120 @@ mod tests {
     }
 
     #[test]
+    fn main_enter_on_delegate_invocation_opens_sub_agent_thread() {
+        let run = DelegatedRun {
+            run_id: "run-123".to_string(),
+            agent_id: "planner".to_string(),
+            state: "completed".to_string(),
+            summary: Some("done".to_string()),
+        };
+
+        let mut app = ChatApp::new();
+        app.sync_runs(vec![run.clone()]);
+        app.append_system_item(TimelineItem::ToolInvocation {
+            call_id: "call-1".to_string(),
+            tool_id: "delegate_to_agent".to_string(),
+            status: "success".to_string(),
+            arguments: serde_json::json!({"agent_id": "planner"}),
+            output: serde_json::json!({"run_id": run.run_id}),
+            expanded: false,
+        });
+        app.focus = FocusPane::Main;
+        app.active_thread = 0;
+        app.sidebar_selected = 0;
+
+        let mut clipboard = MockClipboard { value: None };
+        let action = app.handle_event(Event::Key(key(KeyCode::Enter)), &mut clipboard);
+        assert_eq!(action, AppAction::LoadRun("run-123".to_string()));
+        assert_eq!(app.active_thread, 1);
+        assert_eq!(app.sidebar_selected, 1);
+    }
+
+    #[test]
+    fn sync_runs_keeps_completed_and_failed_threads_visible() {
+        let completed = DelegatedRun {
+            run_id: "run-1".to_string(),
+            agent_id: "planner".to_string(),
+            state: "completed".to_string(),
+            summary: None,
+        };
+        let failed = DelegatedRun {
+            run_id: "run-2".to_string(),
+            agent_id: "browser".to_string(),
+            state: "failed".to_string(),
+            summary: None,
+        };
+
+        let mut app = ChatApp::new();
+        app.sync_runs(vec![completed, failed]);
+
+        assert_eq!(app.threads.len(), 3);
+        assert!(
+            app.threads
+                .iter()
+                .any(|thread| thread.state.as_deref() == Some("completed")),
+            "completed thread should be visible"
+        );
+        assert!(
+            app.threads
+                .iter()
+                .any(|thread| thread.state.as_deref() == Some("failed")),
+            "failed thread should be visible"
+        );
+    }
+
+    #[test]
+    fn load_system_context_maps_messages_into_timeline_items() {
+        let mut app = ChatApp::new();
+        app.load_system_context(vec![
+            OrchestratorThreadMessage::Text {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            },
+            OrchestratorThreadMessage::ToolInvocation {
+                call_id: "call-1".to_string(),
+                tool_id: "read_config".to_string(),
+                arguments: serde_json::json!({}),
+                status: "success".to_string(),
+                output: serde_json::json!({"ok": true}),
+            },
+        ]);
+
+        let system_thread = app
+            .threads
+            .iter()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+            .expect("system thread should exist");
+        assert_eq!(system_thread.items.len(), 2);
+        assert!(matches!(
+            &system_thread.items[0],
+            TimelineItem::Text { role, .. } if *role == MessageRoleTag::User
+        ));
+        assert!(matches!(
+            &system_thread.items[1],
+            TimelineItem::ToolInvocation { tool_id, .. } if tool_id == "read_config"
+        ));
+    }
+
+    #[test]
+    fn long_text_messages_start_collapsed_and_toggle() {
+        let long_text = "line1\nline2\nline3\nline4\nline5";
+        let mut item = TimelineItem::text(MessageRoleTag::Assistant, long_text);
+
+        assert!(item.is_toggleable());
+        assert!(matches!(
+            &item,
+            TimelineItem::Text { expanded, .. } if !expanded
+        ));
+
+        item.toggle();
+        assert!(matches!(
+            &item,
+            TimelineItem::Text { expanded, .. } if *expanded
+        ));
+    }
+
+    #[test]
     fn parse_ndjson_supports_json_message_payloads() {
         assert_eq!(
             parse_ndjson_message_line(r#"{"message":"line1\nline2"}"#),

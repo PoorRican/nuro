@@ -435,6 +435,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_orchestrator_context_get_requires_runtime() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "orchestrator.context.get"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
     async fn removed_legacy_methods_return_method_not_found() {
         let state = test_state();
         let (_status, task_response) = rpc_json(

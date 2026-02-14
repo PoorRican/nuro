@@ -221,4 +221,28 @@ mod tests {
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }
+
+    #[test]
+    fn orchestrator_context_get_result_roundtrip() {
+        let result = OrchestratorContextGetResult {
+            messages: vec![
+                OrchestratorThreadMessage::Text {
+                    role: "assistant".to_string(),
+                    content: "hello".to_string(),
+                },
+                OrchestratorThreadMessage::ToolInvocation {
+                    call_id: "call-1".to_string(),
+                    tool_id: "delegate_to_agent".to_string(),
+                    arguments: serde_json::json!({"agent_id": "planner"}),
+                    status: "success".to_string(),
+                    output: serde_json::json!({"run_id": "run-1"}),
+                },
+            ],
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: OrchestratorContextGetResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
+    }
 }
