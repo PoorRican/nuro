@@ -12,7 +12,6 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use neuromancer_core::rpc::{
-    DelegatedRun, OrchestratorRunGetParams, OrchestratorToolInvocation, OrchestratorTurnResult,
     DelegatedRun, OrchestratorRunGetParams, OrchestratorThreadMessage, OrchestratorToolInvocation,
     OrchestratorTurnResult,
 };
@@ -513,6 +512,14 @@ impl TimelineItem {
         }
     }
 
+    fn linked_run_id(&self) -> Option<String> {
+        match self {
+            TimelineItem::ToolInvocation { output, .. } => output
+                .get("run_id")
+                .and_then(|value| value.as_str())
+                .map(|run_id| run_id.to_string()),
+            TimelineItem::Text { text, .. } => parse_run_id_from_text(text),
+        }
     }
 }
 
@@ -635,8 +642,20 @@ impl ChatApp {
     }
 
     async fn bootstrap(&mut self, rpc: &RpcClient) -> Result<(), CliError> {
+        let context = rpc.orchestrator_context_get().await?.messages;
+        self.load_system_context(context);
+
         let runs = rpc.orchestrator_runs_list().await?.runs;
         self.sync_runs(runs);
+
+        if let Some(system_thread) = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+            && !system_thread.items.is_empty()
+        {
+            self.status = Some("Loaded existing System0 context".to_string());
+        }
         Ok(())
     }
 
@@ -647,32 +666,29 @@ impl ChatApp {
     ) -> Result<OrchestratorTurnResult, CliError> {
         self.active_thread = 0;
         self.sidebar_selected = 0;
-        self.append_system_item(TimelineItem::Text {
-            role: MessageRoleTag::User,
-            text: message.clone(),
-        });
+        self.append_system_item(TimelineItem::text(MessageRoleTag::User, message.clone()));
 
         let result = rpc
             .orchestrator_turn(neuromancer_core::rpc::OrchestratorTurnParams { message })
             .await?;
 
-        self.append_system_item(TimelineItem::Text {
-            role: MessageRoleTag::Assistant,
-            text: result.response.clone(),
-        });
+        self.append_system_item(TimelineItem::text(
+            MessageRoleTag::Assistant,
+            result.response.clone(),
+        ));
 
         for invocation in &result.tool_invocations {
             self.append_system_item(tool_item_from_invocation(invocation));
         }
 
         for run in &result.delegated_runs {
-            self.append_system_item(TimelineItem::Text {
-                role: MessageRoleTag::System,
-                text: format!(
+            self.append_system_item(TimelineItem::text(
+                MessageRoleTag::System,
+                format!(
                     "delegated run {} agent={} state={}",
                     run.run_id, run.agent_id, run.state
                 ),
-            });
+            ));
         }
 
         let runs = rpc.orchestrator_runs_list().await?.runs;
@@ -1064,7 +1080,7 @@ impl ChatApp {
                         AppAction::None
                     }
                 }
-                FocusPane::Main => AppAction::None,
+                FocusPane::Main => self.open_selected_main_link(),
             },
             KeyCode::Char(ch) => {
                 if self.focus == FocusPane::Input
@@ -1102,6 +1118,43 @@ impl ChatApp {
         {
             item.toggle();
         }
+    }
+
+    fn open_selected_main_link(&mut self) -> AppAction {
+        let selected = self.current_thread_selected_item();
+        let Some(run_id) = self
+            .current_thread()
+            .items
+            .get(selected)
+            .and_then(TimelineItem::linked_run_id)
+        else {
+            return AppAction::None;
+        };
+
+        if self.select_thread_by_run_id(&run_id) {
+            self.status = Some(format!("Opening run {}", short_run_id(&run_id)));
+            return AppAction::LoadRun(run_id);
+        }
+
+        self.status = Some(format!(
+            "Run {} not found in sidebar",
+            short_run_id(&run_id)
+        ));
+        AppAction::None
+    }
+
+    fn select_thread_by_run_id(&mut self, run_id: &str) -> bool {
+        let Some(idx) = self
+            .threads
+            .iter()
+            .position(|thread| thread.run_id.as_deref() == Some(run_id) || thread.id == run_id)
+        else {
+            return false;
+        };
+
+        self.active_thread = idx;
+        self.sidebar_selected = idx;
+        true
     }
 
     fn sync_runs(&mut self, runs: Vec<DelegatedRun>) {
@@ -1154,6 +1207,27 @@ impl ChatApp {
         }
     }
 
+    fn load_system_context(&mut self, messages: Vec<OrchestratorThreadMessage>) {
+        let items = messages
+            .into_iter()
+            .map(timeline_item_from_thread_message)
+            .collect::<Vec<_>>();
+
+        if let Some(system_thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+        {
+            system_thread.items = items;
+            if !system_thread.items.is_empty() {
+                self.selected_item_by_thread.insert(
+                    system_thread.id.clone(),
+                    system_thread.items.len().saturating_sub(1),
+                );
+            }
+        }
+    }
+
     fn current_thread(&self) -> &ThreadView {
         &self.threads[self.active_thread.min(self.threads.len().saturating_sub(1))]
     }
@@ -1194,20 +1268,42 @@ impl ChatApp {
 
 fn run_thread_items(run: &DelegatedRun) -> Vec<TimelineItem> {
     let mut items = Vec::new();
-    items.push(TimelineItem::Text {
-        role: MessageRoleTag::System,
-        text: format!(
+    items.push(TimelineItem::text(
+        MessageRoleTag::System,
+        format!(
             "Sub-agent trace for run {} (agent={}, state={})",
             run.run_id, run.agent_id, run.state
         ),
-    });
+    ));
     if let Some(summary) = &run.summary {
-        items.push(TimelineItem::Text {
-            role: MessageRoleTag::Assistant,
-            text: summary.clone(),
-        });
+        items.push(TimelineItem::text(
+            MessageRoleTag::Assistant,
+            summary.clone(),
+        ));
     }
     items
+}
+
+fn timeline_item_from_thread_message(message: OrchestratorThreadMessage) -> TimelineItem {
+    match message {
+        OrchestratorThreadMessage::Text { role, content } => {
+            TimelineItem::text(MessageRoleTag::from_wire_role(&role), content)
+        }
+        OrchestratorThreadMessage::ToolInvocation {
+            call_id,
+            tool_id,
+            arguments,
+            status,
+            output,
+        } => TimelineItem::ToolInvocation {
+            call_id,
+            tool_id,
+            status,
+            arguments,
+            output,
+            expanded: false,
+        },
+    }
 }
 
 fn tool_item_from_invocation(invocation: &OrchestratorToolInvocation) -> TimelineItem {
