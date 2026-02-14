@@ -456,7 +456,7 @@ impl TimelineItem {
         }
     }
 
-    fn lines(&self, selected: bool) -> Vec<Line<'static>> {
+    fn lines(&self, selected: bool, assistant_label: &str) -> Vec<Line<'static>> {
         let mut lines = match self {
             TimelineItem::Text {
                 role,
@@ -464,8 +464,15 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
+                let role_label = if *role == MessageRoleTag::Assistant {
+                    assistant_label
+                } else {
+                    role.label()
+                };
+                let role_prefix_text = format!("[{role_label}] ");
+                let continuation_indent = " ".repeat(role_prefix_text.chars().count());
                 let role_prefix = Span::styled(
-                    format!("[{}] ", role.label()),
+                    role_prefix_text,
                     role.badge_style().add_modifier(Modifier::BOLD),
                 );
 
@@ -480,17 +487,17 @@ impl TimelineItem {
                 let first = iter.next().cloned().unwrap_or_default();
                 lines.push(Line::from(vec![role_prefix, Span::raw(first)]));
                 for line in iter {
-                    lines.push(Line::from(format!("           {line}")));
+                    lines.push(Line::from(format!("{continuation_indent}{line}")));
                 }
 
                 if text_is_collapsible(text) {
                     let hint = if *expanded {
-                        "           [expanded] Space to collapse"
+                        "[expanded] Space to collapse"
                     } else {
-                        "           [collapsed] Space to expand"
+                        "[collapsed] Space to expand"
                     };
                     lines.push(Line::from(Span::styled(
-                        hint,
+                        format!("{continuation_indent}{hint}"),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -863,6 +870,16 @@ impl ThreadView {
             resurrected: summary.resurrected,
             read_only,
             items: vec![],
+        }
+    }
+
+    fn assistant_badge_label(&self) -> String {
+        match self.kind {
+            ThreadKind::System => "System0".to_string(),
+            ThreadKind::Subagent => self
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "Assistant".to_string()),
         }
     }
 
@@ -1817,9 +1834,10 @@ fn build_thread_lines(
 
     let mut lines = Vec::new();
     let mut ranges = Vec::new();
+    let assistant_label = thread.assistant_badge_label();
     for (idx, item) in thread.items.iter().enumerate() {
         let start = lines.len();
-        let item_lines = item.lines(selected == idx);
+        let item_lines = item.lines(selected == idx, &assistant_label);
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
@@ -2362,6 +2380,13 @@ mod tests {
         }
     }
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
     #[test]
     fn composer_normalizes_line_endings_on_insert_str() {
         let mut composer = ComposerState::new();
@@ -2477,6 +2502,30 @@ mod tests {
             TimelineItem::Text { role: MessageRoleTag::System, text, .. }
                 if text.contains("Initial instruction unavailable")
         ));
+    }
+
+    #[test]
+    fn assistant_badge_uses_system_and_agent_names() {
+        let mut system = ThreadView::system();
+        system.items.push(TimelineItem::text(
+            MessageRoleTag::Assistant,
+            "system reply",
+        ));
+        let (system_lines, _) = build_thread_lines(&system, 0);
+        assert!(
+            line_text(&system_lines[0]).starts_with("[System0] "),
+            "system assistant label should be System0"
+        );
+
+        let mut subagent = ThreadView::from_summary(&subagent_summary("thread-2", true, false));
+        subagent
+            .items
+            .push(TimelineItem::text(MessageRoleTag::Assistant, "agent reply"));
+        let (subagent_lines, _) = build_thread_lines(&subagent, 0);
+        assert!(
+            line_text(&subagent_lines[0]).starts_with("[planner] "),
+            "sub-agent assistant label should use the agent id"
+        );
     }
 
     #[test]
