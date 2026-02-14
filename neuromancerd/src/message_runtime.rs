@@ -17,11 +17,14 @@ use neuromancer_core::tool::{
 };
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_core::xdg::{XdgLayout, resolve_path, validate_markdown_prompt_file};
-use neuromancer_skills::{SkillMetadata, SkillRegistry};
+use neuromancer_skills::{Skill, SkillRegistry};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM0_AGENT_ID: &str = "system0";
+const DEFAULT_SKILL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessageRuntimeError {
@@ -854,8 +857,11 @@ struct SkillToolBroker {
 #[derive(Clone)]
 struct SkillTool {
     description: String,
+    skill_root: PathBuf,
     markdown_paths: Vec<String>,
     csv_paths: Vec<String>,
+    script_path: Option<String>,
+    script_timeout: Duration,
 }
 
 impl SkillToolBroker {
@@ -867,14 +873,14 @@ impl SkillToolBroker {
     ) -> Result<Self, MessageRuntimeError> {
         let mut tools = HashMap::new();
         for skill_name in allowed_skills {
-            let metadata = skill_registry.get_metadata(skill_name).ok_or_else(|| {
+            let skill = skill_registry.get(skill_name).ok_or_else(|| {
                 MessageRuntimeError::Config(format!(
                     "agent '{}' references missing skill '{}'",
                     agent_id, skill_name
                 ))
             })?;
 
-            tools.insert(skill_name.clone(), skill_tool_from_metadata(metadata));
+            tools.insert(skill_name.clone(), skill_tool_from_skill(skill));
         }
 
         Ok(Self { tools, local_root })
@@ -959,12 +965,52 @@ impl ToolBroker for SkillToolBroker {
             }));
         }
 
+        let script_result = if let Some(relative_script_path) = tool.script_path.as_deref() {
+            let script_path = resolve_skill_script_path(&tool.skill_root, relative_script_path)
+                .map_err(map_tool_err(&call.tool_id))?;
+
+            let payload = serde_json::json!({
+                "local_root": self.local_root.display().to_string(),
+                "skill": call.tool_id.clone(),
+                "data_sources": {
+                    "markdown": tool.markdown_paths.clone(),
+                    "csv": tool.csv_paths.clone(),
+                },
+                "arguments": call.arguments.clone(),
+            });
+
+            Some(
+                run_skill_script(
+                    &script_path,
+                    &payload,
+                    tool.script_timeout,
+                    &ctx.agent_id,
+                    &ctx.task_id.to_string(),
+                    &call.tool_id,
+                )
+                .await
+                .map_err(map_tool_err(&call.tool_id))?,
+            )
+        } else {
+            None
+        };
+
+        tracing::info!(
+            agent_id = %ctx.agent_id,
+            task_id = %ctx.task_id,
+            tool_id = %call.tool_id,
+            call_id = %call.id,
+            duration_ms = started_at.elapsed().as_millis(),
+            "skill_tool_finished"
+        );
+
         Ok(ToolResult {
             call_id: call.id,
             output: ToolOutput::Success(serde_json::json!({
                 "skill": call.tool_id,
                 "markdown": markdown_docs,
                 "csv": csv_docs,
+                "script_result": script_result,
             })),
         })
     }
@@ -979,21 +1025,44 @@ fn map_tool_err(tool_id: &str) -> impl Fn(MessageRuntimeError) -> NeuromancerErr
     }
 }
 
-fn skill_tool_from_metadata(metadata: &SkillMetadata) -> SkillTool {
+fn skill_tool_from_skill(skill: &Skill) -> SkillTool {
+    let metadata = &skill.metadata;
     SkillTool {
         description: if metadata.description.trim().is_empty() {
             format!("Skill {}", metadata.name)
         } else {
             metadata.description.clone()
         },
+        skill_root: skill.path.clone(),
         markdown_paths: metadata.data_sources.markdown.clone(),
         csv_paths: metadata.data_sources.csv.clone(),
+        script_path: metadata.execution.script.clone(),
+        script_timeout: metadata
+            .execution
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SKILL_SCRIPT_TIMEOUT),
     }
 }
 
 fn resolve_local_data_path(
     local_root: &Path,
     relative: &str,
+) -> Result<PathBuf, MessageRuntimeError> {
+    resolve_relative_path_under_root(local_root, relative, "data file")
+}
+
+fn resolve_skill_script_path(
+    skill_root: &Path,
+    relative: &str,
+) -> Result<PathBuf, MessageRuntimeError> {
+    resolve_relative_path_under_root(skill_root, relative, "skill script")
+}
+
+fn resolve_relative_path_under_root(
+    root: &Path,
+    relative: &str,
+    file_type: &str,
 ) -> Result<PathBuf, MessageRuntimeError> {
     let input = Path::new(relative);
     if input.is_absolute() {
@@ -1013,17 +1082,19 @@ fn resolve_local_data_path(
         }
     }
 
-    let root_canonical = fs::canonicalize(local_root).map_err(|err| {
+    let root_canonical = fs::canonicalize(root).map_err(|err| {
         MessageRuntimeError::ResourceNotFound(format!(
-            "local data root '{}' is unavailable: {err}",
-            local_root.display()
+            "{} root '{}' is unavailable: {err}",
+            file_type,
+            root.display()
         ))
     })?;
 
-    let full_path = local_root.join(input);
+    let full_path = root.join(input);
     let target_canonical = fs::canonicalize(&full_path).map_err(|err| {
         MessageRuntimeError::ResourceNotFound(format!(
-            "data file '{}' is unavailable: {err}",
+            "{} '{}' is unavailable: {err}",
+            file_type,
             full_path.display()
         ))
     })?;
@@ -1037,6 +1108,189 @@ fn resolve_local_data_path(
     }
 
     Ok(target_canonical)
+}
+
+fn script_runtime_error(kind: &str, message: impl Into<String>) -> MessageRuntimeError {
+    MessageRuntimeError::Internal(format!("script_{kind}: {}", message.into()))
+}
+
+async fn run_skill_script(
+    script_path: &Path,
+    payload: &serde_json::Value,
+    timeout: Duration,
+    agent_id: &str,
+    task_id: &str,
+    tool_id: &str,
+) -> Result<serde_json::Value, MessageRuntimeError> {
+    let started_at = Instant::now();
+    tracing::info!(
+        agent_id = %agent_id,
+        task_id = %task_id,
+        tool_id = %tool_id,
+        script_path = %script_path.display(),
+        timeout_ms = timeout.as_millis(),
+        "skill_script_started"
+    );
+
+    let stdin_payload = serde_json::to_vec(payload).map_err(|err| {
+        script_runtime_error("io_error", format!("failed to encode script input payload: {err}"))
+    })?;
+
+    let mut child = TokioCommand::new("python3")
+        .arg("-I")
+        .arg(script_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!(
+                    "failed to start python script '{}': {err}",
+                    script_path.display()
+                ),
+            )
+        })?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        script_runtime_error(
+            "io_error",
+            format!("script stdin is unavailable for '{}'", script_path.display()),
+        )
+    })?;
+    stdin.write_all(&stdin_payload).await.map_err(|err| {
+        script_runtime_error(
+            "io_error",
+            format!(
+                "failed to write input to script '{}': {err}",
+                script_path.display()
+            ),
+        )
+    })?;
+    drop(stdin);
+
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        script_runtime_error(
+            "io_error",
+            format!("script stdout is unavailable for '{}'", script_path.display()),
+        )
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        script_runtime_error(
+            "io_error",
+            format!("script stderr is unavailable for '{}'", script_path.display()),
+        )
+    })?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).await.map(|_| buffer)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        stderr.read_to_end(&mut buffer).await.map(|_| buffer)
+    });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => result.map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!("failed waiting for script '{}': {err}", script_path.display()),
+            )
+        })?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(script_runtime_error(
+                "timeout",
+                format!(
+                    "script '{}' exceeded timeout of {}ms",
+                    script_path.display(),
+                    timeout.as_millis()
+                ),
+            ));
+        }
+    };
+
+    let stdout_bytes = stdout_task
+        .await
+        .map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!(
+                    "failed joining stdout reader for '{}': {err}",
+                    script_path.display()
+                ),
+            )
+        })?
+        .map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!("failed reading script stdout '{}': {err}", script_path.display()),
+            )
+        })?;
+    let stderr_bytes = stderr_task
+        .await
+        .map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!(
+                    "failed joining stderr reader for '{}': {err}",
+                    script_path.display()
+                ),
+            )
+        })?
+        .map_err(|err| {
+            script_runtime_error(
+                "io_error",
+                format!("failed reading script stderr '{}': {err}", script_path.display()),
+            )
+        })?;
+
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if !status.success() {
+        return Err(script_runtime_error(
+            "io_error",
+            format!(
+                "script '{}' exited with status {}: {}",
+                script_path.display(),
+                status,
+                stderr.trim()
+            ),
+        ));
+    }
+
+    let stdout = String::from_utf8(stdout_bytes).map_err(|err| {
+        script_runtime_error(
+            "invalid_json",
+            format!("script '{}' emitted non-utf8 stdout: {err}", script_path.display()),
+        )
+    })?;
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|err| {
+        script_runtime_error(
+            "invalid_json",
+            format!(
+                "script '{}' emitted invalid JSON: {err}; stderr='{}'",
+                script_path.display(),
+                stderr.trim()
+            ),
+        )
+    })?;
+
+    tracing::info!(
+        agent_id = %agent_id,
+        task_id = %task_id,
+        tool_id = %tool_id,
+        script_path = %script_path.display(),
+        duration_ms = started_at.elapsed().as_millis(),
+        status = %status,
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "skill_script_finished"
+    );
+
+    Ok(parsed)
 }
 
 struct ParsedCsv {

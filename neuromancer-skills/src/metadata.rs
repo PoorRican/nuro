@@ -36,6 +36,8 @@ pub struct SkillRequires {
 pub struct SkillExecution {
     pub mode: String,
     pub network: Option<String>,
+    pub script: Option<String>,
+    pub timeout_ms: Option<u64>,
 }
 
 impl Default for SkillExecution {
@@ -43,6 +45,8 @@ impl Default for SkillExecution {
         Self {
             mode: "isolated".into(),
             network: None,
+            script: None,
+            timeout_ms: None,
         }
     }
 }
@@ -144,6 +148,8 @@ fn parse_execution(nm: &HashMap<String, gray_matter::Pod>) -> SkillExecution {
         Some(e) => SkillExecution {
             mode: get_string(&e, "mode").unwrap_or_else(|| "isolated".into()),
             network: get_string(&e, "network"),
+            script: get_string(&e, "script"),
+            timeout_ms: get_u64(&e, "timeout_ms"),
         },
         None => SkillExecution::default(),
     }
@@ -200,6 +206,12 @@ fn get_string_vec(map: &HashMap<String, gray_matter::Pod>, key: &str) -> Vec<Str
         .unwrap_or_default()
 }
 
+fn get_u64(map: &HashMap<String, gray_matter::Pod>, key: &str) -> Option<u64> {
+    map.get(key)
+        .and_then(|v| v.as_i64().ok())
+        .and_then(|value| u64::try_from(value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +229,8 @@ metadata:
     execution:
       mode: "isolated"
       network: "egress-web"
+      script: "scripts/run.py"
+      timeout_ms: 3000
     models:
       preferred: "browser_model"
     data_sources:
@@ -243,6 +257,8 @@ Instructions for the agent to browse and summarize a page.
         assert_eq!(meta.requires.memory_partitions, vec!["workspace:default"]);
         assert_eq!(meta.execution.mode, "isolated");
         assert_eq!(meta.execution.network.as_deref(), Some("egress-web"));
+        assert_eq!(meta.execution.script.as_deref(), Some("scripts/run.py"));
+        assert_eq!(meta.execution.timeout_ms, Some(3000));
         assert_eq!(meta.models.preferred.as_deref(), Some("browser_model"));
         assert_eq!(meta.data_sources.markdown, vec!["data/bills.md"]);
         assert_eq!(meta.data_sources.csv, vec!["data/accounts.csv"]);
@@ -265,6 +281,8 @@ Do something simple.
         assert_eq!(meta.version, "0.0.0");
         assert!(meta.requires.mcp_servers.is_empty());
         assert_eq!(meta.execution.mode, "isolated");
+        assert!(meta.execution.script.is_none());
+        assert!(meta.execution.timeout_ms.is_none());
         assert!(meta.data_sources.markdown.is_empty());
         assert!(meta.data_sources.csv.is_empty());
         assert!(body.contains("Do something simple."));
