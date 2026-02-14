@@ -82,6 +82,12 @@ impl Default for MemoryConfig {
 pub struct ModelSlotConfig {
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_tool_call_retry_limit")]
+    pub tool_call_retry_limit: u32,
+}
+
+fn default_tool_call_retry_limit() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,4 +412,72 @@ capabilities.filesystem_roots = []
         );
     }
 
+    #[test]
+    fn model_slot_tool_call_retry_limit_defaults_to_one() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-model"
+
+[orchestrator]
+
+[agents.planner]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert_eq!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .tool_call_retry_limit,
+            1
+        );
+    }
+
+    #[test]
+    fn model_slot_tool_call_retry_limit_respects_explicit_value() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-model"
+tool_call_retry_limit = 3
+
+[orchestrator]
+
+[agents.planner]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert_eq!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .tool_call_retry_limit,
+            3
+        );
+    }
 }

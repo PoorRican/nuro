@@ -66,6 +66,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                tool_call_retry_limit: 1,
             },
         );
         slots.insert(
@@ -73,6 +74,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                tool_call_retry_limit: 1,
             },
         );
         slots.insert(
@@ -80,6 +82,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
+                tool_call_retry_limit: 1,
             },
         );
         ModelRouter::new(slots)

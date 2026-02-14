@@ -27,6 +27,7 @@ pub struct AgentRuntime {
     llm_client: Arc<dyn LlmClient>,
     tool_broker: Arc<dyn ToolBroker>,
     report_tx: tokio::sync::mpsc::Sender<SubAgentReport>,
+    tool_call_retry_limit: u32,
 }
 
 impl AgentRuntime {
@@ -35,12 +36,14 @@ impl AgentRuntime {
         llm_client: Arc<dyn LlmClient>,
         tool_broker: Arc<dyn ToolBroker>,
         report_tx: tokio::sync::mpsc::Sender<SubAgentReport>,
+        tool_call_retry_limit: u32,
     ) -> Self {
         Self {
             config,
             llm_client,
             tool_broker,
             report_tx,
+            tool_call_retry_limit,
         }
     }
 
@@ -493,7 +496,7 @@ mod tests {
         let mock_broker = Arc::new(MockToolBroker);
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        let runtime = AgentRuntime::new(test_config(), mock_llm, mock_broker, tx);
+        let runtime = AgentRuntime::new(test_config(), mock_llm, mock_broker, tx, 1);
         let mut task = Task::new(
             TriggerSource::Internal,
             "Say hello".into(),
@@ -534,7 +537,7 @@ mod tests {
         let mock_broker = Arc::new(MockToolBroker);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
 
-        let runtime = AgentRuntime::new(test_config(), mock_llm, mock_broker, tx);
+        let runtime = AgentRuntime::new(test_config(), mock_llm, mock_broker, tx, 1);
         let mut task = Task::new(
             TriggerSource::Internal,
             "Search for something".into(),
@@ -569,7 +572,7 @@ mod tests {
         let mut config = test_config();
         config.max_iterations = 3;
 
-        let runtime = AgentRuntime::new(config, mock_llm, mock_broker, tx);
+        let runtime = AgentRuntime::new(config, mock_llm, mock_broker, tx, 1);
         let mut task = Task::new(
             TriggerSource::Internal,
             "Infinite loop task".into(),

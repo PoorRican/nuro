@@ -175,6 +175,7 @@ impl MessageRuntime {
             let agent_config = agent_toml.to_agent_config(agent_id, system_prompt);
 
             let llm_client = build_llm_client(config, &agent_config)?;
+            let tool_call_retry_limit = resolve_tool_call_retry_limit(config, &agent_config);
             let broker: Arc<dyn ToolBroker> = Arc::new(SkillToolBroker::new(
                 agent_id,
                 &agent_config.capabilities.skills,
@@ -187,6 +188,7 @@ impl MessageRuntime {
                 llm_client,
                 broker,
                 report_tx.clone(),
+                tool_call_retry_limit,
             ));
             subagents.insert(agent_id.clone(), runtime);
         }
@@ -214,11 +216,14 @@ impl MessageRuntime {
         let orchestrator_config =
             build_orchestrator_config(config, allowlisted_system0_tools, orchestrator_prompt);
         let orchestrator_llm = build_llm_client(config, &orchestrator_config)?;
+        let orchestrator_tool_call_retry_limit =
+            resolve_tool_call_retry_limit(config, &orchestrator_config);
         let orchestrator_runtime = Arc::new(AgentRuntime::new(
             orchestrator_config,
             orchestrator_llm,
             Arc::new(system0_broker.clone()),
             report_tx,
+            orchestrator_tool_call_retry_limit,
         ));
 
         let core = Arc::new(AsyncMutex::new(RuntimeCore {
@@ -758,6 +763,19 @@ fn render_orchestrator_prompt(
         .replace("{{ORCHESTRATOR_ID}}", SYSTEM0_AGENT_ID)
         .replace("{{AVAILABLE_AGENTS}}", &rendered_agents)
         .replace("{{AVAILABLE_TOOLS}}", &rendered_tools)
+}
+
+fn resolve_tool_call_retry_limit(config: &NeuromancerConfig, agent_config: &AgentConfig) -> u32 {
+    let slot_name = agent_config
+        .models
+        .executor
+        .as_deref()
+        .unwrap_or("executor");
+    config
+        .models
+        .get(slot_name)
+        .map(|slot| slot.tool_call_retry_limit)
+        .unwrap_or(1)
 }
 
 fn build_llm_client(
