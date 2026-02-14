@@ -138,7 +138,10 @@ mod tests {
     #[test]
     fn provider_env_var_is_not_groq_only() {
         assert_eq!(provider_env_var("groq").as_deref(), Some("GROQ_API_KEY"));
-        assert_eq!(provider_env_var("openai").as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(
+            provider_env_var("openai").as_deref(),
+            Some("OPENAI_API_KEY")
+        );
         assert_eq!(
             provider_env_var("anthropic").as_deref(),
             Some("ANTHROPIC_API_KEY")
@@ -179,14 +182,20 @@ enabled = true
         let layout = XdgLayout::new(PathBuf::from("/tmp/home"));
         let targets = provider_credential_targets(&cfg, &layout);
         assert_eq!(targets.len(), 2);
-        assert!(targets
-            .iter()
-            .any(|target| target.env_var == "GROQ_API_KEY"));
-        assert!(targets
-            .iter()
-            .any(|target| target.env_var == "OPENAI_API_KEY"));
-        assert!(targets
-            .iter()
-            .all(|target| target.path.starts_with(layout.provider_keys_dir())));
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.env_var == "GROQ_API_KEY")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.env_var == "OPENAI_API_KEY")
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.path.starts_with(layout.provider_keys_dir()))
+        );
     }
 }

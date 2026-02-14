@@ -433,8 +433,14 @@ fn daemon_restart_command_restarts_running_daemon() {
 
     let restart_json = parse_json_output(&restart);
     assert_eq!(restart_json["ok"], Value::Bool(true));
-    assert_eq!(restart_json["result"]["previous_running"], Value::Bool(true));
-    assert_eq!(restart_json["result"]["start"]["healthy"], Value::Bool(true));
+    assert_eq!(
+        restart_json["result"]["previous_running"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        restart_json["result"]["start"]["healthy"],
+        Value::Bool(true)
+    );
 }
 
 #[test]
@@ -623,9 +629,7 @@ fn orchestrator_turn_routes_finance_queries_to_finance_manager_with_numeric_summ
     let delegated_runs = json["result"]["delegated_runs"]
         .as_array()
         .expect("delegated runs should exist");
-    let finance_run = delegated_runs
-        .first()
-        .expect("finance run should exist");
+    let finance_run = delegated_runs.first().expect("finance run should exist");
     assert_eq!(
         finance_run["agent_id"].as_str(),
         Some("finance-manager"),
@@ -778,7 +782,10 @@ fn install_command_creates_prompt_files() {
     assert_eq!(json["ok"], Value::Bool(true));
 
     let prompt_file = temp.path().join("prompts/orchestrator/SYSTEM.md");
-    assert!(prompt_file.exists(), "install should create orchestrator prompt");
+    assert!(
+        prompt_file.exists(),
+        "install should create orchestrator prompt"
+    );
 }
 
 #[test]
@@ -844,7 +851,10 @@ fn install_with_missing_explicit_config_bootstraps() {
     fs::create_dir_all(&home_dir).expect("home dir");
 
     let explicit_config = temp.path().join("custom-config/neuromancer.toml");
-    assert!(!explicit_config.exists(), "precondition: config should not exist");
+    assert!(
+        !explicit_config.exists(),
+        "precondition: config should not exist"
+    );
 
     let output = neuroctl()
         .arg("--json")

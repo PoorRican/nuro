@@ -141,7 +141,8 @@ impl XdgLayout {
     }
 
     pub fn default_agent_system_prompt_path(&self, agent_id: &str) -> PathBuf {
-        self.config_root.join(format!("agents/{agent_id}/SYSTEM.md"))
+        self.config_root
+            .join(format!("agents/{agent_id}/SYSTEM.md"))
     }
 }
 
@@ -215,8 +216,14 @@ mod tests {
     #[test]
     fn default_layout_paths_are_stable() {
         let layout = XdgLayout::new(PathBuf::from("/tmp/home"));
-        assert_eq!(layout.config_root(), PathBuf::from("/tmp/home/.config/neuromancer"));
-        assert_eq!(layout.runtime_root(), PathBuf::from("/tmp/home/.local/neuromancer"));
+        assert_eq!(
+            layout.config_root(),
+            PathBuf::from("/tmp/home/.config/neuromancer")
+        );
+        assert_eq!(
+            layout.runtime_root(),
+            PathBuf::from("/tmp/home/.local/neuromancer")
+        );
         assert_eq!(
             layout.runtime_home_root(),
             PathBuf::from("/tmp/home/.local/neuromancer")
@@ -239,8 +246,14 @@ mod tests {
     fn xdg_config_and_data_home_override_default_roots() {
         let layout =
             XdgLayout::from_home_and_xdg_str("/home/user", Some("/xdg/config"), Some("/xdg/data"));
-        assert_eq!(layout.config_root(), PathBuf::from("/xdg/config/neuromancer"));
-        assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/data/neuromancer"));
+        assert_eq!(
+            layout.config_root(),
+            PathBuf::from("/xdg/config/neuromancer")
+        );
+        assert_eq!(
+            layout.runtime_root(),
+            PathBuf::from("/xdg/data/neuromancer")
+        );
         assert_eq!(
             layout.runtime_home_root(),
             PathBuf::from("/xdg/data/neuromancer")
@@ -256,7 +269,10 @@ mod tests {
             Some(PathBuf::from("/xdg/data")),
             Some(PathBuf::from("/xdg/runtime")),
         );
-        assert_eq!(layout.runtime_root(), PathBuf::from("/xdg/data/neuromancer"));
+        assert_eq!(
+            layout.runtime_root(),
+            PathBuf::from("/xdg/data/neuromancer")
+        );
         assert_eq!(
             layout.runtime_home_root(),
             PathBuf::from("/xdg/runtime/neuromancer")

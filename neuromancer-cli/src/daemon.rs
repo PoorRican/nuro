@@ -108,12 +108,12 @@ pub async fn start_daemon(options: &DaemonStartOptions) -> Result<DaemonStartRes
     }
 
     let child = command.spawn().map_err(|err| {
-            CliError::Lifecycle(format!(
-                "failed to spawn daemon '{}' with config '{}': {err}",
-                daemon_bin.display(),
-                options.config.display()
-            ))
-        })?;
+        CliError::Lifecycle(format!(
+            "failed to spawn daemon '{}' with config '{}': {err}",
+            daemon_bin.display(),
+            options.config.display()
+        ))
+    })?;
 
     let pid = i32::try_from(child.id())
         .map_err(|_| CliError::Lifecycle("daemon pid did not fit in i32".to_string()))?;

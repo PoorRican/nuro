@@ -44,7 +44,12 @@ pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallR
     let mut overwritten = Vec::new();
     let mut warnings = Vec::new();
 
-    copy_defaults_tree(&bootstrap_dir, &layout.config_root(), &mut created, &mut existing)?;
+    copy_defaults_tree(
+        &bootstrap_dir,
+        &layout.config_root(),
+        &mut created,
+        &mut existing,
+    )?;
     ensure_dir(&layout.runtime_root(), &mut created, &mut existing)?;
     ensure_dir(&layout.runtime_home_root(), &mut created, &mut existing)?;
     ensure_dir(&layout.provider_keys_dir(), &mut created, &mut existing)?;
@@ -52,7 +57,12 @@ pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallR
 
     // When --config points somewhere other than the default XDG config file, bootstrap it too.
     if config_path != layout.default_config_path() {
-        ensure_file_from_source(config_path, &default_config_src, &mut created, &mut existing)?;
+        ensure_file_from_source(
+            config_path,
+            &default_config_src,
+            &mut created,
+            &mut existing,
+        )?;
     }
     if override_config {
         overwrite_file_from_source(
@@ -115,13 +125,7 @@ pub fn run_install(config_path: &Path, override_config: bool) -> Result<InstallR
         )?;
     }
 
-    bootstrap_provider_keys(
-        &config,
-        &layout,
-        &mut created,
-        &mut existing,
-        &mut warnings,
-    )?;
+    bootstrap_provider_keys(&config, &layout, &mut created, &mut existing, &mut warnings)?;
 
     Ok(InstallResult {
         created,
@@ -288,14 +292,21 @@ fn copy_dir_recursive(
     Ok(())
 }
 
-fn ensure_dir(path: &Path, created: &mut Vec<String>, existing: &mut Vec<String>) -> Result<(), CliError> {
+fn ensure_dir(
+    path: &Path,
+    created: &mut Vec<String>,
+    existing: &mut Vec<String>,
+) -> Result<(), CliError> {
     if path.exists() {
         existing.push(path.display().to_string());
         return Ok(());
     }
 
     fs::create_dir_all(path).map_err(|err| {
-        CliError::Lifecycle(format!("failed to create directory '{}': {err}", path.display()))
+        CliError::Lifecycle(format!(
+            "failed to create directory '{}': {err}",
+            path.display()
+        ))
     })?;
     created.push(path.display().to_string());
     Ok(())
@@ -454,7 +465,11 @@ mod tests {
 
         let current = fs::read_to_string(&prompt_path).expect("read");
         assert_eq!(current, "original");
-        assert!(existing.iter().any(|p| p == &prompt_path.display().to_string()));
+        assert!(
+            existing
+                .iter()
+                .any(|p| p == &prompt_path.display().to_string())
+        );
     }
 
     #[test]
@@ -473,7 +488,11 @@ mod tests {
 
         let current = fs::read_to_string(&config_path).expect("read");
         assert_eq!(current, "original");
-        assert!(existing.iter().any(|p| p == &config_path.display().to_string()));
+        assert!(
+            existing
+                .iter()
+                .any(|p| p == &config_path.display().to_string())
+        );
     }
 
     #[test]
@@ -492,9 +511,11 @@ mod tests {
 
         let current = fs::read_to_string(&config_path).expect("read");
         assert_eq!(current, "replacement");
-        assert!(overwritten
-            .iter()
-            .any(|p| p == &config_path.display().to_string()));
+        assert!(
+            overwritten
+                .iter()
+                .any(|p| p == &config_path.display().to_string())
+        );
     }
 
     #[test]
