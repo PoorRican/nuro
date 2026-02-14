@@ -95,6 +95,9 @@ pub struct DelegatedRun {
     pub agent_id: String,
     pub state: String,
     pub summary: Option<String>,
+    pub thread_id: Option<String>,
+    pub initial_instruction: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +130,77 @@ pub struct OrchestratorRunGetParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorRunGetResult {
     pub run: DelegatedRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub kind: String,
+    pub agent_id: Option<String>,
+    pub latest_run_id: Option<String>,
+    pub state: String,
+    pub updated_at: String,
+    pub resurrected: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorThreadsListResult {
+    pub threads: Vec<ThreadSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorThreadGetParams {
+    pub thread_id: String,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadEvent {
+    pub event_id: String,
+    pub thread_id: String,
+    pub thread_kind: String,
+    pub seq: u64,
+    pub ts: String,
+    pub event_type: String,
+    pub agent_id: Option<String>,
+    pub run_id: Option<String>,
+    pub payload: serde_json::Value,
+    pub redaction_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorThreadGetResult {
+    pub thread_id: String,
+    pub events: Vec<ThreadEvent>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorThreadResurrectParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorThreadResurrectResult {
+    pub thread: ThreadSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorSubagentTurnParams {
+    pub thread_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorSubagentTurnResult {
+    pub thread_id: String,
+    pub run: DelegatedRun,
+    pub response: String,
+    pub tool_invocations: Vec<OrchestratorToolInvocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +263,9 @@ mod tests {
                 agent_id: "finance_manager".to_string(),
                 state: "completed".to_string(),
                 summary: Some("delegation summary".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                initial_instruction: Some("collect balances".to_string()),
+                error: None,
             }],
             tool_invocations: vec![OrchestratorToolInvocation {
                 call_id: "call-1".to_string(),
@@ -213,6 +290,9 @@ mod tests {
                 agent_id: "planner".to_string(),
                 state: "completed".to_string(),
                 summary: Some("ok".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                initial_instruction: Some("do thing".to_string()),
+                error: None,
             }],
         };
 
@@ -220,6 +300,27 @@ mod tests {
         let decoded: OrchestratorRunsListResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn thread_event_roundtrip() {
+        let event = ThreadEvent {
+            event_id: "e1".to_string(),
+            thread_id: "thread-1".to_string(),
+            thread_kind: "subagent".to_string(),
+            seq: 42,
+            ts: "2026-02-14T12:00:00Z".to_string(),
+            event_type: "message_assistant".to_string(),
+            agent_id: Some("finance-manager".to_string()),
+            run_id: Some("run-1".to_string()),
+            payload: serde_json::json!({"content":"hello"}),
+            redaction_applied: false,
+        };
+
+        let encoded = serde_json::to_string(&event).expect("event should serialize");
+        let decoded: ThreadEvent =
+            serde_json::from_str(&encoded).expect("event should deserialize");
+        assert_eq!(decoded, event);
     }
 
     #[test]

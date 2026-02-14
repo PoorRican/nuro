@@ -16,7 +16,10 @@ use neuromancer_core::rpc::{
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
-    OrchestratorRunsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
+    OrchestratorRunsListResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
+    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
+    OrchestratorTurnResult,
 };
 
 #[derive(Clone)]
@@ -117,6 +120,70 @@ async fn op_orchestrator_context_get(
         .await
         .map_err(map_message_runtime_error)?;
     Ok(OrchestratorContextGetResult { messages })
+}
+
+async fn op_orchestrator_threads_list(
+    state: &AppState,
+) -> Result<OrchestratorThreadsListResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    let threads = runtime
+        .orchestrator_threads_list()
+        .await
+        .map_err(map_message_runtime_error)?;
+    Ok(OrchestratorThreadsListResult { threads })
+}
+
+async fn op_orchestrator_thread_get(
+    state: &AppState,
+    params: OrchestratorThreadGetParams,
+) -> Result<OrchestratorThreadGetResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_thread_get(params)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_thread_resurrect(
+    state: &AppState,
+    params: OrchestratorThreadResurrectParams,
+) -> Result<OrchestratorThreadResurrectResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_thread_resurrect(params.thread_id)
+        .await
+        .map_err(map_message_runtime_error)
+}
+
+async fn op_orchestrator_subagent_turn(
+    state: &AppState,
+    params: OrchestratorSubagentTurnParams,
+) -> Result<OrchestratorSubagentTurnResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_subagent_turn(params.thread_id, params.message)
+        .await
+        .map_err(map_message_runtime_error)
 }
 
 #[derive(Debug)]
@@ -278,6 +345,41 @@ async fn dispatch_rpc(
                     Ok(result) => to_value(&result),
                     Err(err) => Err(err),
                 }
+            }
+        }
+        "orchestrator.threads.list" => {
+            if let Err(err) = require_no_params_or_empty_object(params.as_ref()) {
+                Err(err)
+            } else {
+                match op_orchestrator_threads_list(state).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                }
+            }
+        }
+        "orchestrator.threads.get" => match parse_params::<OrchestratorThreadGetParams>(params) {
+            Ok(req) => match op_orchestrator_thread_get(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
+        "orchestrator.threads.resurrect" => {
+            match parse_params::<OrchestratorThreadResurrectParams>(params) {
+                Ok(req) => match op_orchestrator_thread_resurrect(state, req).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            }
+        }
+        "orchestrator.subagent.turn" => {
+            match parse_params::<OrchestratorSubagentTurnParams>(params) {
+                Ok(req) => match op_orchestrator_subagent_turn(state, req).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
             }
         }
         _ => Err(RpcMethodError::method_not_found(format!(

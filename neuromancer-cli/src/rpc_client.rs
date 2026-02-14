@@ -1,10 +1,14 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
-    OrchestratorRunsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
+    OrchestratorRunsListResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
+    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
+    OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -23,10 +27,11 @@ pub enum RpcClientError {
     Rpc(i64, String),
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     http: reqwest::Client,
     endpoint: String,
-    next_id: AtomicI64,
+    next_id: Arc<AtomicI64>,
 }
 
 impl RpcClient {
@@ -41,7 +46,7 @@ impl RpcClient {
         Ok(Self {
             http,
             endpoint,
-            next_id: AtomicI64::new(1),
+            next_id: Arc::new(AtomicI64::new(1)),
         })
     }
 
@@ -159,10 +164,59 @@ impl RpcClient {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn orchestrator_context_get(
         &self,
     ) -> Result<OrchestratorContextGetResult, RpcClientError> {
         self.call_typed("orchestrator.context.get", None).await
+    }
+
+    pub async fn orchestrator_threads_list(
+        &self,
+    ) -> Result<OrchestratorThreadsListResult, RpcClientError> {
+        self.call_typed("orchestrator.threads.list", None).await
+    }
+
+    pub async fn orchestrator_thread_get(
+        &self,
+        params: OrchestratorThreadGetParams,
+    ) -> Result<OrchestratorThreadGetResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.threads.get",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_thread_resurrect(
+        &self,
+        params: OrchestratorThreadResurrectParams,
+    ) -> Result<OrchestratorThreadResurrectResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.threads.resurrect",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_subagent_turn(
+        &self,
+        params: OrchestratorSubagentTurnParams,
+    ) -> Result<OrchestratorSubagentTurnResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.subagent.turn",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
     }
 }
 
