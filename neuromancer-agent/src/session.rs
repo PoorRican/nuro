@@ -66,4 +66,9 @@ impl InMemorySessionStore {
             },
         );
     }
+
+    pub async fn get(&self, session_id: AgentSessionId) -> Option<AgentSessionState> {
+        let sessions = self.sessions.read().await;
+        sessions.get(&session_id).cloned()
+    }
 }

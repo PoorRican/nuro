@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
-    OrchestratorTurnParams, OrchestratorTurnResult,
+    OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
+    OrchestratorRunsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -63,8 +63,8 @@ impl RpcClient {
             params,
             id: Some(id.clone()),
         };
-        let request_debug =
-            serde_json::to_string(&request).unwrap_or_else(|_| format!("{{\"method\":\"{method}\"}}"));
+        let request_debug = serde_json::to_string(&request)
+            .unwrap_or_else(|_| format!("{{\"method\":\"{method}\"}}"));
 
         let response = self
             .http
@@ -139,7 +139,9 @@ impl RpcClient {
         .await
     }
 
-    pub async fn orchestrator_runs_list(&self) -> Result<OrchestratorRunsListResult, RpcClientError> {
+    pub async fn orchestrator_runs_list(
+        &self,
+    ) -> Result<OrchestratorRunsListResult, RpcClientError> {
         self.call_typed("orchestrator.runs.list", None).await
     }
 
@@ -155,6 +157,12 @@ impl RpcClient {
             ),
         )
         .await
+    }
+
+    pub async fn orchestrator_context_get(
+        &self,
+    ) -> Result<OrchestratorContextGetResult, RpcClientError> {
+        self.call_typed("orchestrator.context.get", None).await
     }
 }
 

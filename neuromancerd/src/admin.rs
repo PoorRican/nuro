@@ -15,8 +15,8 @@ use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
-    OrchestratorTurnParams, OrchestratorTurnResult,
+    OrchestratorContextGetResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
+    OrchestratorRunsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
 };
 
 #[derive(Clone)]
@@ -101,6 +101,22 @@ async fn op_orchestrator_run_get(
         .await
         .map_err(map_message_runtime_error)?;
     Ok(OrchestratorRunGetResult { run })
+}
+
+async fn op_orchestrator_context_get(
+    state: &AppState,
+) -> Result<OrchestratorContextGetResult, RpcMethodError> {
+    let Some(runtime) = &state.message_runtime else {
+        return Err(RpcMethodError::internal(
+            "message runtime is not initialized".to_string(),
+        ));
+    };
+
+    let messages = runtime
+        .orchestrator_context_get()
+        .await
+        .map_err(map_message_runtime_error)?;
+    Ok(OrchestratorContextGetResult { messages })
 }
 
 #[derive(Debug)]
@@ -254,6 +270,16 @@ async fn dispatch_rpc(
             },
             Err(err) => Err(err),
         },
+        "orchestrator.context.get" => {
+            if let Err(err) = require_no_params_or_empty_object(params.as_ref()) {
+                Err(err)
+            } else {
+                match op_orchestrator_context_get(state).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                }
+            }
+        }
         _ => Err(RpcMethodError::method_not_found(format!(
             "Method '{}' not found",
             method
