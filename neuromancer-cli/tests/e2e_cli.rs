@@ -670,6 +670,74 @@ fn orchestrator_turn_routes_finance_queries_to_finance_manager_with_numeric_summ
         .success();
 }
 
+#[test]
+fn orchestrator_chat_ndjson_streams_snapshot_and_turn_events() {
+    let temp = TempDir::new().expect("tempdir");
+    let (addr, bind_addr) = allocate_addrs();
+    let config = write_orchestrator_config(temp.path(), &bind_addr);
+    let pid_file = temp.path().join("daemon.pid");
+    let _cleanup = Cleanup {
+        pid_file: pid_file.clone(),
+    };
+    run_install(&config, &addr);
+
+    neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("daemon")
+        .arg("start")
+        .arg("--config")
+        .arg(&config)
+        .arg("--daemon-bin")
+        .arg(daemon_bin())
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--wait-healthy")
+        .assert()
+        .success();
+
+    let output = neuroctl()
+        .arg("--json")
+        .arg("--addr")
+        .arg(&addr)
+        .arg("orchestrator")
+        .arg("chat")
+        .write_stdin("{\"message\":\"first line\\nsecond line\"}\nplain follow-up\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rendered = String::from_utf8(output).expect("stdout should be utf8");
+    let events: Vec<Value> = rendered
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every line should be JSON"))
+        .collect();
+
+    assert!(
+        events.len() >= 3,
+        "expected snapshot + two turn events, got {}",
+        events.len()
+    );
+    assert_eq!(events[0]["event"], Value::String("snapshot".to_string()));
+    assert!(events[0]["system_thread"]["messages"].is_array());
+
+    let completes: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == Value::String("turn_complete".to_string()))
+        .collect();
+    assert_eq!(completes.len(), 2, "expected two turn_complete events");
+    assert!(
+        completes[0]["input"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('\n'),
+        "first NDJSON payload should preserve embedded newlines",
+    );
+    assert!(completes[0]["runs"].is_array());
+
     neuroctl()
         .arg("--json")
         .arg("--addr")
