@@ -464,22 +464,6 @@ impl RuntimeCore {
         let delegated_runs = self.system0_broker.take_runs(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
 
-        let _ = self
-            .thread_journal
-            .append_event(ThreadEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                thread_id: SYSTEM0_AGENT_ID.to_string(),
-                thread_kind: "system".to_string(),
-                seq: 0,
-                ts: now_rfc3339(),
-                event_type: "message_assistant".to_string(),
-                agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
-                run_id: Some(turn_id.to_string()),
-                payload: serde_json::json!({ "role": "assistant", "content": response.clone() }),
-                redaction_applied: false,
-            })
-            .await;
-
         for invocation in &tool_invocations {
             let _ = self
                 .thread_journal
@@ -521,6 +505,22 @@ impl RuntimeCore {
                 })
                 .await;
         }
+
+        let _ = self
+            .thread_journal
+            .append_event(ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: SYSTEM0_AGENT_ID.to_string(),
+                thread_kind: "system".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "message_assistant".to_string(),
+                agent_id: Some(SYSTEM0_AGENT_ID.to_string()),
+                run_id: Some(turn_id.to_string()),
+                payload: serde_json::json!({ "role": "assistant", "content": response.clone() }),
+                redaction_applied: false,
+            })
+            .await;
         tracing::info!(
             turn_id = %turn_id,
             delegated_runs = delegated_runs.len(),
