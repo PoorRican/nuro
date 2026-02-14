@@ -27,6 +27,7 @@ Entry point: `AgentRuntime::execute(&self, task: &mut Task) -> Result<TaskOutput
 | `conversation.rs` | `ConversationContext` + `ChatMessage` — token-budgeted message buffer with truncation |
 | `llm.rs` | `LlmClient` trait + `RigLlmClient<M>` adapter + `MockLlmClient` for tests |
 | `model_router.rs` | `ModelRouter` — resolves agent role slots to `ModelSlotConfig` |
+| `session.rs` | `InMemorySessionStore` — per-session conversation state (`load_or_create`, `save_conversation`, `get`) with `AgentSessionId` and `AgentSessionState` |
 
 ## Architecture
 
