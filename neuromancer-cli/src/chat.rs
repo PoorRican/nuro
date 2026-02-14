@@ -415,6 +415,32 @@ enum ThreadKind {
     Subagent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainFilter {
+    All,
+    DelegatesOnly,
+    FailuresOnly,
+    SystemToolsOnly,
+}
+
+impl MainFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::DelegatesOnly => "delegates",
+            Self::FailuresOnly => "failures",
+            Self::SystemToolsOnly => "system-tools",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TimelineRenderMeta {
+    seq: Option<u64>,
+    ts: Option<String>,
+    redaction_applied: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 enum TimelineItem {
     Text {
@@ -428,6 +454,7 @@ enum TimelineItem {
         status: String,
         arguments: serde_json::Value,
         output: serde_json::Value,
+        meta: Option<TimelineRenderMeta>,
         expanded: bool,
     },
     DelegateInvocation {
@@ -441,6 +468,7 @@ enum TimelineItem {
         error: Option<String>,
         arguments: serde_json::Value,
         output: serde_json::Value,
+        meta: Option<TimelineRenderMeta>,
         expanded: bool,
     },
 }
@@ -456,7 +484,12 @@ impl TimelineItem {
         }
     }
 
-    fn lines(&self, selected: bool, assistant_label: &str) -> Vec<Line<'static>> {
+    fn lines(
+        &self,
+        selected: bool,
+        assistant_label: &str,
+        selected_fill_width: Option<usize>,
+    ) -> Vec<Line<'static>> {
         let mut lines = match self {
             TimelineItem::Text {
                 role,
@@ -510,14 +543,21 @@ impl TimelineItem {
                 status,
                 arguments,
                 output,
+                meta,
                 expanded,
             } => {
                 let mut lines = Vec::new();
+                let (badge, badge_color) = match tool_id.as_str() {
+                    "list_agents" => ("[AGENTS] ", Color::Cyan),
+                    "read_config" => ("[CONFIG] ", Color::Magenta),
+                    "modify_skill" => ("[SKILL] ", Color::LightBlue),
+                    _ => ("[TOOL] ", Color::Yellow),
+                };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "[TOOL] ",
+                        badge,
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(badge_color)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(tool_id.clone(), Style::default().fg(Color::Gray)),
@@ -532,10 +572,155 @@ impl TimelineItem {
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
+
+                match tool_id.as_str() {
+                    "list_agents" => {
+                        let agents = output
+                            .get("agents")
+                            .and_then(|value| value.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let visible = if *expanded { agents.len() } else { agents.len().min(4) };
+                        lines.push(Line::from(vec![
+                            Span::styled("  agents: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(format!("{} found", agents.len())),
+                        ]));
+                        for agent in agents.iter().take(visible) {
+                            let agent_id = json_string_field(agent, "agent_id")
+                                .or_else(|| json_string_field(agent, "id"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let state = json_string_field(agent, "state")
+                                .or_else(|| json_string_field(agent, "status"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let thread = json_string_field(agent, "thread_id")
+                                .or_else(|| json_string_field(agent, "latest_thread_id"))
+                                .map(|id| short_id(&id))
+                                .unwrap_or_else(|| "-".to_string());
+                            let run = json_string_field(agent, "run_id")
+                                .or_else(|| json_string_field(agent, "latest_run_id"))
+                                .map(|id| short_id(&id))
+                                .unwrap_or_else(|| "-".to_string());
+                            lines.push(Line::from(vec![
+                                Span::styled("  - ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(agent_id, Style::default().fg(Color::Cyan)),
+                                Span::raw(" ["),
+                                Span::styled(state, status_style(status)),
+                                Span::raw("] "),
+                                Span::styled("thread=", Style::default().fg(Color::DarkGray)),
+                                Span::raw(thread),
+                                Span::styled(" run=", Style::default().fg(Color::DarkGray)),
+                                Span::raw(run),
+                            ]));
+                        }
+                        if !*expanded && agents.len() > visible {
+                            lines.push(Line::from(Span::styled(
+                                format!("  ... {} more (expand for full list)", agents.len() - visible),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    "read_config" => {
+                        let mut sections = output
+                            .as_object()
+                            .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        sections.sort();
+                        let section_count = sections.len();
+                        let preview_len = if *expanded {
+                            section_count
+                        } else {
+                            section_count.min(6)
+                        };
+                        let preview = sections
+                            .iter()
+                            .take(preview_len)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(Line::from(vec![
+                            Span::styled("  snapshot: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(format!("{section_count} top-level sections")),
+                        ]));
+                        if !preview.is_empty() {
+                            lines.push(Line::from(vec![
+                                Span::styled("  sections: ", Style::default().fg(Color::DarkGray)),
+                                Span::raw(preview),
+                            ]));
+                        }
+                        lines.push(Line::from(vec![
+                            Span::styled("  redaction: ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                if contains_redaction_marker(output) { "yes" } else { "no" },
+                                Style::default().fg(if contains_redaction_marker(output) {
+                                    Color::Yellow
+                                } else {
+                                    Color::Green
+                                }),
+                            ),
+                        ]));
+                        if !*expanded && section_count > preview_len {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "  ... {} more sections (expand for full snapshot)",
+                                    section_count - preview_len
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                    }
+                    "modify_skill" => {
+                        let status_preview = output
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| output.get("result").and_then(|value| value.as_str()))
+                            .unwrap_or("unknown");
+                        let reason_preview = output
+                            .get("reason")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| output.get("error").and_then(|value| value.as_str()))
+                            .unwrap_or("n/a");
+                        lines.push(Line::from(vec![
+                            Span::styled("  action: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(status_preview.to_string()),
+                        ]));
+                        lines.push(Line::from(vec![
+                            Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(text_preview_lines(reason_preview, 1, 180).join(" ")),
+                        ]));
+                    }
+                    _ => {}
+                }
+
                 if *expanded {
                     lines.push(Line::from(vec![
                         Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    let seq = meta
+                        .as_ref()
+                        .and_then(|value| value.seq)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let ts = meta
+                        .as_ref()
+                        .and_then(|value| value.ts.clone())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let redaction = meta
+                        .as_ref()
+                        .and_then(|value| value.redaction_applied)
+                        .map(|flag| if flag { "yes" } else { "no" })
+                        .unwrap_or("n/a");
+                    let linked_thread = json_string_field(output, "thread_id")
+                        .map(|id| short_id(&id))
+                        .unwrap_or_else(|| "-".to_string());
+                    let linked_run = json_string_field(output, "run_id")
+                        .map(|id| short_id(&id))
+                        .unwrap_or_else(|| "-".to_string());
+                    lines.push(Line::from(vec![
+                        Span::styled("  meta: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!(
+                            "status={status} thread={linked_thread} run={linked_run} seq={seq} ts={ts} redacted={redaction}"
+                        )),
                     ]));
                     lines.push(Line::from(Span::styled(
                         "  arguments:",
@@ -566,6 +751,7 @@ impl TimelineItem {
                 error,
                 arguments,
                 output,
+                meta,
                 expanded,
             } => {
                 let mut lines = Vec::new();
@@ -637,6 +823,34 @@ impl TimelineItem {
                         Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
                     ]));
+                    let seq = meta
+                        .as_ref()
+                        .and_then(|value| value.seq)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let ts = meta
+                        .as_ref()
+                        .and_then(|value| value.ts.clone())
+                        .unwrap_or_else(|| "n/a".to_string());
+                    let redaction = meta
+                        .as_ref()
+                        .and_then(|value| value.redaction_applied)
+                        .map(|flag| if flag { "yes" } else { "no" })
+                        .unwrap_or("n/a");
+                    let linked_thread = thread_id
+                        .as_ref()
+                        .map(|id| short_id(id))
+                        .unwrap_or_else(|| "-".to_string());
+                    let linked_run = run_id
+                        .as_ref()
+                        .map(|id| short_id(id))
+                        .unwrap_or_else(|| "-".to_string());
+                    lines.push(Line::from(vec![
+                        Span::styled("  meta: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!(
+                            "status={status} thread={linked_thread} run={linked_run} seq={seq} ts={ts} redacted={redaction}"
+                        )),
+                    ]));
                     lines.push(Line::from(Span::styled(
                         "  arguments:",
                         Style::default().fg(Color::Gray),
@@ -658,10 +872,18 @@ impl TimelineItem {
         };
 
         if selected {
+            let selected_style = Style::default().bg(Color::DarkGray).fg(Color::White);
             for line in &mut lines {
-                *line = line
-                    .clone()
-                    .patch_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                *line = line.clone().patch_style(selected_style);
+                if let Some(fill_width) = selected_fill_width {
+                    let width = line.width();
+                    if fill_width > width {
+                        line.spans.push(Span::styled(
+                            " ".repeat(fill_width - width),
+                            selected_style,
+                        ));
+                    }
+                }
             }
         }
 
@@ -681,6 +903,7 @@ impl TimelineItem {
                 status,
                 arguments,
                 output,
+                meta,
                 ..
             } => serde_json::json!({
                 "role": "tool",
@@ -690,6 +913,11 @@ impl TimelineItem {
                 "status": status,
                 "arguments": arguments,
                 "output": output,
+                "meta": meta.as_ref().map(|meta| serde_json::json!({
+                    "seq": meta.seq,
+                    "ts": meta.ts,
+                    "redaction_applied": meta.redaction_applied,
+                })),
             }),
             TimelineItem::DelegateInvocation {
                 call_id,
@@ -702,6 +930,7 @@ impl TimelineItem {
                 error,
                 arguments,
                 output,
+                meta,
                 ..
             } => serde_json::json!({
                 "role": "tool",
@@ -716,6 +945,11 @@ impl TimelineItem {
                 "error": error,
                 "arguments": arguments,
                 "output": output,
+                "meta": meta.as_ref().map(|meta| serde_json::json!({
+                    "seq": meta.seq,
+                    "ts": meta.ts,
+                    "redaction_applied": meta.redaction_applied,
+                })),
             }),
         }
     }
@@ -883,7 +1117,6 @@ impl ThreadView {
                 .unwrap_or_else(|| "Assistant".to_string()),
         }
     }
-
     fn apply_summary(&mut self, summary: &ThreadSummary) {
         self.agent_id = summary.agent_id.clone();
         self.state = summary.state.clone();
@@ -910,6 +1143,7 @@ struct ChatApp {
     sidebar_selected: usize,
     active_thread: usize,
     focus: FocusPane,
+    main_filter: MainFilter,
     selected_item_by_thread: HashMap<String, usize>,
     vertical_scroll_by_thread: HashMap<String, usize>,
     horizontal_scroll_by_thread: HashMap<String, usize>,
@@ -928,6 +1162,7 @@ impl ChatApp {
             sidebar_selected: 0,
             active_thread: 0,
             focus: FocusPane::Input,
+            main_filter: MainFilter::All,
             selected_item_by_thread: HashMap::new(),
             vertical_scroll_by_thread: HashMap::new(),
             horizontal_scroll_by_thread: HashMap::new(),
@@ -1311,11 +1546,24 @@ impl ChatApp {
         let selected = self
             .current_thread_selected_item()
             .min(thread.items.len().saturating_sub(1));
-        let (lines, ranges) = build_thread_lines(&thread, selected);
+        let horizontal_offset = self
+            .horizontal_scroll_by_thread
+            .get(&thread.id)
+            .copied()
+            .unwrap_or(0);
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let selected_fill_width = horizontal_offset.saturating_add(inner_width.max(1));
+        let (lines, ranges, selected_visible_idx) =
+            build_thread_lines(&thread, selected, selected_fill_width, self.main_filter);
         let viewport_rows = area.height.saturating_sub(2) as usize;
         self.last_main_viewport_rows = viewport_rows.max(1);
 
-        self.ensure_selected_visible_for(&thread.id, &ranges, viewport_rows.max(1));
+        self.ensure_selected_visible_for(
+            &thread.id,
+            &ranges,
+            viewport_rows.max(1),
+            selected_visible_idx,
+        );
 
         let max_vertical = lines.len().saturating_sub(viewport_rows.max(1));
         let mut vertical_offset = self
@@ -1327,23 +1575,9 @@ impl ChatApp {
         self.vertical_scroll_by_thread
             .insert(thread.id.clone(), vertical_offset);
 
-        let horizontal_offset = self
-            .horizontal_scroll_by_thread
-            .get(&thread.id)
-            .copied()
-            .unwrap_or(0);
-
-        let horizontal_scroll = if thread.kind == ThreadKind::System {
-            0
-        } else {
-            horizontal_offset
-        };
-        let mut paragraph = Paragraph::new(Text::from(lines))
+        let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
-            .scroll((vertical_offset as u16, horizontal_scroll as u16));
-        if thread.kind == ThreadKind::System {
-            paragraph = paragraph.wrap(Wrap { trim: false });
-        }
+            .scroll((vertical_offset as u16, horizontal_offset as u16));
 
         frame.render_widget(paragraph, area);
 
@@ -1403,7 +1637,10 @@ impl ChatApp {
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
         let status = self.status.clone().unwrap_or_else(|| {
-            "Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | Ctrl+J/Ctrl+N/Shift+Enter: newline | q: quit".to_string()
+            format!(
+                "Filter: {} (1:all 2:delegates 3:failures 4:system-tools) | Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | Ctrl+J/Ctrl+N/Shift+Enter: newline | q: quit",
+                self.main_filter.label()
+            )
         });
         let text = Text::from(Line::from(vec![Span::styled(
             status,
@@ -1598,6 +1835,22 @@ impl ChatApp {
                 }
                 FocusPane::Main => self.open_selected_main_link(),
             },
+            KeyCode::Char('1') if self.focus == FocusPane::Main && key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::All);
+                AppAction::None
+            }
+            KeyCode::Char('2') if self.focus == FocusPane::Main && key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::DelegatesOnly);
+                AppAction::None
+            }
+            KeyCode::Char('3') if self.focus == FocusPane::Main && key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::FailuresOnly);
+                AppAction::None
+            }
+            KeyCode::Char('4') if self.focus == FocusPane::Main && key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::SystemToolsOnly);
+                AppAction::None
+            }
             KeyCode::Char(ch) => {
                 if self.focus == FocusPane::Input
                     && !read_only_input
@@ -1644,19 +1897,31 @@ impl ChatApp {
     }
 
     fn select_main_prev(&mut self) {
+        let visible = self.current_visible_item_indices();
+        if visible.is_empty() {
+            return;
+        }
         let selected = self.current_thread_selected_item();
-        self.set_current_thread_selected_item(selected.saturating_sub(1));
+        let current_pos = selected_visible_position(&visible, selected);
+        let new_pos = current_pos.saturating_sub(1);
+        self.set_current_thread_selected_item(visible[new_pos]);
         self.ensure_selected_visible_current();
     }
 
     fn select_main_next(&mut self) {
-        let max = self.current_thread().items.len().saturating_sub(1);
+        let visible = self.current_visible_item_indices();
+        if visible.is_empty() {
+            return;
+        }
         let selected = self.current_thread_selected_item();
-        self.set_current_thread_selected_item((selected + 1).min(max));
+        let current_pos = selected_visible_position(&visible, selected);
+        let new_pos = (current_pos + 1).min(visible.len().saturating_sub(1));
+        self.set_current_thread_selected_item(visible[new_pos]);
         self.ensure_selected_visible_current();
     }
 
     fn toggle_selected_item(&mut self) {
+        self.align_selection_to_filter_current();
         let selected = self.current_thread_selected_item();
         let thread_id = self.current_thread().id.clone();
         if let Some(item) = self
@@ -1675,6 +1940,7 @@ impl ChatApp {
         self.active_thread = self
             .sidebar_selected
             .min(self.threads.len().saturating_sub(1));
+        self.focus = FocusPane::Main;
 
         let thread = self.current_thread().clone();
         if thread.id == SYSTEM_THREAD_ID {
@@ -1691,6 +1957,7 @@ impl ChatApp {
     }
 
     fn open_selected_main_link(&mut self) -> AppAction {
+        self.align_selection_to_filter_current();
         let selected = self.current_thread_selected_item();
         let Some(thread_id) = self
             .current_thread()
@@ -1728,6 +1995,7 @@ impl ChatApp {
 
         self.active_thread = idx;
         self.sidebar_selected = idx;
+        self.focus = FocusPane::Main;
         true
     }
 
@@ -1761,13 +2029,60 @@ impl ChatApp {
         self.horizontal_scroll_by_thread.insert(thread_id, offset);
     }
 
+    fn set_main_filter(&mut self, filter: MainFilter) {
+        self.main_filter = filter;
+        self.align_selection_to_filter_current();
+        self.ensure_selected_visible_current();
+        self.status = Some(format!("Main filter: {}", self.main_filter.label()));
+    }
+
+    fn current_visible_item_indices(&self) -> Vec<usize> {
+        self.current_thread()
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                if item_matches_filter(item, self.main_filter) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn align_selection_to_filter_current(&mut self) {
+        let visible = self.current_visible_item_indices();
+        if visible.is_empty() {
+            return;
+        }
+
+        let selected = self.current_thread_selected_item();
+        if visible.iter().any(|idx| *idx == selected) {
+            return;
+        }
+
+        let fallback = visible
+            .iter()
+            .rfind(|idx| **idx < selected)
+            .copied()
+            .unwrap_or_else(|| visible[0]);
+        self.set_current_thread_selected_item(fallback);
+    }
+
     fn ensure_selected_visible_current(&mut self) {
         let thread = self.current_thread().clone();
         let selected = self
             .current_thread_selected_item()
             .min(thread.items.len().saturating_sub(1));
-        let (_, ranges) = build_thread_lines(&thread, selected);
-        self.ensure_selected_visible_for(&thread.id, &ranges, self.last_main_viewport_rows.max(1));
+        let (_, ranges, selected_visible_idx) =
+            build_thread_lines(&thread, selected, 1, self.main_filter);
+        self.ensure_selected_visible_for(
+            &thread.id,
+            &ranges,
+            self.last_main_viewport_rows.max(1),
+            selected_visible_idx,
+        );
     }
 
     fn ensure_selected_visible_for(
@@ -1775,6 +2090,7 @@ impl ChatApp {
         thread_id: &str,
         ranges: &[(usize, usize)],
         viewport_rows: usize,
+        selected_idx: usize,
     ) {
         if ranges.is_empty() {
             self.vertical_scroll_by_thread
@@ -1782,12 +2098,7 @@ impl ChatApp {
             return;
         }
 
-        let selected = self
-            .selected_item_by_thread
-            .get(thread_id)
-            .copied()
-            .unwrap_or(0)
-            .min(ranges.len().saturating_sub(1));
+        let selected = selected_idx.min(ranges.len().saturating_sub(1));
         let (start, end) = ranges[selected];
 
         let mut offset = self
@@ -1830,7 +2141,9 @@ impl ChatApp {
 fn build_thread_lines(
     thread: &ThreadView,
     selected: usize,
-) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+    selected_fill_width: usize,
+    filter: MainFilter,
+) -> (Vec<Line<'static>>, Vec<(usize, usize)>, usize) {
     if thread.items.is_empty() {
         return (
             vec![Line::from(Span::styled(
@@ -1838,21 +2151,93 @@ fn build_thread_lines(
                 Style::default().fg(Color::DarkGray),
             ))],
             vec![],
+            0,
         );
     }
 
+    let visible_indices = thread
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            if item_matches_filter(item, filter) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if visible_indices.is_empty() {
+        return (
+            vec![Line::from(Span::styled(
+                "No messages for current filter",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            vec![],
+            0,
+        );
+    }
+
+    let selected_visible_idx = selected_visible_position(&visible_indices, selected);
     let mut lines = Vec::new();
     let mut ranges = Vec::new();
     let assistant_label = thread.assistant_badge_label();
-    for (idx, item) in thread.items.iter().enumerate() {
+    for (visible_pos, idx) in visible_indices.iter().enumerate() {
+        let item = &thread.items[*idx];
         let start = lines.len();
-        let item_lines = item.lines(selected == idx, &assistant_label);
+        let item_lines = item.lines(
+            visible_pos == selected_visible_idx,
+            &assistant_label,
+            if visible_pos == selected_visible_idx {
+                Some(selected_fill_width)
+            } else {
+                None
+            },
+        );
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
     }
 
-    (lines, ranges)
+    (lines, ranges, selected_visible_idx)
+}
+
+fn selected_visible_position(visible: &[usize], selected: usize) -> usize {
+    if visible.is_empty() {
+        return 0;
+    }
+
+    if let Some(pos) = visible.iter().position(|idx| *idx == selected) {
+        return pos;
+    }
+
+    visible.iter().rposition(|idx| *idx < selected).unwrap_or(0)
+}
+
+fn item_matches_filter(item: &TimelineItem, filter: MainFilter) -> bool {
+    match filter {
+        MainFilter::All => true,
+        MainFilter::DelegatesOnly => match item {
+            TimelineItem::DelegateInvocation { .. } => true,
+            TimelineItem::ToolInvocation { tool_id, .. } => tool_id == "delegate_to_agent",
+            _ => false,
+        },
+        MainFilter::FailuresOnly => match item {
+            TimelineItem::ToolInvocation { status, .. } => status == "error" || status == "failed",
+            TimelineItem::DelegateInvocation { status, error, .. } => {
+                status == "error" || status == "failed" || error.is_some()
+            }
+            TimelineItem::Text { role, text, .. } => {
+                *role == MessageRoleTag::System && text.to_ascii_lowercase().contains("error")
+            }
+        },
+        MainFilter::SystemToolsOnly => matches!(
+            item,
+            TimelineItem::DelegateInvocation { .. }
+                | TimelineItem::ToolInvocation { .. }
+        ),
+    }
 }
 
 async fn fetch_all_thread_events(
@@ -1988,12 +2373,77 @@ fn timeline_items_from_events(kind: &ThreadKind, events: &[ThreadEvent]) -> Vec<
                     status,
                     arguments,
                     output,
+                    Some(TimelineRenderMeta {
+                        seq: Some(event.seq),
+                        ts: Some(event.ts.clone()),
+                        redaction_applied: Some(event.redaction_applied),
+                    }),
+                ));
+            }
+            "thread_created" => {
+                let agent_id = event
+                    .payload
+                    .get("agent_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    format!("Thread created for sub-agent '{agent_id}'"),
                 ));
             }
             "thread_resurrected" => {
                 items.push(TimelineItem::text(
                     MessageRoleTag::System,
                     "Thread resurrected and ready for continuation.",
+                ));
+            }
+            "run_state_changed" => {
+                let state = event
+                    .payload
+                    .get("state")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let summary = event
+                    .payload
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let error = event
+                    .payload
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+
+                let mut message = format!("Run state changed: {state}");
+                if !summary.is_empty() {
+                    message.push_str(&format!(" | summary: {summary}"));
+                }
+                if !error.is_empty() {
+                    message.push_str(&format!(" | error: {error}"));
+                }
+                items.push(TimelineItem::text(MessageRoleTag::System, message));
+            }
+            "subagent_report" => {
+                let report_type = event
+                    .payload
+                    .get("report_type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let summary = event
+                    .payload
+                    .get("report")
+                    .and_then(|value| value.get("description"))
+                    .and_then(|value| value.as_str())
+                    .or_else(|| {
+                        event.payload
+                            .get("report")
+                            .and_then(|value| value.get("summary"))
+                            .and_then(|value| value.as_str())
+                    })
+                    .unwrap_or("report available");
+                items.push(TimelineItem::text(
+                    MessageRoleTag::System,
+                    format!("SUB-AGENT REPORT [{report_type}] {summary}"),
                 ));
             }
             "error" => {
@@ -2028,6 +2478,7 @@ fn timeline_items_from_events(kind: &ThreadKind, events: &[ThreadEvent]) -> Vec<
             "pending".to_string(),
             arguments,
             serde_json::Value::Null,
+            None,
         ));
     }
 
@@ -2050,6 +2501,7 @@ fn tool_item_from_parts(
     status: String,
     arguments: serde_json::Value,
     output: serde_json::Value,
+    meta: Option<TimelineRenderMeta>,
 ) -> TimelineItem {
     if tool_id == "delegate_to_agent" {
         let target_agent = arguments
@@ -2101,6 +2553,7 @@ fn tool_item_from_parts(
             error,
             arguments,
             output,
+            meta,
             expanded: false,
         }
     } else {
@@ -2110,13 +2563,43 @@ fn tool_item_from_parts(
             status,
             arguments,
             output,
+            meta,
             expanded: false,
         }
     }
 }
 
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 fn short_thread_id(thread_id: &str) -> String {
-    thread_id.chars().take(8).collect()
+    short_id(thread_id)
+}
+
+fn json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(|field| field.to_string())
+}
+
+fn contains_redaction_marker(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let normalized = text.to_ascii_lowercase();
+            normalized.contains("redacted") || normalized.contains("sensitive_payload")
+        }
+        serde_json::Value::Array(items) => items.iter().any(contains_redaction_marker),
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            let key_lower = key.to_ascii_lowercase();
+            key_lower.contains("redacted")
+                || key_lower.contains("sensitive")
+                || key_lower.contains("secret")
+                || contains_redaction_marker(value)
+        }),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2469,10 +2952,10 @@ mod tests {
                 error: None,
                 arguments: serde_json::json!({}),
                 output: serde_json::json!({}),
+                meta: None,
                 expanded: false,
             });
         }
-
         app.focus = FocusPane::Main;
         app.active_thread = 0;
         app.sidebar_selected = 0;
@@ -2503,6 +2986,12 @@ mod tests {
             run_id: Some("run-1".to_string()),
             payload: serde_json::json!({"content":"hello"}),
             redaction_applied: false,
+            turn_id: None,
+            parent_event_id: None,
+            call_id: None,
+            attempt: None,
+            duration_ms: None,
+            meta: None,
         }];
 
         let items = timeline_items_from_events(&ThreadKind::Subagent, &events);
@@ -2520,7 +3009,7 @@ mod tests {
             MessageRoleTag::Assistant,
             "system reply",
         ));
-        let (system_lines, _) = build_thread_lines(&system, 0);
+        let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All);
         assert!(
             line_text(&system_lines[0]).starts_with("[System0] "),
             "system assistant label should be System0"
@@ -2530,7 +3019,7 @@ mod tests {
         subagent
             .items
             .push(TimelineItem::text(MessageRoleTag::Assistant, "agent reply"));
-        let (subagent_lines, _) = build_thread_lines(&subagent, 0);
+        let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All);
         assert!(
             line_text(&subagent_lines[0]).starts_with("[planner] "),
             "sub-agent assistant label should use the agent id"
@@ -2550,10 +3039,11 @@ mod tests {
             error: None,
             arguments: serde_json::json!({}),
             output: serde_json::json!({}),
+            meta: None,
             expanded: false,
         };
 
-        let lines = item.lines(false, "System0");
+        let lines = item.lines(false, "System0", None);
         let summary_line = lines
             .iter()
             .map(line_text)
