@@ -1023,6 +1023,8 @@ impl LlmClient for EchoLlmClient {
 #[derive(Clone)]
 struct SkillToolBroker {
     tools: HashMap<String, SkillTool>,
+    tool_aliases: HashMap<String, String>,
+    aliases_by_tool: HashMap<String, Vec<String>>,
     local_root: PathBuf,
 }
 
@@ -1055,31 +1057,54 @@ impl SkillToolBroker {
             tools.insert(skill_name.clone(), skill_tool_from_skill(skill));
         }
 
-        Ok(Self { tools, local_root })
+        let (tool_aliases, aliases_by_tool) = build_skill_tool_aliases(allowed_skills);
+
+        Ok(Self {
+            tools,
+            tool_aliases,
+            aliases_by_tool,
+            local_root,
+        })
+    }
+
+    fn resolve_tool_id(&self, ctx: &AgentContext, requested_tool_id: &str) -> Option<String> {
+        let is_allowed = |tool_id: &str| ctx.allowed_tools.iter().any(|allowed| allowed == tool_id);
+        if is_allowed(requested_tool_id) && self.tools.contains_key(requested_tool_id) {
+            return Some(requested_tool_id.to_string());
+        }
+
+        let canonical = self.tool_aliases.get(requested_tool_id)?;
+        if is_allowed(canonical) && self.tools.contains_key(canonical) {
+            Some(canonical.clone())
+        } else {
+            None
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl ToolBroker for SkillToolBroker {
     async fn list_tools(&self, ctx: &AgentContext) -> Vec<ToolSpec> {
-        ctx.allowed_tools
-            .iter()
-            .filter_map(|name| {
-                self.tools.get(name).map(|tool| ToolSpec {
-                    id: name.clone(),
-                    name: name.clone(),
-                    description: tool.description.clone(),
-                    parameters_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }),
-                    source: ToolSource::Skill {
-                        skill_id: name.clone(),
-                    },
-                })
-            })
-            .collect()
+        let mut specs = Vec::new();
+        for name in &ctx.allowed_tools {
+            let Some(tool) = self.tools.get(name) else {
+                continue;
+            };
+
+            specs.push(skill_tool_spec(name, name, &tool.description));
+
+            if let Some(aliases) = self.aliases_by_tool.get(name) {
+                for alias in aliases {
+                    specs.push(skill_tool_spec(
+                        alias,
+                        name,
+                        &format!("Alias for '{name}'. {}", tool.description),
+                    ));
+                }
+            }
+        }
+
+        specs
     }
 
     async fn call_tool(
@@ -1088,6 +1113,7 @@ impl ToolBroker for SkillToolBroker {
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
         let started_at = Instant::now();
+        let requested_tool_id = call.tool_id.clone();
         tracing::info!(
             agent_id = %ctx.agent_id,
             task_id = %ctx.task_id,
@@ -1096,22 +1122,28 @@ impl ToolBroker for SkillToolBroker {
             "skill_tool_started"
         );
 
-        if !ctx.allowed_tools.iter().any(|tool| tool == &call.tool_id) {
+        let Some(canonical_tool_id) = self.resolve_tool_id(ctx, &requested_tool_id) else {
             return Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: call.tool_id,
+                tool_id: requested_tool_id,
             }));
+        };
+
+        if canonical_tool_id != requested_tool_id {
+            tracing::warn!(
+                agent_id = %ctx.agent_id,
+                task_id = %ctx.task_id,
         }
 
-        let Some(tool) = self.tools.get(&call.tool_id) else {
+        let Some(tool) = self.tools.get(&canonical_tool_id) else {
             return Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: call.tool_id,
+                tool_id: canonical_tool_id,
             }));
         };
 
         let mut markdown_docs = Vec::new();
         for raw in &tool.markdown_paths {
             let path = resolve_local_data_path(&self.local_root, raw)
-                .map_err(map_tool_err(&call.tool_id))?;
+                .map_err(map_tool_err(&canonical_tool_id))?;
             let content = fs::read_to_string(&path).map_err(|err| {
                 NeuromancerError::Tool(ToolError::ExecutionFailed {
                     tool_id: call.tool_id.clone(),
@@ -1127,14 +1159,15 @@ impl ToolBroker for SkillToolBroker {
         let mut csv_docs = Vec::new();
         for raw in &tool.csv_paths {
             let path = resolve_local_data_path(&self.local_root, raw)
-                .map_err(map_tool_err(&call.tool_id))?;
+                .map_err(map_tool_err(&canonical_tool_id))?;
             let content = fs::read_to_string(&path).map_err(|err| {
                 NeuromancerError::Tool(ToolError::ExecutionFailed {
                     tool_id: call.tool_id.clone(),
                     message: err.to_string(),
                 })
             })?;
-            let parsed = parse_csv_content(&path, &content).map_err(map_tool_err(&call.tool_id))?;
+            let parsed =
+                parse_csv_content(&path, &content).map_err(map_tool_err(&canonical_tool_id))?;
             csv_docs.push(serde_json::json!({
                 "path": raw,
                 "headers": parsed.headers,
@@ -1152,7 +1185,7 @@ impl ToolBroker for SkillToolBroker {
 
             let payload = serde_json::json!({
                 "local_root": self.local_root.display().to_string(),
-                "skill": call.tool_id.clone(),
+                "skill": canonical_tool_id.clone(),
                 "data_sources": {
                     "markdown": tool.markdown_paths.clone(),
                     "csv": tool.csv_paths.clone(),
@@ -1188,7 +1221,7 @@ impl ToolBroker for SkillToolBroker {
         Ok(ToolResult {
             call_id: call.id,
             output: ToolOutput::Success(serde_json::json!({
-                "skill": call.tool_id,
+                "skill": canonical_tool_id,
                 "markdown": markdown_docs,
                 "csv": csv_docs,
                 "script_result": script_result,
@@ -1224,6 +1257,54 @@ fn skill_tool_from_skill(skill: &Skill) -> SkillTool {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_SKILL_SCRIPT_TIMEOUT),
     }
+}
+
+fn skill_tool_spec(name: &str, skill_id: &str, description: &str) -> ToolSpec {
+    ToolSpec {
+        id: name.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        source: ToolSource::Skill {
+            skill_id: skill_id.to_string(),
+        },
+    }
+}
+
+fn build_skill_tool_aliases(
+    allowed_skills: &[String],
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let canonical_skills: HashSet<&str> = allowed_skills.iter().map(String::as_str).collect();
+    let mut alias_to_canonical = HashMap::<String, String>::new();
+    let mut aliases_by_tool = HashMap::<String, Vec<String>>::new();
+
+    for canonical in allowed_skills {
+        let alias = canonical.replace('-', "_");
+        if alias == *canonical {
+            continue;
+        }
+
+        // Keep canonical names authoritative when an underscore variant already exists.
+        if canonical_skills.contains(alias.as_str()) {
+            continue;
+        }
+
+        if alias_to_canonical.contains_key(&alias) {
+            continue;
+        }
+
+        alias_to_canonical.insert(alias.clone(), canonical.clone());
+        aliases_by_tool
+            .entry(canonical.clone())
+            .or_default()
+            .push(alias);
+    }
+
+    (alias_to_canonical, aliases_by_tool)
 }
 
 fn resolve_local_data_path(
@@ -1730,6 +1811,69 @@ print("{}")
             err.to_string().contains("script_invalid_json"),
             "unexpected parse error: {err}"
         );
+    }
+
+    #[test]
+    fn build_skill_tool_aliases_adds_underscore_variants() {
+        let (alias_to_canonical, aliases_by_tool) =
+            build_skill_tool_aliases(&["manage-bills".to_string(), "manage-accounts".to_string()]);
+
+        assert_eq!(
+            alias_to_canonical.get("manage_bills"),
+            Some(&"manage-bills".to_string())
+        );
+        assert_eq!(
+            alias_to_canonical.get("manage_accounts"),
+            Some(&"manage-accounts".to_string())
+        );
+        assert_eq!(
+            aliases_by_tool.get("manage-bills"),
+            Some(&vec!["manage_bills".to_string()])
+        );
+        assert_eq!(
+            aliases_by_tool.get("manage-accounts"),
+            Some(&vec!["manage_accounts".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_skill_tool_aliases_skips_conflicting_names() {
+        let (alias_to_canonical, aliases_by_tool) =
+            build_skill_tool_aliases(&["manage-bills".to_string(), "manage_bills".to_string()]);
+
+        assert!(!alias_to_canonical.contains_key("manage_bills"));
+        assert!(!aliases_by_tool.contains_key("manage-bills"));
+    }
+
+    #[test]
+    fn resolve_tool_call_retry_limit_uses_model_slot_value() {
+        let config_toml = r#"
+[global]
+instance_id = "test"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-model"
+tool_call_retry_limit = 4
+
+[orchestrator]
+model_slot = "executor"
+
+[agents.planner]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+        let config: NeuromancerConfig = toml::from_str(config_toml).expect("config parse");
+        let planner = config.agents.get("planner").expect("planner config");
+        let agent_config = planner.to_agent_config("planner", "system prompt".to_string());
+        assert_eq!(resolve_tool_call_retry_limit(&config, &agent_config), 4);
     }
 
     #[test]
