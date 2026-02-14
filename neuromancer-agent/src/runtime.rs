@@ -89,11 +89,13 @@ impl AgentRuntime {
 
         // Gather available tool definitions
         let tool_specs = self.tool_broker.list_tools(&agent_ctx).await;
+        let available_tool_names = available_tool_names(&tool_specs);
         // NOTE: [low pri] shouldn't this be done in advance?
         let tool_defs = specs_to_rig_definitions(&tool_specs);
 
         let max_iterations = self.config.max_iterations;
         let mut iteration: u32 = 0;
+        let mut invalid_tool_call_recovery_attempts: u32 = 0;
 
         // Main Thinking -> Acting loop
         loop {
@@ -122,11 +124,27 @@ impl AgentRuntime {
             // NOTE: [low pri] should this log something?
             conversation.maybe_truncate();
             let rig_messages = conversation.to_rig_messages();
-
-            let response = self
+            let response = match self
                 .llm_client
                 .complete(&system_prompt, rig_messages, tool_defs.clone())
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => match self
+                    .try_recover_invalid_tool_call(
+                        &err,
+                        &mut conversation,
+                        task.id,
+                        &available_tool_names,
+                        &mut invalid_tool_call_recovery_attempts,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => return Err(err),
+                    Err(exhausted) => return Err(exhausted),
+                },
+            };
 
             total_usage.prompt_tokens += response.prompt_tokens;
             total_usage.completion_tokens += response.completion_tokens;
@@ -282,9 +300,11 @@ impl AgentRuntime {
         conversation.add_message(ChatMessage::user(user_message));
 
         let tool_specs = self.tool_broker.list_tools(&agent_ctx).await;
+        let available_tool_names = available_tool_names(&tool_specs);
         let tool_defs = specs_to_rig_definitions(&tool_specs);
         let max_iterations = self.config.max_iterations;
         let mut iteration: u32 = 0;
+        let mut invalid_tool_call_recovery_attempts: u32 = 0;
 
         let run_result = loop {
             iteration += 1;
@@ -315,7 +335,20 @@ impl AgentRuntime {
                 .await
             {
                 Ok(response) => response,
-                Err(err) => break Err(err),
+                Err(err) => match self
+                    .try_recover_invalid_tool_call(
+                        &err,
+                        &mut conversation,
+                        task.id,
+                        &available_tool_names,
+                        &mut invalid_tool_call_recovery_attempts,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break Err(err),
+                    Err(exhausted) => break Err(exhausted),
+                },
             };
 
             total_usage.prompt_tokens += response.prompt_tokens;
@@ -416,6 +449,142 @@ impl AgentRuntime {
         if let Err(e) = self.report_tx.send(report).await {
             tracing::error!("failed to send agent report: {e}");
         }
+    }
+
+    async fn try_recover_invalid_tool_call(
+        &self,
+        err: &NeuromancerError,
+        conversation: &mut ConversationContext,
+        task_id: uuid::Uuid,
+        available_tool_names: &[String],
+        recovery_attempts: &mut u32,
+    ) -> Result<bool, NeuromancerError> {
+        let NeuromancerError::Llm(LlmError::InvalidResponse { reason }) = err else {
+            return Ok(false);
+        };
+        if !is_invalid_tool_call_reason(reason) {
+            return Ok(false);
+        }
+
+        let attempted_tool_id =
+            extract_attempted_tool_name(reason).unwrap_or_else(|| "__invalid_tool__".to_string());
+        let available_tools_display = if available_tool_names.is_empty() {
+            "none".to_string()
+        } else {
+            available_tool_names.join(", ")
+        };
+
+        tracing::warn!(
+            task_id = %task_id,
+            agent_id = %self.config.id,
+            attempted_tool_id = %attempted_tool_id,
+            available_tools = %available_tools_display,
+            retry_attempt = *recovery_attempts + 1,
+            retry_limit = self.tool_call_retry_limit,
+            "llm_bad_tool_call_detected"
+        );
+
+        if *recovery_attempts >= self.tool_call_retry_limit {
+            tracing::error!(
+                task_id = %task_id,
+                agent_id = %self.config.id,
+                attempted_tool_id = %attempted_tool_id,
+                retries = *recovery_attempts,
+                retry_limit = self.tool_call_retry_limit,
+                "llm_bad_tool_call_retry_exhausted"
+            );
+            return Err(NeuromancerError::Llm(LlmError::InvalidResponse {
+                reason: format!(
+                    "invalid tool-call recovery exhausted after {} retries: {reason}",
+                    self.tool_call_retry_limit
+                ),
+            }));
+        }
+
+        *recovery_attempts += 1;
+        let call_id = format!("invalid-tool-recovery-{}", *recovery_attempts);
+        let recovery_error = format!(
+            "Tool '{attempted_tool_id}' is unavailable or invalid. Available tools: {available_tools_display}. Original error: {reason}"
+        );
+
+        conversation.add_message(ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: call_id.clone(),
+            tool_id: attempted_tool_id.clone(),
+            arguments: serde_json::json!({}),
+        }]));
+        conversation.add_message(ChatMessage::tool_result(ToolResult {
+            call_id,
+            output: ToolOutput::Error(recovery_error.clone()),
+        }));
+
+        self.send_report(SubAgentReport::ToolFailure {
+            task_id,
+            tool_id: attempted_tool_id.clone(),
+            error: recovery_error,
+            retry_eligible: *recovery_attempts < self.tool_call_retry_limit,
+            attempted_count: *recovery_attempts,
+        })
+        .await;
+
+        tracing::info!(
+            task_id = %task_id,
+            agent_id = %self.config.id,
+            attempted_tool_id = %attempted_tool_id,
+            recovery_attempt = *recovery_attempts,
+            retry_limit = self.tool_call_retry_limit,
+            "llm_bad_tool_call_recovered"
+        );
+
+        Ok(true)
+    }
+}
+
+fn available_tool_names(specs: &[ToolSpec]) -> Vec<String> {
+    let mut names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn is_invalid_tool_call_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("tool call validation failed")
+        || lower.contains("attempted to call tool")
+        || lower.contains("request.tools")
+        || lower.contains("tool_use_failed")
+}
+
+fn extract_attempted_tool_name(reason: &str) -> Option<String> {
+    for marker in [
+        "attempted to call tool '",
+        "attempted to call tool \"",
+        "\"name\":\"",
+        "\"name\": \"",
+        "'name':'",
+        "'name': '",
+    ] {
+        if let Some(tool_name) = extract_tool_name_after_marker(reason, marker) {
+            return Some(tool_name);
+        }
+    }
+    None
+}
+
+fn extract_tool_name_after_marker(reason: &str, marker: &str) -> Option<String> {
+    let start = reason.find(marker)?;
+    let tail = &reason[start + marker.len()..];
+    let mut tool_name = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
+            tool_name.push(ch);
+        } else {
+            break;
+        }
+    }
+    if tool_name.is_empty() {
+        None
+    } else {
+        Some(tool_name)
     }
 }
 
@@ -593,5 +762,93 @@ mod tests {
         let output = truncate_summary(input, 10);
         assert!(output.ends_with("..."));
         assert!(output.starts_with("I’m testi"));
+    }
+
+    #[tokio::test]
+    async fn execute_recovers_from_invalid_tool_call_error() {
+        let llm = Arc::new(SequenceLlmClient::new(vec![
+            SequenceItem::Error(invalid_tool_call_error("manage_bills")),
+            SequenceItem::Response(LlmResponse {
+                text: Some("Recovered response".into()),
+                tool_calls: vec![],
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            }),
+        ]));
+        let broker = Arc::new(MockToolBroker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        let runtime = AgentRuntime::new(test_config(), llm, broker, tx, 1);
+        let mut task = Task::new(
+            TriggerSource::Internal,
+            "Answer the question".into(),
+            "test-agent".into(),
+        );
+
+        let output = runtime
+            .execute(&mut task)
+            .await
+            .expect("recovery should succeed");
+        assert!(output.artifacts[0].content.contains("Recovered response"));
+    }
+
+    #[tokio::test]
+    async fn execute_fails_when_invalid_tool_call_retries_exhausted() {
+        let llm = Arc::new(SequenceLlmClient::new(vec![
+            SequenceItem::Error(invalid_tool_call_error("manage_bills")),
+            SequenceItem::Error(invalid_tool_call_error("manage_accounts")),
+        ]));
+        let broker = Arc::new(MockToolBroker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+
+        let runtime = AgentRuntime::new(test_config(), llm, broker, tx, 1);
+        let mut task = Task::new(
+            TriggerSource::Internal,
+            "Answer the question".into(),
+            "test-agent".into(),
+        );
+
+        let err = runtime
+            .execute(&mut task)
+            .await
+            .expect_err("retries should be exhausted");
+        assert!(
+            err.to_string()
+                .contains("invalid tool-call recovery exhausted after 1 retries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_turn_recovers_from_invalid_tool_call_error() {
+        let llm = Arc::new(SequenceLlmClient::new(vec![
+            SequenceItem::Error(invalid_tool_call_error("manage_bills")),
+            SequenceItem::Response(LlmResponse {
+                text: Some("Recovered turn response".into()),
+                tool_calls: vec![],
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            }),
+        ]));
+        let broker = Arc::new(MockToolBroker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let runtime = AgentRuntime::new(test_config(), llm, broker, tx, 1);
+
+        let session_store = InMemorySessionStore::new();
+        let session_id = uuid::Uuid::new_v4();
+        let output = runtime
+            .execute_turn(
+                &session_store,
+                session_id,
+                TriggerSource::Internal,
+                "What happened?".into(),
+            )
+            .await
+            .expect("turn recovery should succeed");
+        assert!(
+            output.output.artifacts[0]
+                .content
+                .contains("Recovered turn response")
+        );
     }
 }
