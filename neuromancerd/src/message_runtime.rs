@@ -237,12 +237,35 @@ impl MessageRuntime {
         let worker_core = core.clone();
         let turn_worker = tokio::spawn(async move {
             while let Some(request) = turn_rx.recv().await {
-                let result = {
-                    let mut core = worker_core.lock().await;
-                    core.process_turn(request.message, request.trigger_type)
-                        .await
+                let TurnRequest {
+                    message,
+                    trigger_type,
+                    response_tx,
+                } = request;
+                let started_at = Instant::now();
+
+                let result = match tokio::spawn({
+                    let worker_core = worker_core.clone();
+                    async move {
+                        let mut core = worker_core.lock().await;
+                        core.process_turn(message, trigger_type).await
+                    }
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(join_err) => {
+                        tracing::error!(
+                            error = ?join_err,
+                            duration_ms = started_at.elapsed().as_millis(),
+                            "orchestrator_turn_worker_panic"
+                        );
+                        Err(MessageRuntimeError::Internal(format!(
+                            "turn worker panicked: {join_err}"
+                        )))
+                    }
                 };
-                let _ = request.response_tx.send(result);
+                let _ = response_tx.send(result);
             }
         });
 
@@ -658,12 +681,16 @@ impl ToolBroker for System0ToolBroker {
                 inner.running_agents.remove(&agent_id);
 
                 let run = match result {
-                    Ok(output) => DelegatedRun {
-                        run_id: run_id.clone(),
-                        agent_id: agent_id.clone(),
-                        state: "completed".to_string(),
-                        summary: Some(output.summary.clone()),
-                    },
+                    Ok(output) => {
+                        let full_response = extract_response_text(&output)
+                            .unwrap_or_else(|| output.summary.clone());
+                        DelegatedRun {
+                            run_id: run_id.clone(),
+                            agent_id: agent_id.clone(),
+                            state: "completed".to_string(),
+                            summary: Some(full_response),
+                        }
+                    }
                     Err(err) => DelegatedRun {
                         run_id: run_id.clone(),
                         agent_id: agent_id.clone(),
