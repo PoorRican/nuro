@@ -77,10 +77,30 @@ These define the system's extension points — all in `neuromancer-core/src/`:
   - `orchestrator.turn`
   - `orchestrator.runs.list`
   - `orchestrator.runs.get`
-- CLI commands:
-  - `neuroctl orchestrator turn "<message>"`
-  - `neuroctl orchestrator runs list`
-  - `neuroctl orchestrator runs get <run_id>`
+  - `orchestrator.runs.diagnose`
+  - `orchestrator.context.get`
+  - `orchestrator.threads.list`
+  - `orchestrator.threads.get`
+  - `orchestrator.threads.resurrect`
+  - `orchestrator.subagent.turn`
+  - `orchestrator.events.query`
+  - `orchestrator.stats.get`
+  - `admin.health`
+  - `admin.config.reload`
+- CLI commands (`neuroctl`):
+  - `install [--config <path>] [--override-config]`
+  - `daemon {start,restart,stop,status}`
+  - `health`
+  - `config reload`
+  - `rpc call --method <method> [--params <json>]`
+  - `e2e smoke`
+  - `orchestrator turn "<message>"`
+  - `orchestrator chat`
+  - `orchestrator runs {list, get <run_id>, diagnose <run_id>}`
+  - `orchestrator events query [--thread-id ...] [--run-id ...] [--agent-id ...] [--tool-id ...] [--event-type ...] [--error-contains ...]`
+  - `orchestrator stats get`
+  - `orchestrator threads {list, get <thread_id>, resurrect <thread_id>}`
+  - `orchestrator subagent turn --thread-id <id> "<message>"`
 
 Removed methods should return JSON-RPC method-not-found.
 
@@ -89,6 +109,8 @@ Removed methods should return JSON-RPC method-not-found.
 **Delegated sub-agent task lifecycle** (`core/task.rs`): Queued → Dispatched → Running → Completed/Failed/Cancelled/Suspended
 
 **Agent execution** (`core/agent.rs`): Initializing → Thinking → Acting → WaitingForInput → Evaluating → Completed/Failed/Suspended
+
+> **Note**: The `AgentRuntime` loop in `neuromancer-agent/src/runtime.rs` currently exercises only Thinking → Acting → Completed. Other states (WaitingForInput, Evaluating, Suspended) are defined in the core enum for future use.
 
 ### Error Hierarchy (`core/error.rs`)
 
@@ -104,7 +126,7 @@ For System0, `[orchestrator]` config controls:
 - `system_prompt_path` for the orchestrator SYSTEM.md
 - max iterations
 
-Canonical example: `samples/v0_1_alpha/neuromancer.toml`.
+Canonical example: `defaults/bootstrap/neuromancer.toml`.
 Install/bootstrap flow: `neuroctl install` (defaults to XDG config path), with optional override `--config <path>`. Use `--override-config` to replace the target config file from bootstrap defaults. Install also detects configured model providers and prompts for API keys (one per provider) when interactive.
 XDG layout defaults resolve under `$XDG_CONFIG_HOME/neuromancer` (or `~/.config/neuromancer`) and `$XDG_DATA_HOME/neuromancer` (or `~/.local/neuromancer`). Provider API keys are currently stored under `$XDG_RUNTIME_HOME/neuromancer/provider_keys` (falling back to `$XDG_DATA_HOME/neuromancer/provider_keys` when `XDG_RUNTIME_HOME` is unset) as a temporary alpha behavior.
 OS-specific keychain integration is a required follow-up and must replace plaintext runtime key files.
