@@ -10,7 +10,9 @@ use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig};
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::rpc::{DelegatedRun, OrchestratorToolInvocation, OrchestratorTurnResult};
+use neuromancer_core::rpc::{
+    DelegatedRun, OrchestratorThreadMessage, OrchestratorToolInvocation, OrchestratorTurnResult,
+};
 use neuromancer_core::task::Task;
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
@@ -63,6 +65,8 @@ impl MessageRuntimeError {
 pub struct MessageRuntime {
     turn_tx: mpsc::Sender<TurnRequest>,
     system0_broker: System0ToolBroker,
+    session_store: InMemorySessionStore,
+    session_id: AgentSessionId,
     _turn_worker: tokio::task::JoinHandle<()>,
     _report_worker: tokio::task::JoinHandle<()>,
 }
@@ -227,10 +231,12 @@ impl MessageRuntime {
             orchestrator_tool_call_retry_limit,
         ));
 
+        let session_store = InMemorySessionStore::new();
+        let session_id = uuid::Uuid::new_v4();
         let core = Arc::new(AsyncMutex::new(RuntimeCore {
             orchestrator_runtime,
-            session_store: InMemorySessionStore::new(),
-            session_id: uuid::Uuid::new_v4(),
+            session_store: session_store.clone(),
+            session_id,
             system0_broker,
         }));
 
@@ -273,6 +279,8 @@ impl MessageRuntime {
         Ok(Self {
             turn_tx,
             system0_broker: runtime_broker,
+            session_store,
+            session_id,
             _turn_worker: turn_worker,
             _report_worker: report_worker,
         })
@@ -325,6 +333,99 @@ impl MessageRuntime {
             .get_run(&run_id)
             .await
             .ok_or_else(|| MessageRuntimeError::ResourceNotFound(format!("run '{run_id}'")))
+    }
+
+    pub async fn orchestrator_context_get(
+        &self,
+    ) -> Result<Vec<OrchestratorThreadMessage>, MessageRuntimeError> {
+        let session = self.session_store.get(self.session_id).await;
+        let messages = match session {
+            Some(state) => conversation_to_thread_messages(&state.conversation.messages),
+            None => Vec::new(),
+        };
+        Ok(messages)
+    }
+}
+
+fn conversation_to_thread_messages(
+    messages: &[neuromancer_agent::conversation::ChatMessage],
+) -> Vec<OrchestratorThreadMessage> {
+    use neuromancer_agent::conversation::{MessageContent, MessageRole};
+
+    let mut result = Vec::new();
+    // Collect tool call info so we can merge status from subsequent tool results
+    let mut pending_tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+
+    for msg in messages {
+        match (&msg.role, &msg.content) {
+            (MessageRole::System, _) => {
+                // Skip system messages from the thread view
+            }
+            (MessageRole::User, MessageContent::Text(text)) => {
+                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
+                result.push(OrchestratorThreadMessage::Text {
+                    role: "user".to_string(),
+                    content: text.clone(),
+                });
+            }
+            (MessageRole::Assistant, MessageContent::Text(text)) => {
+                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
+                result.push(OrchestratorThreadMessage::Text {
+                    role: "assistant".to_string(),
+                    content: text.clone(),
+                });
+            }
+            (MessageRole::Assistant, MessageContent::ToolCalls(calls)) => {
+                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
+                for call in calls {
+                    pending_tool_calls.push((
+                        call.id.clone(),
+                        call.tool_id.clone(),
+                        call.arguments.clone(),
+                    ));
+                }
+            }
+            (MessageRole::Tool, MessageContent::ToolResult(tool_result)) => {
+                // Find matching pending tool call and emit with status
+                if let Some(pos) = pending_tool_calls
+                    .iter()
+                    .position(|(id, _, _)| *id == tool_result.call_id)
+                {
+                    let (call_id, tool_id, arguments) = pending_tool_calls.remove(pos);
+                    let (status, output) = match &tool_result.output {
+                        ToolOutput::Success(v) => ("success".to_string(), v.clone()),
+                        ToolOutput::Error(e) => {
+                            ("error".to_string(), serde_json::Value::String(e.clone()))
+                        }
+                    };
+                    result.push(OrchestratorThreadMessage::ToolInvocation {
+                        call_id,
+                        tool_id,
+                        arguments,
+                        status,
+                        output,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
+    result
+}
+
+fn flush_pending_tool_calls(
+    pending: &mut Vec<(String, String, serde_json::Value)>,
+    result: &mut Vec<OrchestratorThreadMessage>,
+) {
+    for (call_id, tool_id, arguments) in pending.drain(..) {
+        result.push(OrchestratorThreadMessage::ToolInvocation {
+            call_id,
+            tool_id,
+            arguments,
+            status: "pending".to_string(),
+            output: serde_json::Value::Null,
+        });
     }
 }
 
