@@ -479,116 +479,119 @@ impl TimelineItem {
                 let target = target_agent
                     .clone()
                     .unwrap_or_else(|| "unknown-agent".to_string());
+                let args_preview = instruction
+                    .as_ref()
+                    .map(|value| text_preview_lines(value, 1, 72).join(" "))
+                    .unwrap_or_else(|| preview_json_value(arguments, 72));
+                let output_preview = summary
+                    .as_ref()
+                    .map(|value| text_preview_lines(value, 1, 72).join(" "))
+                    .unwrap_or_else(|| preview_json_value(output, 72));
+                let error_preview = error.clone().unwrap_or_else(|| "none".to_string());
+
+                if !*expanded {
+                    lines.push(kv_row("Args", args_preview));
+                    lines.push(kv_row("Output", output_preview));
+                    lines.push(kv_row("Error", error_preview));
+                } else {
+                    lines.push(section_header("State"));
+                    lines.push(kv_row("status", pretty_status(status)));
+                    lines.push(kv_row("agent", target.clone()));
+
+                    lines.push(Line::raw(""));
+                    lines.push(section_header("Input"));
+                    let mut input_fields = key_values_from_json(arguments, 5, &[]);
+                    if let Some(instruction) = instruction
+                        && !input_fields.iter().any(|(key, _)| key == "task")
+                    {
+                        input_fields.insert(
+                            0,
+                            (
+                                "task".to_string(),
+                                text_preview_lines(instruction, 2, 90).join(" "),
+                            ),
+                        );
+                    }
+                    if input_fields.is_empty() {
+                        input_fields.push(("task".to_string(), args_preview.clone()));
+                    }
+                    for (key, value) in input_fields {
+                        lines.push(kv_row(&key, value));
+                    }
+
+                    lines.push(Line::raw(""));
+                    lines.push(section_header("Output"));
+                    lines.push(kv_row("summary", output_preview.clone()));
+                    let output_fields = key_values_from_json(
+                        output,
+                        3,
+                        &[
+                            "summary",
+                            "error",
+                            "thread_id",
+                            "run_id",
+                            "timestamp",
+                            "tools",
+                        ],
+                    );
+                    for (key, value) in output_fields {
+                        lines.push(kv_row(&key, value));
+                    }
+                    lines.push(kv_row("error", error_preview.clone()));
+
+                    let tool_fields = collect_tool_usage(output);
+                    if !tool_fields.is_empty() {
+                        lines.push(Line::raw(""));
+                        lines.push(section_header("Tools"));
+                        for (key, value) in tool_fields {
+                            lines.push(kv_row(&key, value));
+                        }
+                    }
+
+                    lines.push(Line::raw(""));
+                    lines.push(section_header("Details"));
+                    lines.push(kv_row("thread_id", compact_id(thread_id.as_deref())));
+                    lines.push(kv_row("run_id", compact_id(run_id.as_deref())));
+                    lines.push(kv_row(
+                        "timestamp",
+                        meta.as_ref()
+                            .and_then(|value| value.ts.clone())
+                            .or_else(|| {
+                                output
+                                    .get("timestamp")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| value.to_string())
+                            })
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    ));
+                    lines.push(kv_row(
+                        "duration",
+                        output
+                            .get("duration")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string())
+                            .or_else(|| {
+                                output
+                                    .get("duration")
+                                    .and_then(|value| value.as_u64())
+                                    .map(|value| format!("{value}s"))
+                            })
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    ));
+                    lines.push(kv_row("call_id", compact_id(Some(call_id.as_str()))));
+                }
+                lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
                     badge_chip(
-                        "delegate",
+                        &target,
                         Style::default()
                             .fg(Color::Rgb(255, 237, 183))
                             .bg(Color::Rgb(89, 76, 33))
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
-                    Span::styled(format!("-> {target}"), Style::default().fg(Color::Cyan)),
-                    Span::raw(" state="),
-                    Span::styled(status.clone(), status_style(status)),
-                    Span::styled(
-                        if *expanded {
-                            " [expanded]"
-                        } else {
-                            " [collapsed]"
-                        },
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(pretty_status(status), status_style(status)),
                 ]));
-                lines.push(Line::from(vec![
-                    Span::styled("  thread: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        thread_id
-                            .clone()
-                            .unwrap_or_else(|| "unavailable".to_string()),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled("  run: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        run_id.clone().unwrap_or_else(|| "unavailable".to_string()),
-                        Style::default().fg(Color::White),
-                    ),
-                ]));
-
-                if let Some(instruction) = instruction {
-                    let preview = text_preview_lines(instruction, 2, 160).join(" ");
-                    lines.push(Line::from(vec![
-                        Span::styled("  instruction: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(preview),
-                    ]));
-                }
-
-                if let Some(error) = error {
-                    lines.push(Line::from(vec![
-                        Span::styled("  error: ", Style::default().fg(Color::Red)),
-                        Span::styled(error.clone(), Style::default().fg(Color::Red)),
-                    ]));
-                } else if let Some(summary) = summary {
-                    let preview = text_preview_lines(summary, 2, 180).join(" ");
-                    lines.push(Line::from(vec![
-                        Span::styled("  summary: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(preview),
-                    ]));
-                }
-
-                lines.push(Line::from(Span::styled(
-                    "  Enter: open sub-agent thread",
-                    Style::default().fg(Color::DarkGray),
-                )));
-
-                if *expanded {
-                    lines.push(Line::from(vec![
-                        Span::styled("  call id: ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(call_id.clone(), Style::default().fg(Color::DarkGray)),
-                    ]));
-                    let seq = meta
-                        .as_ref()
-                        .and_then(|value| value.seq)
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "n/a".to_string());
-                    let ts = meta
-                        .as_ref()
-                        .and_then(|value| value.ts.clone())
-                        .unwrap_or_else(|| "n/a".to_string());
-                    let redaction = meta
-                        .as_ref()
-                        .and_then(|value| value.redaction_applied)
-                        .map(|flag| if flag { "yes" } else { "no" })
-                        .unwrap_or("n/a");
-                    let linked_thread = thread_id
-                        .as_ref()
-                        .map(|id| short_id(id))
-                        .unwrap_or_else(|| "-".to_string());
-                    let linked_run = run_id
-                        .as_ref()
-                        .map(|id| short_id(id))
-                        .unwrap_or_else(|| "-".to_string());
-                    lines.push(Line::from(vec![
-                        Span::styled("  meta: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!(
-                            "status={status} thread={linked_thread} run={linked_run} seq={seq} ts={ts} redacted={redaction}"
-                        )),
-                    ]));
-                    lines.push(Line::from(Span::styled(
-                        "  arguments:",
-                        Style::default().fg(Color::Gray),
-                    )));
-                    for line in pretty_json_lines(arguments) {
-                        lines.push(Line::from(format!("    {line}")));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "  output:",
-                        Style::default().fg(Color::Gray),
-                    )));
-                    for line in pretty_json_lines(output) {
-                        lines.push(Line::from(format!("    {line}")));
-                    }
-                }
                 lines
             }
         };
@@ -789,6 +792,143 @@ fn badge_chip(label: &str, style: Style) -> Span<'static> {
     Span::styled(format!(" {} ", label), style)
 }
 
+fn section_header(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("[{title}]"),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn kv_row(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<10}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(": ", Style::default().fg(Color::DarkGray)),
+        Span::styled(value, Style::default().fg(Color::White)),
+    ])
+}
+
+fn pretty_status(status: &str) -> String {
+    match status {
+        "success" | "completed" => "COMPLETED".to_string(),
+        "error" | "failed" => "FAILED".to_string(),
+        "running" | "pending" => "RUNNING".to_string(),
+        _ => status.to_ascii_uppercase(),
+    }
+}
+
+fn preview_json_value(value: &serde_json::Value, max_chars: usize) -> String {
+    let rendered = match value {
+        serde_json::Value::Null => "none".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                "none".to_string()
+            } else {
+                let values = items
+                    .iter()
+                    .take(3)
+                    .map(|item| preview_json_value(item, 24))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if items.len() > 3 {
+                    format!("{values}, ...")
+                } else {
+                    values
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let values = keys
+                .iter()
+                .take(3)
+                .map(|key| {
+                    format!(
+                        "{key}={}",
+                        preview_json_value(map.get(key).unwrap_or(&serde_json::Value::Null), 24)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if keys.len() > 3 {
+                format!("{values}, ...")
+            } else {
+                values
+            }
+        }
+    };
+    if rendered.chars().count() > max_chars {
+        let mut clipped = rendered
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>();
+        clipped.push_str("...");
+        clipped
+    } else {
+        rendered
+    }
+}
+
+fn key_values_from_json(
+    value: &serde_json::Value,
+    max_fields: usize,
+    skip_keys: &[&str],
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let Some(map) = value.as_object() else {
+        if !value.is_null() {
+            rows.push(("value".to_string(), preview_json_value(value, 90)));
+        }
+        return rows;
+    };
+
+    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        if rows.len() >= max_fields {
+            break;
+        }
+        if skip_keys.iter().any(|skip| *skip == key) {
+            continue;
+        }
+        let Some(field) = map.get(&key) else {
+            continue;
+        };
+        rows.push((key, preview_json_value(field, 90)));
+    }
+    rows
+}
+
+fn collect_tool_usage(output: &serde_json::Value) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    if let Some(tools) = output.get("tools").and_then(|value| value.as_object()) {
+        let mut keys = tools.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            if let Some(value) = tools.get(&key) {
+                rows.push((key, preview_json_value(value, 60)));
+            }
+        }
+    }
+    rows
+}
+
+fn compact_id(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "n/a".to_string();
+    };
+    if value.chars().count() <= 12 {
+        return value.to_string();
+    }
+    let prefix = value.chars().take(8).collect::<String>();
+    format!("{prefix}...")
+}
+
 fn pretty_json_lines(value: &serde_json::Value) -> Vec<String> {
     let rendered = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     rendered.lines().map(|line| line.to_string()).collect()
@@ -901,15 +1041,15 @@ mod tests {
         };
 
         let lines = item.lines(false, "System0", None, true);
-        let summary_line = lines
+        let output_line = lines
             .iter()
             .map(line_text)
-            .find(|line| line.contains("  summary: "))
-            .expect("summary line should exist");
+            .find(|line| line.contains("Output"))
+            .expect("collapsed output line should exist");
         assert!(
-            summary_line.len() < 250,
-            "summary line should be previewed, got {} chars",
-            summary_line.len()
+            output_line.len() < 250,
+            "output line should be previewed, got {} chars",
+            output_line.len()
         );
     }
 }

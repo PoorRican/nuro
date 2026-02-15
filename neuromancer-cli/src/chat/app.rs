@@ -556,6 +556,7 @@ impl ChatApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(1),
                 Constraint::Length(input_box_height),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -1792,5 +1793,16 @@ mod tests {
             .find(|thread| thread.id == SYSTEM_THREAD_ID)
             .expect("system thread should exist");
         assert_eq!(system.items.len(), 2);
+    }
+
+    #[test]
+    fn render_smoke_test() {
+        let backend = ratatui::backend::TestBackend::new(140, 42);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal should initialize");
+        let mut app = ChatApp::new();
+        app.bootstrap_demo();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should not panic");
     }
 }

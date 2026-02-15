@@ -16,6 +16,8 @@
 - Input prompt now uses a bold right chevron (`❯`).
 - Sidebar is borderless and uses simpler ASCII-style markers.
 - Source tags switched from bracket labels to colored chips.
+- Delegate cards now use minimal collapsed rows (`Args`/`Output`/`Error`) and sectioned expanded views (`State`, `Input`, `Output`, `Details`, optional `Tools`).
+- Delegate badge now uses delegate color with the agent name label, rendered as a footer chip.
 
 ## Additional Decisions
 
