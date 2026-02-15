@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use neuromancer_core::rpc::ThreadSummary;
@@ -16,6 +17,10 @@ use super::composer::{ComposerState, DEFAULT_MAX_VISIBLE_LINES};
 use super::events::{fetch_all_thread_events, timeline_items_from_events};
 use super::timeline::{MessageRoleTag, TimelineItem, short_thread_id, status_style};
 use super::{PendingOutcome, SYSTEM_THREAD_ID};
+
+const ESC_NAVIGATION_WINDOW: Duration = Duration::from_millis(850);
+const AUTO_COLLAPSE_SIDEBAR_WIDTH: u16 = 92;
+const MIN_RIGHT_COLUMN_WIDTH: u16 = 58;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
@@ -40,6 +45,12 @@ impl FocusPane {
             Self::Input => Self::Main,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Compose,
+    Navigate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +190,10 @@ pub(super) struct ChatApp {
     pub(super) status: Option<String>,
     last_input_cursor_rel: Option<(u16, u16)>,
     last_main_viewport_rows: usize,
+    sidebar_collapsed: bool,
+    sidebar_auto_collapsed: bool,
+    mode: InteractionMode,
+    esc_armed_at: Option<Instant>,
     pending_thread_id: Option<String>,
     pending_placeholder_index_by_thread: HashMap<String, usize>,
 }
@@ -198,6 +213,10 @@ impl ChatApp {
             status: Some("System0 thread ready".to_string()),
             last_input_cursor_rel: None,
             last_main_viewport_rows: 1,
+            sidebar_collapsed: false,
+            sidebar_auto_collapsed: false,
+            mode: InteractionMode::Compose,
+            esc_armed_at: None,
             pending_thread_id: None,
             pending_placeholder_index_by_thread: HashMap::new(),
         }
@@ -480,6 +499,11 @@ impl ChatApp {
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        self.sidebar_auto_collapsed = area.width < AUTO_COLLAPSE_SIDEBAR_WIDTH;
+        if self.focus == FocusPane::Sidebar && !self.sidebar_visible() {
+            self.focus = FocusPane::Main;
+        }
+
         self.composer.max_visible_lines = if area.height < 22 {
             4
         } else if area.height < 34 {
@@ -489,50 +513,53 @@ impl ChatApp {
         };
         self.composer.ensure_cursor_visible();
 
-        let max_input_height = area.height.saturating_sub(6).max(3);
+        let max_input_height = area.height.saturating_sub(7).max(3);
         let input_box_height = (self.composer.input_height() as u16)
             .saturating_add(2)
             .clamp(3, max_input_height);
-        let chunks = Layout::default()
+
+        let right_column = if self.sidebar_visible() {
+            let max_sidebar = area.width.saturating_sub(MIN_RIGHT_COLUMN_WIDTH);
+            let sidebar_width = (((area.width as f32) * 0.28) as u16)
+                .clamp(20, 38)
+                .min(max_sidebar);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(sidebar_width),
+                    Constraint::Min(MIN_RIGHT_COLUMN_WIDTH),
+                ])
+                .split(area);
+            self.render_sidebar(frame, columns[0]);
+            columns[1]
+        } else {
+            area
+        };
+
+        let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
                 Constraint::Length(input_box_height),
                 Constraint::Length(1),
             ])
-            .split(area);
+            .split(right_column);
 
-        let body = if chunks[0].width < 84 {
-            let sidebar_height = (chunks[0].height / 3).clamp(5, 10);
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(sidebar_height), Constraint::Min(6)])
-                .split(chunks[0])
-        } else {
-            let max_sidebar = chunks[0].width.saturating_sub(20).max(18);
-            let sidebar_width = (((chunks[0].width as f32) * 0.30) as u16)
-                .clamp(18, 38)
-                .min(max_sidebar);
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(sidebar_width), Constraint::Min(20)])
-                .split(chunks[0])
-        };
-
-        self.render_sidebar(frame, body[0]);
-        self.render_thread(frame, body[1]);
-        self.render_input(frame, chunks[1]);
-        self.render_status(frame, chunks[2]);
+        self.render_thread(frame, right_chunks[0]);
+        self.render_input(frame, right_chunks[1]);
+        self.render_status(frame, right_chunks[2]);
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
         let block = if self.focus == FocusPane::Sidebar {
             Block::default()
-                .title("Threads")
+                .title("Threads (Ctrl+B)")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
         } else {
-            Block::default().title("Threads").borders(Borders::ALL)
+            Block::default()
+                .title("Threads (Ctrl+B)")
+                .borders(Borders::ALL)
         };
         let items: Vec<ListItem<'static>> = self
             .threads
@@ -580,13 +607,23 @@ impl ChatApp {
 
     fn render_thread(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let thread = self.current_thread().clone();
-        let title = if thread.read_only {
-            format!("Conversation: {} (read-only)", thread.title)
+        let mode_suffix = if self.mode == InteractionMode::Navigate {
+            " [NAV]"
         } else {
-            format!("Conversation: {}", thread.title)
+            ""
+        };
+        let title = if thread.read_only {
+            format!("Conversation: {} (read-only){mode_suffix}", thread.title)
+        } else {
+            format!("Conversation: {}{mode_suffix}", thread.title)
         };
 
-        let block = if self.focus == FocusPane::Main {
+        let block = if self.mode == InteractionMode::Navigate {
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+        } else if self.focus == FocusPane::Main {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -645,14 +682,18 @@ impl ChatApp {
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let read_only = self.current_thread().read_only;
-        let title = if read_only {
+        let title = if self.mode == InteractionMode::Navigate {
+            "Input (navigation mode: press i to edit)"
+        } else if read_only {
             "Input (read-only sub-agent thread)"
         } else {
             "Input"
         };
 
         let mut block = Block::default().title(title).borders(Borders::ALL);
-        if self.focus == FocusPane::Input && !read_only {
+        if self.mode == InteractionMode::Navigate {
+            block = block.border_style(Style::default().fg(Color::DarkGray));
+        } else if self.focus == FocusPane::Input && !read_only {
             block = block.border_style(Style::default().fg(Color::Green));
         } else if read_only {
             block = block.border_style(Style::default().fg(Color::DarkGray));
@@ -667,7 +708,7 @@ impl ChatApp {
         frame.render_widget(paragraph, area);
         self.last_input_cursor_rel = None;
 
-        if self.focus != FocusPane::Input || read_only {
+        if self.mode == InteractionMode::Navigate || self.focus != FocusPane::Input || read_only {
             return;
         }
 
@@ -688,9 +729,18 @@ impl ChatApp {
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mode_label = match self.mode {
+            InteractionMode::Compose => "input",
+            InteractionMode::Navigate => "navigation",
+        };
+        let sidebar_label = if self.sidebar_visible() {
+            "open"
+        } else {
+            "hidden"
+        };
         let status = self.status.clone().unwrap_or_else(|| {
             format!(
-                "Filter: {} (1:all 2:delegates 3:failures 4:system-tools) | Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | Ctrl+J/Ctrl+N/Shift+Enter: newline | q: quit",
+                "Mode:{mode_label} Sidebar:{sidebar_label} Filter:{} | Esc Esc: navigation mode | i: input mode | Ctrl+B: toggle sidebar | Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | 1-4: filter | q: quit",
                 self.main_filter.label()
             )
         });
@@ -727,21 +777,38 @@ impl ChatApp {
             return AppAction::None;
         }
 
+        self.expire_esc_arm();
         let read_only_input = self.current_thread().read_only;
 
         if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
             return AppAction::Quit;
         }
 
+        if key.code == KeyCode::Esc {
+            return self.handle_escape_press();
+        }
+        self.esc_armed_at = None;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
+        {
+            self.toggle_sidebar();
+            return AppAction::None;
+        }
+
+        if self.mode == InteractionMode::Navigate {
+            return self.handle_navigation_key(key);
+        }
+
         if key.code == KeyCode::BackTab
             || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
         {
-            self.focus = self.focus.prev();
+            self.cycle_focus_backward();
             return AppAction::None;
         }
 
         if key.code == KeyCode::Tab {
-            self.focus = self.focus.next();
+            self.cycle_focus_forward();
             return AppAction::None;
         }
 
@@ -914,6 +981,139 @@ impl ChatApp {
                 {
                     self.composer.insert_char(ch);
                 }
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
+    fn sidebar_visible(&self) -> bool {
+        !self.sidebar_collapsed && !self.sidebar_auto_collapsed
+    }
+
+    fn cycle_focus_forward(&mut self) {
+        let mut next = self.focus.next();
+        if next == FocusPane::Sidebar && !self.sidebar_visible() {
+            next = next.next();
+        }
+        self.focus = next;
+    }
+
+    fn cycle_focus_backward(&mut self) {
+        let mut prev = self.focus.prev();
+        if prev == FocusPane::Sidebar && !self.sidebar_visible() {
+            prev = prev.prev();
+        }
+        self.focus = prev;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        if !self.sidebar_visible() && self.focus == FocusPane::Sidebar {
+            self.focus = FocusPane::Main;
+        }
+        self.status = Some(if self.sidebar_visible() {
+            "Thread sidebar shown".to_string()
+        } else {
+            "Thread sidebar hidden".to_string()
+        });
+    }
+
+    fn expire_esc_arm(&mut self) {
+        if let Some(armed_at) = self.esc_armed_at
+            && armed_at.elapsed() > ESC_NAVIGATION_WINDOW
+        {
+            self.esc_armed_at = None;
+        }
+    }
+
+    fn handle_escape_press(&mut self) -> AppAction {
+        if self.mode == InteractionMode::Navigate {
+            self.mode = InteractionMode::Compose;
+            self.focus = FocusPane::Input;
+            self.esc_armed_at = None;
+            self.status = Some("Input mode".to_string());
+            return AppAction::None;
+        }
+
+        if self
+            .esc_armed_at
+            .is_some_and(|armed| armed.elapsed() <= ESC_NAVIGATION_WINDOW)
+        {
+            self.mode = InteractionMode::Navigate;
+            self.focus = FocusPane::Main;
+            self.esc_armed_at = None;
+            self.status = Some(
+                "Navigation mode: Up/Down to move, Enter to open, Space to expand, i to edit"
+                    .to_string(),
+            );
+            return AppAction::None;
+        }
+
+        self.esc_armed_at = Some(Instant::now());
+        self.status = Some("Press Esc again quickly to enter navigation mode".to_string());
+        AppAction::None
+    }
+
+    fn handle_navigation_key(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.mode = InteractionMode::Compose;
+                self.focus = FocusPane::Input;
+                self.status = Some("Input mode".to_string());
+                AppAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                self.select_main_prev();
+                AppAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                self.select_main_next();
+                AppAction::None
+            }
+            KeyCode::Left => {
+                let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    8
+                } else {
+                    1
+                };
+                let current = self.current_thread_horizontal_offset();
+                self.set_current_thread_horizontal_offset(current.saturating_sub(step));
+                AppAction::None
+            }
+            KeyCode::Right => {
+                let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    8
+                } else {
+                    1
+                };
+                let current = self.current_thread_horizontal_offset();
+                self.set_current_thread_horizontal_offset(current.saturating_add(step));
+                AppAction::None
+            }
+            KeyCode::Home => {
+                self.set_current_thread_horizontal_offset(0);
+                AppAction::None
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_selected_item();
+                AppAction::None
+            }
+            KeyCode::Enter => self.open_selected_main_link(),
+            KeyCode::Char('1') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::All);
+                AppAction::None
+            }
+            KeyCode::Char('2') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::DelegatesOnly);
+                AppAction::None
+            }
+            KeyCode::Char('3') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::FailuresOnly);
+                AppAction::None
+            }
+            KeyCode::Char('4') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::SystemToolsOnly);
                 AppAction::None
             }
             _ => AppAction::None,
@@ -1245,11 +1445,7 @@ fn build_thread_lines(
         let item_lines = item.lines(
             visible_pos == selected_visible_idx,
             &assistant_label,
-            if visible_pos == selected_visible_idx {
-                Some(selected_fill_width)
-            } else {
-                None
-            },
+            Some(selected_fill_width),
         );
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
@@ -1376,6 +1572,67 @@ mod tests {
             &mut clipboard,
         );
         assert_eq!(app.composer.buffer, "hello\n");
+    }
+
+    #[test]
+    fn double_escape_enters_navigation_mode() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Input;
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(Event::Key(key(KeyCode::Esc)), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Compose);
+        let _ = app.handle_event(Event::Key(key(KeyCode::Esc)), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Navigate);
+        assert_eq!(app.focus, FocusPane::Main);
+    }
+
+    #[test]
+    fn navigation_mode_scrolls_and_exits_with_i() {
+        let mut app = ChatApp::new();
+        if let Some(system) = app
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+        {
+            system
+                .items
+                .push(TimelineItem::text(MessageRoleTag::User, "first"));
+            system
+                .items
+                .push(TimelineItem::text(MessageRoleTag::Assistant, "second"));
+        }
+        app.selected_item_by_thread
+            .insert(SYSTEM_THREAD_ID.to_string(), 0);
+        app.mode = InteractionMode::Navigate;
+        app.focus = FocusPane::Main;
+
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(Event::Key(key(KeyCode::Down)), &mut clipboard);
+        assert_eq!(app.current_thread_selected_item(), 1);
+
+        let _ = app.handle_event(Event::Key(key(KeyCode::Char('i'))), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Compose);
+        assert_eq!(app.focus, FocusPane::Input);
+    }
+
+    #[test]
+    fn ctrl_b_collapses_sidebar_and_skips_sidebar_focus() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Sidebar;
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(
+            Event::Key(key_with_modifiers(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            )),
+            &mut clipboard,
+        );
+        assert!(app.sidebar_collapsed);
+        assert_eq!(app.focus, FocusPane::Main);
+
+        app.focus = FocusPane::Input;
+        let _ = app.handle_event(Event::Key(key(KeyCode::Tab)), &mut clipboard);
+        assert_eq!(app.focus, FocusPane::Main);
     }
 
     #[test]

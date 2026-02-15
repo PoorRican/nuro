@@ -529,21 +529,47 @@ impl TimelineItem {
             }
         };
 
-        if selected {
-            let selected_style = Style::default().bg(Color::DarkGray).fg(Color::White);
-            for line in &mut lines {
-                *line = line.clone().patch_style(selected_style);
-                if let Some(fill_width) = selected_fill_width {
-                    let width = line.width();
-                    if fill_width > width {
-                        line.spans
-                            .push(Span::styled(" ".repeat(fill_width - width), selected_style));
-                    }
+        let card_style = if selected {
+            self.selected_card_style()
+        } else {
+            self.base_card_style()
+        };
+        for line in &mut lines {
+            *line = line.clone().patch_style(card_style);
+            if let Some(fill_width) = selected_fill_width {
+                let width = line.width();
+                if fill_width > width {
+                    line.spans
+                        .push(Span::styled(" ".repeat(fill_width - width), card_style));
                 }
             }
         }
 
         lines
+    }
+
+    fn base_card_style(&self) -> Style {
+        match self {
+            TimelineItem::Text {
+                role: MessageRoleTag::User,
+                ..
+            } => Style::default().bg(Color::Rgb(20, 36, 62)),
+            _ => Style::default().bg(Color::Rgb(24, 24, 31)),
+        }
+    }
+
+    fn selected_card_style(&self) -> Style {
+        match self {
+            TimelineItem::Text {
+                role: MessageRoleTag::User,
+                ..
+            } => Style::default()
+                .bg(Color::Rgb(33, 63, 108))
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .bg(Color::Rgb(58, 58, 74))
+                .add_modifier(Modifier::BOLD),
+        }
     }
 
     pub(super) fn to_snapshot_value(&self) -> serde_json::Value {
