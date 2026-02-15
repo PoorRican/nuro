@@ -146,6 +146,22 @@ impl TimelineItem {
                     "list_agents" => ("[AGENTS] ", Color::Cyan),
                     "read_config" => ("[CONFIG] ", Color::Magenta),
                     "modify_skill" => ("[SKILL] ", Color::LightBlue),
+                    "propose_config_change"
+                    | "propose_skill_add"
+                    | "propose_skill_update"
+                    | "propose_agent_add"
+                    | "propose_agent_update"
+                    | "list_proposals"
+                    | "get_proposal"
+                    | "analyze_failures"
+                    | "score_skills"
+                    | "adapt_routing"
+                    | "record_lesson"
+                    | "run_redteam_eval"
+                    | "list_audit_records" => ("[ADAPT] ", Color::LightMagenta),
+                    "authorize_proposal" | "apply_authorized_proposal" => {
+                        ("[AUTH-ADAPT] ", Color::Magenta)
+                    }
                     _ => ("[TOOL] ", Color::Yellow),
                 };
                 lines.push(Line::from(vec![
@@ -292,6 +308,42 @@ impl TimelineItem {
                         lines.push(Line::from(vec![
                             Span::styled("  reason: ", Style::default().fg(Color::DarkGray)),
                             Span::raw(text_preview_lines(reason_preview, 1, 180).join(" ")),
+                        ]));
+                    }
+                    "propose_config_change"
+                    | "propose_skill_add"
+                    | "propose_skill_update"
+                    | "propose_agent_add"
+                    | "propose_agent_update"
+                    | "authorize_proposal"
+                    | "apply_authorized_proposal" => {
+                        let state_preview = output
+                            .get("state")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| {
+                                output
+                                    .get("proposal")
+                                    .and_then(|proposal| proposal.get("state"))
+                                    .and_then(|value| value.as_str())
+                            })
+                            .unwrap_or("n/a");
+                        let proposal_id = output
+                            .get("proposal_id")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| {
+                                output
+                                    .get("proposal")
+                                    .and_then(|proposal| proposal.get("proposal_id"))
+                                    .and_then(|value| value.as_str())
+                            })
+                            .unwrap_or("n/a");
+                        lines.push(Line::from(vec![
+                            Span::styled("  proposal: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(proposal_id.to_string()),
+                        ]));
+                        lines.push(Line::from(vec![
+                            Span::styled("  state: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(state_preview.to_string()),
                         ]));
                     }
                     _ => {}
