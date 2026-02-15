@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-a2a"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "axum",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-agent"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-cli"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-core"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-mcp"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "neuromancer-core",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-memory-simple"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-secrets"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-skills"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "gray_matter",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancer-triggers"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "neuromancerd"
-version = "0.1.0"
+version = "0.2.0-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
