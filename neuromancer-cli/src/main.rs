@@ -197,6 +197,12 @@ async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
             }
         },
         Command::Orchestrator { command } => {
+            if let OrchestratorCommand::Chat(ref args) = command
+                && args.demo
+            {
+                chat::run_demo_chat().await?;
+                return Ok(RunOutcome::Silent);
+            }
             let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
             match command {
                 OrchestratorCommand::Turn(args) => {

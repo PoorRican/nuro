@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod composer;
+mod demo;
 mod events;
 mod terminal;
 mod timeline;
@@ -26,6 +27,53 @@ use self::clipboard::CommandClipboard;
 use self::terminal::TerminalCleanup;
 
 pub(super) const SYSTEM_THREAD_ID: &str = "system0";
+
+pub async fn run_demo_chat() -> Result<(), CliError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CliError::Usage("demo mode requires a TTY".to_string()));
+    }
+
+    enable_raw_mode().map_err(map_terminal_err)?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste).map_err(map_terminal_err)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(map_terminal_err)?;
+    let mut cleanup = TerminalCleanup { enabled: true };
+
+    let mut app = ChatApp::new();
+    app.bootstrap_demo();
+    let mut clipboard = CommandClipboard;
+
+    loop {
+        terminal
+            .draw(|frame| app.render(frame))
+            .map_err(map_terminal_err)?;
+
+        if !event::poll(Duration::from_millis(100)).map_err(map_terminal_err)? {
+            continue;
+        }
+
+        let next = event::read().map_err(map_terminal_err)?;
+        match app.handle_event(next, &mut clipboard) {
+            AppAction::None => {}
+            AppAction::Quit => break,
+            AppAction::SubmitSystemTurn(_) | AppAction::SubmitSubagentTurn { .. } => {
+                app.status = Some("Demo mode: sends disabled".to_string());
+            }
+            AppAction::OpenThread { thread_id, .. } => {
+                app.status = Some(format!(
+                    "Loaded thread {} (demo)",
+                    timeline::short_thread_id(&thread_id)
+                ));
+            }
+        }
+    }
+
+    terminal.show_cursor().map_err(map_terminal_err)?;
+    drop(terminal);
+    cleanup.disable();
+    Ok(())
+}
 
 pub async fn run_orchestrator_chat(rpc: &RpcClient, json_mode: bool) -> Result<(), CliError> {
     if json_mode {

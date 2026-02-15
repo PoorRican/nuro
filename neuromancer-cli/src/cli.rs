@@ -220,7 +220,11 @@ pub struct OrchestratorTurnArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct OrchestratorChatArgs {}
+pub struct OrchestratorChatArgs {
+    /// Launch in demo mode with synthetic data (no daemon required).
+    #[arg(long)]
+    pub demo: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct OrchestratorRunGetArgs {
@@ -417,8 +421,25 @@ mod tests {
 
         match cli.command {
             Command::Orchestrator {
-                command: OrchestratorCommand::Chat(_),
-            } => {}
+                command: OrchestratorCommand::Chat(args),
+            } => {
+                assert!(!args.demo);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_chat_demo_flag() {
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "chat", "--demo"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Chat(args),
+            } => {
+                assert!(args.demo);
+            }
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

@@ -77,16 +77,16 @@ impl MainFilter {
 }
 
 #[derive(Debug, Clone)]
-struct ThreadView {
-    id: String,
-    title: String,
-    kind: ThreadKind,
-    agent_id: Option<String>,
-    state: String,
-    active: bool,
-    resurrected: bool,
-    read_only: bool,
-    items: Vec<TimelineItem>,
+pub(super) struct ThreadView {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) kind: ThreadKind,
+    pub(super) agent_id: Option<String>,
+    pub(super) state: String,
+    pub(super) active: bool,
+    pub(super) resurrected: bool,
+    pub(super) read_only: bool,
+    pub(super) items: Vec<TimelineItem>,
 }
 
 impl ThreadView {
@@ -215,6 +215,19 @@ impl ChatApp {
             self.status = Some("Loaded existing System0 context".to_string());
         }
         Ok(())
+    }
+
+    pub(super) fn bootstrap_demo(&mut self) {
+        let (threads, active) = super::demo::build_demo_threads();
+        self.threads = threads;
+        self.active_thread = active;
+        self.sidebar_selected = active;
+        let thread_id = self.threads[active].id.clone();
+        self.selected_item_by_thread.insert(
+            thread_id,
+            self.threads[active].items.len().saturating_sub(1),
+        );
+        self.status = Some("DEMO MODE".to_string());
     }
 
     pub(super) async fn handle_pending_outcome(
