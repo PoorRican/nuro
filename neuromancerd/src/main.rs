@@ -1,6 +1,6 @@
 mod admin;
 mod config;
-mod message_runtime;
+mod orchestrator;
 mod shutdown;
 mod telemetry;
 
@@ -79,16 +79,16 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 5. Start admin API server
     // -----------------------------------------------------------------------
-    let message_runtime = Arc::new(
-        message_runtime::MessageRuntime::new(&initial_config, &cli.config)
+    let orchestrator_runtime = Arc::new(
+        orchestrator::OrchestratorRuntime::new(&initial_config, &cli.config)
             .await
-            .map_err(|err| anyhow!("failed to initialize message runtime: {err}"))?,
+            .map_err(|err| anyhow!("failed to initialize orchestrator runtime: {err}"))?,
     );
 
     let admin_state = admin::AppState {
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        message_runtime: Some(message_runtime),
+        orchestrator_runtime: Some(orchestrator_runtime),
     };
 
     let admin_router = admin::admin_router(admin_state);
