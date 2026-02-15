@@ -25,6 +25,7 @@ const PANE_GUTTER_WIDTH: u16 = 1;
 const INPUT_FOCUS_COLOR: Color = Color::Rgb(120, 210, 176);
 const INPUT_BACKGROUND: Color = Color::Rgb(58, 58, 68);
 const TIMELINE_BACKGROUND: Color = Color::Rgb(16, 16, 22);
+const SIDEBAR_BACKGROUND: Color = Color::Rgb(40, 44, 58);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
@@ -502,15 +503,7 @@ impl ChatApp {
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let screen = frame.area();
-        let area = if screen.width > 4 && screen.height > 4 {
-            screen.inner(Margin {
-                horizontal: 2,
-                vertical: 2,
-            })
-        } else {
-            screen
-        };
+        let area = frame.area();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -551,22 +544,28 @@ impl ChatApp {
             area
         };
 
+        let right_content = if right_column.width > 2 {
+            right_column.inner(Margin {
+                horizontal: 1,
+                vertical: 0,
+            })
+        } else {
+            right_column
+        };
+
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
-                Constraint::Length(1),
                 Constraint::Length(input_box_height),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ])
-            .split(right_column);
+            .split(right_content);
 
         self.render_thread(frame, right_chunks[0]);
-        frame.render_widget(
-            Paragraph::new(" ").style(Style::default().bg(TIMELINE_BACKGROUND)),
-            right_chunks[1],
-        );
-        self.render_input(frame, right_chunks[2]);
+        self.render_input(frame, right_chunks[1]);
+        frame.render_widget(Paragraph::new(" "), right_chunks[2]);
         self.render_status(frame, right_chunks[3]);
     }
 
@@ -574,6 +573,13 @@ impl ChatApp {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let focused = self.focus == FocusPane::Sidebar;
+        let primary_text = if focused { Color::White } else { Color::Gray };
+        let secondary_text = if focused {
+            Color::DarkGray
+        } else {
+            Color::Gray
+        };
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -581,8 +587,8 @@ impl ChatApp {
         frame.render_widget(
             Paragraph::new("threads").style(
                 Style::default()
-                    .fg(Color::DarkGray)
-                    .bg(TIMELINE_BACKGROUND)
+                    .fg(secondary_text)
+                    .bg(SIDEBAR_BACKGROUND)
                     .add_modifier(Modifier::BOLD),
             ),
             split[0],
@@ -592,20 +598,22 @@ impl ChatApp {
             .iter()
             .map(|thread| {
                 if thread.kind == ThreadKind::System {
-                    ListItem::new(Line::from(vec![
-                        Span::styled("S ", Style::default().fg(Color::Cyan)),
-                        Span::styled("system0", Style::default().fg(Color::White)),
-                    ]))
+                    ListItem::new(Line::from(vec![Span::styled(
+                        "system0",
+                        Style::default().fg(primary_text),
+                    )]))
                 } else {
-                    let mode_marker = if thread.read_only { "s" } else { "l" };
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{mode_marker} "),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::raw(thread.title.clone()),
+                        Span::styled(thread.title.clone(), Style::default().fg(primary_text)),
                         Span::raw(" "),
-                        Span::styled(thread.state.clone(), status_style(&thread.state)),
+                        Span::styled(
+                            thread.state.clone(),
+                            if focused {
+                                status_style(&thread.state)
+                            } else {
+                                Style::default().fg(Color::Gray)
+                            },
+                        ),
                     ]))
                 }
             })
@@ -619,15 +627,15 @@ impl ChatApp {
 
         let mut highlight = Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(38, 38, 52))
+            .bg(Color::Rgb(54, 58, 76))
             .add_modifier(Modifier::BOLD);
-        if self.focus != FocusPane::Sidebar {
+        if !focused {
             highlight = highlight.remove_modifier(Modifier::BOLD);
         }
 
         let list = List::new(items)
-            .style(Style::default().bg(TIMELINE_BACKGROUND))
-            .highlight_symbol(">> ")
+            .style(Style::default().bg(SIDEBAR_BACKGROUND))
+            .highlight_symbol("» ")
             .highlight_style(highlight)
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
@@ -650,8 +658,15 @@ impl ChatApp {
             .unwrap_or(0);
         let visible_width = area.width as usize;
         let selected_fill_width = horizontal_offset.saturating_add(visible_width.max(1));
-        let (lines, ranges, selected_visible_idx) =
-            build_thread_lines(&thread, selected, selected_fill_width, self.main_filter);
+        let timeline_focused =
+            self.mode == InteractionMode::Navigate || self.focus == FocusPane::Main;
+        let (lines, ranges, selected_visible_idx) = build_thread_lines(
+            &thread,
+            selected,
+            selected_fill_width,
+            self.main_filter,
+            timeline_focused,
+        );
         let viewport_rows = area.height as usize;
         self.last_main_viewport_rows = viewport_rows.max(1);
 
@@ -1358,7 +1373,7 @@ impl ChatApp {
             .current_thread_selected_item()
             .min(thread.items.len().saturating_sub(1));
         let (_, ranges, selected_visible_idx) =
-            build_thread_lines(&thread, selected, 1, self.main_filter);
+            build_thread_lines(&thread, selected, 1, self.main_filter, false);
         self.ensure_selected_visible_for(
             &thread.id,
             &ranges,
@@ -1425,6 +1440,7 @@ fn build_thread_lines(
     selected: usize,
     selected_fill_width: usize,
     filter: MainFilter,
+    timeline_focused: bool,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>, usize) {
     if thread.items.is_empty() {
         return (
@@ -1472,6 +1488,7 @@ fn build_thread_lines(
             visible_pos == selected_visible_idx,
             &assistant_label,
             Some(selected_fill_width),
+            timeline_focused,
         );
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
@@ -1736,7 +1753,7 @@ mod tests {
             MessageRoleTag::Assistant,
             "system reply",
         ));
-        let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All);
+        let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All, true);
         assert!(
             line_text(&system_lines[1]).contains("system0"),
             "system assistant label should be System0"
@@ -1746,7 +1763,7 @@ mod tests {
         subagent
             .items
             .push(TimelineItem::text(MessageRoleTag::Assistant, "agent reply"));
-        let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All);
+        let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All, true);
         assert!(
             line_text(&subagent_lines[1]).contains("planner"),
             "sub-agent assistant label should use the agent id"

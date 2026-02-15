@@ -11,8 +11,8 @@
 - User and assistant text cards include extra vertical padding.
 - Visually mute `[SYSTEM]` timeline lines.
 - Timeline cards now have exactly one separator line between cards.
-- Render a single spacer line between timeline and input panes.
-- The app content now renders with a 2-line outer margin on all sides.
+- Render a single spacer line below the input pane (before status).
+- Right pane content uses a 1-column inner horizontal margin.
 - Input prompt now uses a bold right chevron (`❯`).
 - Sidebar is borderless and uses simpler ASCII-style markers.
 - Source tags switched from bracket labels to colored chips.

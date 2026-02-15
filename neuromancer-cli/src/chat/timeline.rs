@@ -78,6 +78,7 @@ impl TimelineItem {
         selected: bool,
         assistant_label: &str,
         selected_fill_width: Option<usize>,
+        timeline_focused: bool,
     ) -> Vec<Line<'static>> {
         let mut lines = match self {
             TimelineItem::Text {
@@ -597,7 +598,7 @@ impl TimelineItem {
         } else {
             self.base_card_style()
         };
-        let card_gutter_style = self.card_gutter_style(selected);
+        let card_gutter_style = self.card_gutter_style(selected, timeline_focused);
         for line in &mut lines {
             let mut prefixed = Vec::with_capacity(line.spans.len() + 2);
             prefixed.push(Span::styled(
@@ -641,17 +642,19 @@ impl TimelineItem {
         Style::default().bg(background).add_modifier(Modifier::BOLD)
     }
 
-    fn card_gutter_style(&self, selected: bool) -> Style {
+    fn card_gutter_style(&self, selected: bool, timeline_focused: bool) -> Style {
         let background = if selected {
             self.selected_card_bg()
         } else {
             self.base_card_bg()
         };
-        Style::default().bg(background).fg(if selected {
-            Color::Rgb(104, 181, 255)
-        } else {
-            Color::Rgb(70, 70, 84)
-        })
+        Style::default()
+            .bg(background)
+            .fg(if selected && timeline_focused {
+                Color::Rgb(104, 181, 255)
+            } else {
+                Color::Rgb(70, 70, 84)
+            })
     }
 
     fn base_card_bg(&self) -> Color {
@@ -897,7 +900,7 @@ mod tests {
             expanded: false,
         };
 
-        let lines = item.lines(false, "System0", None);
+        let lines = item.lines(false, "System0", None, true);
         let summary_line = lines
             .iter()
             .map(line_text)
