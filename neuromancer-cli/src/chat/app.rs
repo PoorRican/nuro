@@ -24,7 +24,6 @@ const MIN_RIGHT_COLUMN_WIDTH: u16 = 58;
 const PANE_GUTTER_WIDTH: u16 = 1;
 const INPUT_FOCUS_COLOR: Color = Color::Rgb(120, 210, 176);
 const INPUT_BACKGROUND: Color = Color::Rgb(58, 58, 68);
-const TIMELINE_BACKGROUND: Color = Color::Rgb(16, 16, 22);
 const SIDEBAR_BACKGROUND: Color = Color::Rgb(40, 44, 58);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,7 +520,7 @@ impl ChatApp {
         };
         self.composer.ensure_cursor_visible();
 
-        let max_input_height = area.height.saturating_sub(8).max(3);
+        let max_input_height = area.height.saturating_sub(9).max(3);
         let input_box_height = (self.composer.input_height() as u16)
             .saturating_add(2)
             .clamp(3, max_input_height);
@@ -564,9 +563,10 @@ impl ChatApp {
             .split(right_content);
 
         self.render_thread(frame, right_chunks[0]);
-        self.render_input(frame, right_chunks[1]);
-        frame.render_widget(Paragraph::new(" "), right_chunks[2]);
-        self.render_status(frame, right_chunks[3]);
+        frame.render_widget(Paragraph::new(" "), right_chunks[1]);
+        self.render_input(frame, right_chunks[2]);
+        frame.render_widget(Paragraph::new(" "), right_chunks[3]);
+        self.render_status(frame, right_chunks[4]);
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -688,7 +688,6 @@ impl ChatApp {
             .insert(thread.id.clone(), vertical_offset);
 
         let paragraph = Paragraph::new(Text::from(lines))
-            .style(Style::default().bg(TIMELINE_BACKGROUND))
             .scroll((vertical_offset as u16, horizontal_offset as u16));
 
         frame.render_widget(paragraph, area);
@@ -1494,10 +1493,7 @@ fn build_thread_lines(
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
         if visible_pos + 1 < visible_indices.len() {
-            lines.push(Line::from(Span::styled(
-                " ",
-                Style::default().bg(TIMELINE_BACKGROUND),
-            )));
+            lines.push(Line::from(" "));
         }
     }
 
