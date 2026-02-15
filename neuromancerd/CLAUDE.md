@@ -34,7 +34,7 @@ cargo run -p neuromancerd -- --validate -c neuromancer.toml
 - `state.rs`: `System0ToolBroker` state, tool spec registry, invocation recording, proposal creation helpers.
 - `bootstrap.rs`: build orchestrator agent config.
 - `prompt.rs`: prompt loading/rendering.
-- `llm_clients.rs`: LLM client builders and retry-limit resolution.
+- `llm_clients.rs`: LLM client builders (generic OpenAI-compatible via `base_url`), provider defaults, and retry-limit resolution.
 - `tools.rs`: default/effective System0 tool allowlist.
 - `error.rs`: orchestrator runtime error variants.
 

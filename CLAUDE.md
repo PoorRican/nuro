@@ -138,6 +138,33 @@ Removed methods should return JSON-RPC method-not-found (`message.send`, `task.s
 Single TOML file (`neuromancer.toml`) with sections:
 `[global]`, `[otel]`, `[secrets]`, `[memory]`, `[models.*]`, `[mcp_servers.*]`, `[a2a]`, `[orchestrator]`, `[agents.*]`, `[triggers]`, `[admin_api]`.
 
+### Model Slots (`[models.*]`)
+
+Each model slot specifies a `provider`, `model`, and optional `base_url`. All non-mock providers use rig's OpenAI-compatible client.
+
+Known providers with built-in defaults:
+
+| Provider | Default `base_url` | API key env var |
+|----------|-------------------|-----------------|
+| `openai` | *(rig default)* | `OPENAI_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `fireworks` | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` |
+| `xai` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| `mistral` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` |
+
+The `base_url` field overrides the provider default, enabling custom/proxy endpoints. Unknown providers require an explicit `base_url`.
+
+```toml
+[models.executor]
+provider = "fireworks"
+model = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+
+[models.custom]
+provider = "openai"
+base_url = "https://my-proxy.example.com/v1"
+model = "my-model"
+```
+
 For System0, `[orchestrator]` controls:
 
 - model slot
