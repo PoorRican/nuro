@@ -1,10 +1,10 @@
 # neuromancerd
 
-Daemon binary hosting the System0 orchestrator runtime. Loads config, starts the admin API (Axum HTTP), processes user turns via a message queue, delegates to sub-agent runtimes, and journals all thread events to disk.
+Daemon binary hosting the System0 orchestrator runtime. It loads config, starts the admin API (`axum`), runs orchestrator turns through a worker queue, delegates sub-agent turns, and journals thread events.
 
-System0 is itself an `AgentRuntime` (from `neuromancer-agent`) whose `ToolBroker` can spin up and delegate to other `AgentRuntime` instances. This crate is the integration layer that wires everything together.
+System0 is itself an `AgentRuntime` (`neuromancer-agent`) whose `ToolBroker` can delegate to other `AgentRuntime` instances.
 
-## Build & Test
+## Build and Test
 
 ```bash
 cargo build -p neuromancerd
@@ -13,125 +13,132 @@ cargo run -p neuromancerd -- -c neuromancer.toml
 cargo run -p neuromancerd -- --validate -c neuromancer.toml
 ```
 
-## Module Map
+## Top-Level Module Map
 
 | File | Purpose |
 |------|---------|
-| `main.rs` | CLI args (clap), boot sequence, config watcher, admin server spawn, shutdown loop |
-| `config.rs` | TOML loading, validation (model slots, agent refs, MCP servers, prompt files), hot-reload via `notify` file watcher |
-| `admin.rs` | Axum HTTP routes: `POST /rpc` (JSON-RPC 2.0), `GET /admin/health`, `POST /admin/config/reload` |
-| `message_runtime.rs` | **Core module** (~3.5K lines): `MessageRuntime`, `RuntimeCore`, `System0ToolBroker`, `SkillToolBroker`, `ThreadJournal`, LLM clients |
-| `shutdown.rs` | Unix signal handler: SIGTERM/SIGINT -> shutdown, SIGHUP -> config reload |
-| `telemetry.rs` | OTEL tracing init with optional OTLP exporter, JSON stdout layer |
+| `src/main.rs` | CLI args, boot sequence, config watcher, admin server spawn, shutdown loop |
+| `src/config.rs` | TOML load/validate + hot-reload watcher (`notify`) |
+| `src/admin.rs` | JSON-RPC dispatch and admin HTTP endpoints |
+| `src/shutdown.rs` | signal handling (shutdown/reload) |
+| `src/telemetry.rs` | tracing/OTEL setup |
+| `src/orchestrator/` | orchestrator runtime and all runtime internals |
+
+## Orchestrator Module Structure
+
+`src/orchestrator/mod.rs` exports `OrchestratorRuntime` and `OrchestratorRuntimeError` and includes:
+
+### Runtime Core
+
+- `runtime.rs`: `OrchestratorRuntime`, turn queue worker, orchestrator RPC helpers, thread/runs/context APIs.
+- `state.rs`: `System0ToolBroker` state, tool spec registry, invocation recording, proposal creation helpers.
+- `bootstrap.rs`: build orchestrator agent config.
+- `prompt.rs`: prompt loading/rendering.
+- `llm_clients.rs`: LLM client builders and retry-limit resolution.
+- `tools.rs`: default/effective System0 tool allowlist.
+- `error.rs`: orchestrator runtime error variants.
+
+### Actions
+
+- `actions/dispatch.rs`: classifies tool calls into `Runtime`, `Adaptive`, `AuthenticatedAdaptive`.
+- `actions/runtime_actions.rs`: runtime operations (`delegate_to_agent`, `list_agents`, `read_config`).
+- `actions/adaptive_actions.rs`: non-admin adaptive operations (proposal creation/list/read, analytics, lessons, red-team, audit log reads).
+- `actions/authenticated_adaptive_actions.rs`: admin-authorized lifecycle mutations (`authorize_proposal`, `apply_authorized_proposal`) and `modify_skill` compatibility alias.
+
+### Security
+
+- `security/trigger_gate.rs`: central `TriggerType::Admin` enforcement helper.
+- `security/audit.rs`: risk scoring, safeguards, allow/block verdicts, mutation audit record model.
+- `security/execution_guard.rs`: `ExecutionGuard` hook abstraction; fail-closed `blocked_missing_sandbox`.
+- `security/redaction.rs`: secret masking + payload shape restrictions for tool events.
+
+### Proposals
+
+- `proposals/model.rs`: proposal kind/state/report/authorization/apply models.
+- `proposals/verification.rs`: verification checks (including skill lint and unknown-skill checks on agent patches).
+- `proposals/lifecycle.rs`: hash generation + state transitions.
+- `proposals/apply.rs`: mutation application to managed config/skills/agents.
+
+### Adaptation
+
+- `adaptation/analytics.rs`: failure clustering, skill quality scoring, routing recommendations.
+- `adaptation/canary.rs`: canary metrics and regression rollback decision.
+- `adaptation/lessons.rs`: lessons partition constant.
+- `adaptation/redteam.rs`: lightweight continuous red-team report.
+
+### Tracing
+
+- `tracing/thread_journal.rs`: append/read JSONL thread events + index snapshots.
+- `tracing/event_query.rs`: query filtering helpers.
+- `tracing/conversation_projection.rs`: conversation reconstruction and timeline conversion.
+- `tracing/jsonl_io.rs`: low-level JSONL read/write.
+
+### Skills
+
+- `skills/broker.rs`: skill tool broker implementation.
+- `skills/script_runner.rs`: skill script execution.
+- `skills/path_policy.rs`: filesystem path policy checks.
+- `skills/csv.rs`, `skills/aliases.rs`: parsing/alias helpers.
 
 ## Turn Processing Flow
 
-```
+```text
 neuroctl orchestrator turn "message"
-  -> POST /rpc (admin.rs) -> orchestrator.turn
-    -> MessageRuntime::orchestrator_turn() -> sends TurnRequest to mpsc channel
-      -> turn_worker receives -> RuntimeCore::process_turn()
-        -> journal message_user event
-        -> orchestrator AgentRuntime::execute_turn() (Think->Act loop)
-          -> System0ToolBroker.call_tool() when LLM requests tools
-            -> delegate_to_agent: sub-agent AgentRuntime::execute(task)
-        -> journal message_assistant + tool events
-      <- OrchestratorTurnResult { turn_id, response, delegated_runs, tool_invocations }
+  -> POST /rpc (`admin.rs`) -> `orchestrator.turn`
+    -> `OrchestratorRuntime::orchestrator_turn`
+      -> enqueue `TurnRequest { message, trigger_type }` on mpsc
+        -> worker: `RuntimeCore::process_turn`
+          -> journal `message_user`
+          -> System0 `AgentRuntime::execute_turn(..., TriggerSource::Cli, ...)`
+            -> `System0ToolBroker.call_tool` -> dispatch -> action handler
+          -> journal tool invocations + `message_assistant`
+      <- `OrchestratorTurnResult { turn_id, response, delegated_runs, tool_invocations }`
 ```
 
-## Key Components in message_runtime.rs
+Current ingress behavior: orchestrator turns are enqueued with `TriggerType::Admin` (CLI/chat boundary).
 
-**MessageRuntime** -- Public API surface. Owns the turn queue (`mpsc::Sender<TurnRequest>`). Exposes all `orchestrator_*` methods called from admin.rs RPC dispatch.
+## Self-Improvement Lifecycle and Gating
 
-**RuntimeCore** -- Internal state that lives inside the `turn_worker` task. Holds: orchestrator `AgentRuntime`, `InMemorySessionStore`, `System0ToolBroker`, `ThreadJournal`. Processes turns sequentially.
+Self-improvement tools are enabled by `orchestrator.self_improvement.enabled`.
 
-**System0ToolBroker** (implements `ToolBroker`) -- 4 built-in tools:
-- `delegate_to_agent(agent_id, instruction)` -- creates/resumes a sub-agent thread, runs `AgentRuntime::execute`, journals all events
-- `list_agents` -- returns configured agent IDs
-- `read_config` -- returns config snapshot as JSON
-- `modify_skill(skill_id, patch)` -- admin-only skill modification
+Lifecycle states:
 
-**SkillToolBroker** (implements `ToolBroker`) -- Loads `SKILL.md` files via `SkillRegistry` (from `neuromancer-skills`), executes skill scripts with timeout, returns markdown/csv/script results.
+`proposal_created -> verification_passed|verification_failed -> audit_passed|audit_blocked -> awaiting_admin_message -> authorized -> applied_canary -> promoted|rolled_back`
 
-**ThreadJournal** -- Append-only JSONL event log at `~/.local/neuromancer/threads/`. Redacts secret values on write. Directory layout: `system0/system0.jsonl`, `subagents/<thread_id>.jsonl`, `index.jsonl`.
+Rules implemented in runtime:
 
-**LLM Clients** -- Three implementations of `LlmClient`:
-- `RigLlmClient` -- production client via rig-core (Groq, OpenAI, Anthropic, etc.)
-- `TwoStepMockLlmClient` -- deterministic two-step mock for testing (returns tool call then final response)
-- `EchoLlmClient` -- simple echo fallback
+- `authorize_proposal` and `apply_authorized_proposal` use `trigger_gate::ensure_admin_trigger`.
+- Verification must pass before authorization when `verify_before_authorize = true`.
+- High/critical-risk proposals require explicit `force=true` in admin turns.
+- `ExecutionGuard::pre_apply_proposal` can block and force rollback.
+- Canary regression detection can rollback before promotion (`canary_before_promote` thresholds).
+- Every mutation path records `MutationAuditRecord` with trigger type, proposal id/hash, outcome, and details.
+- `modify_skill` is compatibility only and still flows through proposal verify/audit/guard/apply logic.
 
-## Crate Relationships
+No transport authentication mechanism is currently added; `TriggerType` is the effective privilege boundary.
 
-```
-neuromancer-core          Pure trait contracts + domain types (no rig-core dep)
-    |                     Defines: ToolBroker, MemoryStore, SecretsBroker, PolicyEngine
-    |
-neuromancer-agent         Execution engine (depends on rig-core)
-    |                     Implements: AgentRuntime (Think->Act loop),
-    |                     ConversationContext, LlmClient trait, InMemorySessionStore
-    |
-neuromancerd              Integration layer (this crate)
-                          Instantiates AgentRuntime per agent + System0
-                          Implements System0ToolBroker and SkillToolBroker
-                          Manages turn queue, thread journals, admin API
-```
+## Config Validation Hooks
 
-Key insight: System0 is an `AgentRuntime` whose `ToolBroker` can delegate to other `AgentRuntime` instances -- it's agents all the way down.
+`src/config.rs` enforces:
+
+- referenced model slots exist
+- agent references are valid (`mcp_servers`, `a2a_peers`)
+- cron template agent references are valid
+- prompt files exist and are valid markdown
+- if `orchestrator.self_improvement.enabled = true`, the configured `audit_agent_id` must exist in `[agents]`
 
 ## RPC Surface
 
-Orchestrator methods:
-- `orchestrator.turn` -- submit a user message, get orchestrator response
-- `orchestrator.runs.list` -- list all delegated runs
-- `orchestrator.runs.get` -- get a specific run by ID
-- `orchestrator.runs.diagnose` -- diagnostics for a specific run
-- `orchestrator.context.get` -- get current conversation context
-- `orchestrator.threads.list` -- list all thread journals
-- `orchestrator.threads.get` -- get events from a specific thread
-- `orchestrator.threads.resurrect` -- resurrect a thread into active session
-- `orchestrator.subagent.turn` -- send a message directly to a sub-agent thread
-- `orchestrator.events.query` -- query thread events with filters
-- `orchestrator.stats.get` -- runtime statistics
+See root `CLAUDE.md` for the full RPC method list. Dispatch is in `src/admin.rs`.
 
-Admin methods:
-- `admin.health` -- health check with version and uptime
-- `admin.config.reload` -- trigger config hot-reload
+## Tests to Keep in Mind
 
-Removed (return method-not-found): `task.submit`, `task.list`, `task.get`, `message.send`
+`src/orchestrator/runtime_tests.rs` covers core self-improvement security and lifecycle behavior, including:
 
-## Persistence Hierarchy
-
-| Layer | Storage | Survives Restart | Notes |
-|-------|---------|------------------|-------|
-| Sessions | In-memory (`InMemorySessionStore`) | No | `ConversationContext` per agent, lost on restart |
-| Threads | Disk (JSONL) | Yes | `~/.local/neuromancer/threads/`, can be resurrected |
-| Runs | In-memory + journaled | Partially | `DelegatedRun` records per turn, indexed by run_id |
-
-## Constants
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `TURN_TIMEOUT` | 180s | Max duration for a single orchestrator turn |
-| `DEFAULT_SKILL_SCRIPT_TIMEOUT` | 5s | Max duration for skill script execution |
-| `DEFAULT_THREAD_PAGE_LIMIT` | 100 | Default page size for thread event queries |
-| `DEFAULT_EVENTS_QUERY_LIMIT` | 200 | Default limit for events query results |
-| Turn channel buffer | 128 | `mpsc::channel` buffer for `TurnRequest` |
-| Report channel buffer | 256 | `mpsc::channel` buffer for sub-agent reports |
-
-## v0.1-alpha Stubs
-
-These subsystems are referenced but stubbed out, pending sibling crate integration:
-- Secrets broker (handle-based injection, zeroize after use)
-- MCP client pool (tool caching, SSE + child process transports)
-- Policy engine (pre/post gates on tool/LLM calls)
-- Triggers (Discord gateway, cron scheduling)
-- Container execution for sandboxed tool runs
-- Crash recovery checkpoints
-- Sub-agent report remediation
-
-## SDS Guardrails
-
-- Secrets never enter LLM context -- referenced by handle only, injected at tool execution time, zeroized after use
-- System0 is the single ingress orchestrator -- no ambient message APIs
-- Explicit, auditable, revocable capabilities per agent
-- Least privilege by default -- sub-agents can only reduce from parent capabilities
+- non-admin denial for `authorize_proposal` and `apply_authorized_proposal`
+- admin authorize/apply happy path
+- dangerous proposal blocking
+- unknown-skill rejection in agent updates
+- canary rollback behavior
+- mutation audit logging expectations
+- `modify_skill` compatibility path behavior
