@@ -476,6 +476,7 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
+                lines.push(Line::raw(""));
                 let target = target_agent
                     .clone()
                     .unwrap_or_else(|| "unknown-agent".to_string());
@@ -592,6 +593,7 @@ impl TimelineItem {
                     Span::raw(" "),
                     Span::styled(pretty_status(status), status_style(status)),
                 ]));
+                lines.push(Line::raw(""));
                 lines
             }
         };
