@@ -82,6 +82,8 @@ impl Default for MemoryConfig {
 pub struct ModelSlotConfig {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default = "default_tool_call_retry_limit")]
     pub tool_call_retry_limit: u32,
 }
@@ -552,6 +554,58 @@ capabilities.filesystem_roots = []
                 .expect("executor model should be present")
                 .tool_call_retry_limit,
             3
+        );
+    }
+
+    #[test]
+    fn model_slot_base_url_defaults_to_none() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "groq"
+model = "test-model"
+
+[orchestrator]
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .base_url
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_slot_base_url_parses_explicit_value() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "openai"
+model = "gpt-4"
+base_url = "https://my-proxy.example.com/v1"
+
+[orchestrator]
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert_eq!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .base_url
+                .as_deref(),
+            Some("https://my-proxy.example.com/v1")
         );
     }
 

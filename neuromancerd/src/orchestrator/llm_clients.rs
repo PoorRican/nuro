@@ -38,23 +38,55 @@ pub fn build_llm_client(
     };
 
     match slot.provider.as_str() {
-        "groq" => {
-            let key = std::env::var("GROQ_API_KEY").map_err(|_| {
-                OrchestratorRuntimeError::Config(
-                    "GROQ_API_KEY is required when using provider='groq'".to_string(),
-                )
+        "mock" => Ok(Arc::new(TwoStepMockLlmClient::default())),
+        provider => {
+            let env_var = resolve_api_key_env_var(provider);
+            let key = std::env::var(&env_var).map_err(|_| {
+                OrchestratorRuntimeError::Config(format!(
+                    "{env_var} is required when using provider='{provider}'"
+                ))
             })?;
-            let groq_compat =
-                rig::providers::openai::Client::from_url(&key, "https://api.groq.com/openai/v1");
+
+            let client = match (slot.base_url.as_deref(), default_base_url(provider)) {
+                (Some(url), _) | (None, Some(url)) => {
+                    rig::providers::openai::Client::from_url(&key, url)
+                }
+                (None, None) if provider == "openai" => rig::providers::openai::Client::new(&key),
+                _ => {
+                    return Err(OrchestratorRuntimeError::Config(format!(
+                        "provider '{provider}' requires a base_url in config"
+                    )));
+                }
+            };
+
             Ok(Arc::new(RigLlmClient::new(
-                groq_compat.completion_model(&slot.model),
+                client.completion_model(&slot.model),
             )))
         }
-        "mock" => Ok(Arc::new(TwoStepMockLlmClient::default())),
-        other => Err(OrchestratorRuntimeError::Config(format!(
-            "agent '{}' uses unsupported model provider '{}'",
-            agent_config.id, other
-        ))),
+    }
+}
+
+fn default_base_url(provider: &str) -> Option<&'static str> {
+    match provider {
+        // TODO: add more provider support
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        _ => None,
+    }
+}
+
+fn resolve_api_key_env_var(provider: &str) -> String {
+    match provider {
+        "openai" => "OPENAI_API_KEY".into(),
+        "anthropic" => "ANTHROPIC_API_KEY".into(),
+        "groq" => "GROQ_API_KEY".into(),
+        "fireworks" => "FIREWORKS_API_KEY".into(),
+        "gemini" | "google" => "GEMINI_API_KEY".into(),
+        "xai" => "XAI_API_KEY".into(),
+        "mistral" => "MISTRAL_API_KEY".into(),
+        other => format!("{}_API_KEY", other.to_ascii_uppercase()),
     }
 }
 
