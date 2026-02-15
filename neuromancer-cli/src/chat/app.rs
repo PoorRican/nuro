@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use neuromancer_core::rpc::ThreadSummary;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::CliError;
 use crate::rpc_client::RpcClient;
@@ -21,6 +21,10 @@ use super::{PendingOutcome, SYSTEM_THREAD_ID};
 const ESC_NAVIGATION_WINDOW: Duration = Duration::from_millis(850);
 const AUTO_COLLAPSE_SIDEBAR_WIDTH: u16 = 92;
 const MIN_RIGHT_COLUMN_WIDTH: u16 = 58;
+const PANE_GUTTER_WIDTH: u16 = 1;
+const INPUT_FOCUS_COLOR: Color = Color::Rgb(120, 210, 176);
+const INPUT_BACKGROUND: Color = Color::Rgb(58, 58, 68);
+const TIMELINE_BACKGROUND: Color = Color::Rgb(16, 16, 22);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
@@ -498,7 +502,18 @@ impl ChatApp {
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
-        let area = frame.area();
+        let screen = frame.area();
+        let area = if screen.width > 4 && screen.height > 4 {
+            screen.inner(Margin {
+                horizontal: 2,
+                vertical: 2,
+            })
+        } else {
+            screen
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         self.sidebar_auto_collapsed = area.width < AUTO_COLLAPSE_SIDEBAR_WIDTH;
         if self.focus == FocusPane::Sidebar && !self.sidebar_visible() {
             self.focus = FocusPane::Main;
@@ -513,7 +528,7 @@ impl ChatApp {
         };
         self.composer.ensure_cursor_visible();
 
-        let max_input_height = area.height.saturating_sub(7).max(3);
+        let max_input_height = area.height.saturating_sub(8).max(3);
         let input_box_height = (self.composer.input_height() as u16)
             .saturating_add(2)
             .clamp(3, max_input_height);
@@ -540,44 +555,57 @@ impl ChatApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(1),
                 Constraint::Length(input_box_height),
                 Constraint::Length(1),
             ])
             .split(right_column);
 
         self.render_thread(frame, right_chunks[0]);
-        self.render_input(frame, right_chunks[1]);
-        self.render_status(frame, right_chunks[2]);
+        frame.render_widget(
+            Paragraph::new(" ").style(Style::default().bg(TIMELINE_BACKGROUND)),
+            right_chunks[1],
+        );
+        self.render_input(frame, right_chunks[2]);
+        self.render_status(frame, right_chunks[3]);
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = if self.focus == FocusPane::Sidebar {
-            Block::default()
-                .title("Threads (Ctrl+B)")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-        } else {
-            Block::default()
-                .title("Threads (Ctrl+B)")
-                .borders(Borders::ALL)
-        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new("threads").style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .bg(TIMELINE_BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            split[0],
+        );
         let items: Vec<ListItem<'static>> = self
             .threads
             .iter()
             .map(|thread| {
                 if thread.kind == ThreadKind::System {
                     ListItem::new(Line::from(vec![
-                        Span::styled("System0", Style::default().fg(Color::Cyan)),
-                        Span::styled(" [active]", Style::default().fg(Color::DarkGray)),
+                        Span::styled("S ", Style::default().fg(Color::Cyan)),
+                        Span::styled("system0", Style::default().fg(Color::White)),
                     ]))
                 } else {
-                    let mode_label = if thread.read_only { " saved" } else { " live" };
+                    let mode_marker = if thread.read_only { "s" } else { "l" };
                     ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{mode_marker} "),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                         Span::raw(thread.title.clone()),
-                        Span::raw(" ["),
+                        Span::raw(" "),
                         Span::styled(thread.state.clone(), status_style(&thread.state)),
-                        Span::raw("]"),
-                        Span::styled(mode_label, Style::default().fg(Color::DarkGray)),
                     ]))
                 }
             })
@@ -591,47 +619,27 @@ impl ChatApp {
 
         let mut highlight = Style::default()
             .fg(Color::White)
-            .bg(Color::DarkGray)
+            .bg(Color::Rgb(38, 38, 52))
             .add_modifier(Modifier::BOLD);
         if self.focus != FocusPane::Sidebar {
             highlight = highlight.remove_modifier(Modifier::BOLD);
         }
 
         let list = List::new(items)
-            .block(block)
-            .highlight_symbol("▶ ")
-            .highlight_style(highlight);
+            .style(Style::default().bg(TIMELINE_BACKGROUND))
+            .highlight_symbol(">> ")
+            .highlight_style(highlight)
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_stateful_widget(list, split[1], &mut state);
     }
 
     fn render_thread(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
         let thread = self.current_thread().clone();
-        let mode_suffix = if self.mode == InteractionMode::Navigate {
-            " [NAV]"
-        } else {
-            ""
-        };
-        let title = if thread.read_only {
-            format!("Conversation: {} (read-only){mode_suffix}", thread.title)
-        } else {
-            format!("Conversation: {}{mode_suffix}", thread.title)
-        };
-
-        let block = if self.mode == InteractionMode::Navigate {
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-        } else if self.focus == FocusPane::Main {
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
-        } else {
-            Block::default().title(title).borders(Borders::ALL)
-        };
-
         let selected = self
             .current_thread_selected_item()
             .min(thread.items.len().saturating_sub(1));
@@ -640,11 +648,11 @@ impl ChatApp {
             .get(&thread.id)
             .copied()
             .unwrap_or(0);
-        let inner_width = area.width.saturating_sub(2) as usize;
-        let selected_fill_width = horizontal_offset.saturating_add(inner_width.max(1));
+        let visible_width = area.width as usize;
+        let selected_fill_width = horizontal_offset.saturating_add(visible_width.max(1));
         let (lines, ranges, selected_visible_idx) =
             build_thread_lines(&thread, selected, selected_fill_width, self.main_filter);
-        let viewport_rows = area.height.saturating_sub(2) as usize;
+        let viewport_rows = area.height as usize;
         self.last_main_viewport_rows = viewport_rows.max(1);
 
         self.ensure_selected_visible_for(
@@ -665,7 +673,7 @@ impl ChatApp {
             .insert(thread.id.clone(), vertical_offset);
 
         let paragraph = Paragraph::new(Text::from(lines))
-            .block(block)
+            .style(Style::default().bg(TIMELINE_BACKGROUND))
             .scroll((vertical_offset as u16, horizontal_offset as u16));
 
         frame.render_widget(paragraph, area);
@@ -681,41 +689,40 @@ impl ChatApp {
     }
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let read_only = self.current_thread().read_only;
-        let title = if self.mode == InteractionMode::Navigate {
-            "Input (navigation mode: press i to edit)"
-        } else if read_only {
-            "Input (read-only sub-agent thread)"
-        } else {
-            "Input"
-        };
-
-        let mut block = Block::default().title(title).borders(Borders::ALL);
-        if self.mode == InteractionMode::Navigate {
-            block = block.border_style(Style::default().fg(Color::DarkGray));
-        } else if self.focus == FocusPane::Input && !read_only {
-            block = block.border_style(Style::default().fg(Color::Green));
-        } else if read_only {
-            block = block.border_style(Style::default().fg(Color::DarkGray));
+        if area.width <= PANE_GUTTER_WIDTH {
+            return;
         }
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(PANE_GUTTER_WIDTH), Constraint::Min(1)])
+            .split(area);
+        let gutter_area = split[0];
+        let body_area = split[1];
+
+        let read_only = self.current_thread().read_only;
+        let input_focused =
+            self.mode != InteractionMode::Navigate && self.focus == FocusPane::Input;
+        self.render_focus_gutter(frame, gutter_area, input_focused);
+
+        let block = Block::default()
+            .padding(Padding::new(1, 1, 1, 1))
+            .style(Style::default().bg(INPUT_BACKGROUND));
+        let inner = block.inner(body_area);
 
         let lines = self.composer.prefixed_lines();
         let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
+            .style(Style::default().bg(INPUT_BACKGROUND))
             .wrap(Wrap { trim: false })
             .scroll((self.composer.scroll_line_offset as u16, 0));
 
-        frame.render_widget(paragraph, area);
+        frame.render_widget(paragraph, body_area);
         self.last_input_cursor_rel = None;
 
         if self.mode == InteractionMode::Navigate || self.focus != FocusPane::Input || read_only {
             return;
         }
 
-        let inner = area.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -989,6 +996,25 @@ impl ChatApp {
 
     fn sidebar_visible(&self) -> bool {
         !self.sidebar_collapsed && !self.sidebar_auto_collapsed
+    }
+
+    fn render_focus_gutter(&self, frame: &mut Frame<'_>, area: Rect, active: bool) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let lines = (0..area.height)
+            .map(|_| {
+                Line::from(Span::styled(
+                    if active { "┃" } else { " " },
+                    Style::default().fg(INPUT_FOCUS_COLOR).bg(INPUT_BACKGROUND),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).style(Style::default().bg(INPUT_BACKGROUND)),
+            area,
+        );
     }
 
     fn cycle_focus_forward(&mut self) {
@@ -1450,6 +1476,12 @@ fn build_thread_lines(
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
+        if visible_pos + 1 < visible_indices.len() {
+            lines.push(Line::from(Span::styled(
+                " ",
+                Style::default().bg(TIMELINE_BACKGROUND),
+            )));
+        }
     }
 
     (lines, ranges, selected_visible_idx)
@@ -1706,7 +1738,7 @@ mod tests {
         ));
         let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All);
         assert!(
-            line_text(&system_lines[0]).starts_with("[System0] "),
+            line_text(&system_lines[1]).contains("system0"),
             "system assistant label should be System0"
         );
 
@@ -1716,7 +1748,7 @@ mod tests {
             .push(TimelineItem::text(MessageRoleTag::Assistant, "agent reply"));
         let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All);
         assert!(
-            line_text(&subagent_lines[0]).starts_with("[planner] "),
+            line_text(&subagent_lines[1]).contains("planner"),
             "sub-agent assistant label should use the agent id"
         );
     }

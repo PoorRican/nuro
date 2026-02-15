@@ -1,6 +1,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::composer::INPUT_PREFIX;
+
 const TEXT_COLLAPSE_LINE_THRESHOLD: usize = 4;
 const TEXT_COLLAPSE_CHAR_THRESHOLD: usize = 280;
 
@@ -17,14 +19,6 @@ impl MessageRoleTag {
             Self::System => "SYSTEM",
             Self::User => "USER",
             Self::Assistant => "ASSISTANT",
-        }
-    }
-
-    fn badge_style(self) -> Style {
-        match self {
-            Self::System => Style::default().fg(Color::Cyan),
-            Self::User => Style::default().fg(Color::Green),
-            Self::Assistant => Style::default().fg(Color::Blue),
         }
     }
 }
@@ -92,17 +86,18 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
-                let role_label = if *role == MessageRoleTag::Assistant {
-                    assistant_label
+                let is_system_line = *role == MessageRoleTag::System;
+                let content_style = if is_system_line {
+                    Style::default().fg(Color::DarkGray)
                 } else {
-                    role.label()
+                    Style::default().fg(Color::White)
                 };
-                let role_prefix_text = format!("[{role_label}] ");
-                let continuation_indent = " ".repeat(role_prefix_text.chars().count());
-                let role_prefix = Span::styled(
-                    role_prefix_text,
-                    role.badge_style().add_modifier(Modifier::BOLD),
-                );
+                let role_label = if *role == MessageRoleTag::Assistant {
+                    assistant_label.to_ascii_lowercase()
+                } else {
+                    "system".to_string()
+                };
+                let continuation_indent = "  ";
 
                 let full_lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
                 let preview_lines = text_preview_lines(text, 3, 220);
@@ -113,9 +108,44 @@ impl TimelineItem {
                 };
                 let mut iter = source.iter();
                 let first = iter.next().cloned().unwrap_or_default();
-                lines.push(Line::from(vec![role_prefix, Span::raw(first)]));
+                let first_line = match role {
+                    MessageRoleTag::User => Line::from(vec![
+                        Span::styled(
+                            INPUT_PREFIX,
+                            Style::default()
+                                .fg(Color::Rgb(140, 235, 255))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(first, content_style),
+                    ]),
+                    MessageRoleTag::Assistant => Line::from(vec![
+                        badge_chip(
+                            &role_label,
+                            Style::default()
+                                .fg(Color::Rgb(205, 228, 255))
+                                .bg(Color::Rgb(52, 76, 115))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(first, content_style),
+                    ]),
+                    MessageRoleTag::System => Line::from(vec![
+                        badge_chip(
+                            "system",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .bg(Color::Rgb(44, 44, 52)),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(first, content_style),
+                    ]),
+                };
+                lines.push(first_line);
                 for line in iter {
-                    lines.push(Line::from(format!("{continuation_indent}{line}")));
+                    lines.push(Line::from(vec![
+                        Span::raw(continuation_indent),
+                        Span::styled(line.clone(), content_style),
+                    ]));
                 }
 
                 if text_is_collapsible(text) {
@@ -129,7 +159,10 @@ impl TimelineItem {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                lines.push(Line::raw(""));
+                if matches!(*role, MessageRoleTag::User | MessageRoleTag::Assistant) {
+                    lines.insert(0, Line::raw(""));
+                    lines.push(Line::raw(""));
+                }
                 lines
             }
             TimelineItem::ToolInvocation {
@@ -142,10 +175,28 @@ impl TimelineItem {
                 expanded,
             } => {
                 let mut lines = Vec::new();
-                let (badge, badge_color) = match tool_id.as_str() {
-                    "list_agents" => ("[AGENTS] ", Color::Cyan),
-                    "read_config" => ("[CONFIG] ", Color::Magenta),
-                    "modify_skill" => ("[SKILL] ", Color::LightBlue),
+                let badge = match tool_id.as_str() {
+                    "list_agents" => badge_chip(
+                        "agents",
+                        Style::default()
+                            .fg(Color::Rgb(196, 236, 255))
+                            .bg(Color::Rgb(36, 88, 108))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    "read_config" => badge_chip(
+                        "config",
+                        Style::default()
+                            .fg(Color::Rgb(252, 212, 255))
+                            .bg(Color::Rgb(92, 48, 105))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    "modify_skill" => badge_chip(
+                        "skill",
+                        Style::default()
+                            .fg(Color::Rgb(210, 229, 255))
+                            .bg(Color::Rgb(48, 76, 122))
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     "propose_config_change"
                     | "propose_skill_add"
                     | "propose_skill_update"
@@ -158,19 +209,31 @@ impl TimelineItem {
                     | "adapt_routing"
                     | "record_lesson"
                     | "run_redteam_eval"
-                    | "list_audit_records" => ("[ADAPT] ", Color::LightMagenta),
-                    "authorize_proposal" | "apply_authorized_proposal" => {
-                        ("[AUTH-ADAPT] ", Color::Magenta)
-                    }
-                    _ => ("[TOOL] ", Color::Yellow),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        badge,
+                    | "list_audit_records" => badge_chip(
+                        "adapt",
                         Style::default()
-                            .fg(badge_color)
+                            .fg(Color::Rgb(252, 220, 255))
+                            .bg(Color::Rgb(95, 43, 110))
                             .add_modifier(Modifier::BOLD),
                     ),
+                    "authorize_proposal" | "apply_authorized_proposal" => badge_chip(
+                        "auth",
+                        Style::default()
+                            .fg(Color::Rgb(245, 220, 255))
+                            .bg(Color::Rgb(109, 55, 118))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    _ => badge_chip(
+                        "tool",
+                        Style::default()
+                            .fg(Color::Rgb(255, 236, 197))
+                            .bg(Color::Rgb(95, 77, 28))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                };
+                lines.push(Line::from(vec![
+                    badge,
+                    Span::raw(" "),
                     Span::styled(tool_id.clone(), Style::default().fg(Color::Gray)),
                     Span::raw(" status="),
                     Span::styled(status.clone(), status_style(status)),
@@ -395,7 +458,6 @@ impl TimelineItem {
                         lines.push(Line::from(format!("    {line}")));
                     }
                 }
-                lines.push(Line::raw(""));
                 lines
             }
             TimelineItem::DelegateInvocation {
@@ -417,12 +479,14 @@ impl TimelineItem {
                     .clone()
                     .unwrap_or_else(|| "unknown-agent".to_string());
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "[DELEGATE] ",
+                    badge_chip(
+                        "delegate",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(Color::Rgb(255, 237, 183))
+                            .bg(Color::Rgb(89, 76, 33))
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Span::raw(" "),
                     Span::styled(format!("-> {target}"), Style::default().fg(Color::Cyan)),
                     Span::raw(" state="),
                     Span::styled(status.clone(), status_style(status)),
@@ -524,7 +588,6 @@ impl TimelineItem {
                         lines.push(Line::from(format!("    {line}")));
                     }
                 }
-                lines.push(Line::raw(""));
                 lines
             }
         };
@@ -534,8 +597,16 @@ impl TimelineItem {
         } else {
             self.base_card_style()
         };
+        let card_gutter_style = self.card_gutter_style(selected);
         for line in &mut lines {
-            *line = line.clone().patch_style(card_style);
+            let mut prefixed = Vec::with_capacity(line.spans.len() + 2);
+            prefixed.push(Span::styled(
+                if selected { "┃" } else { " " },
+                card_gutter_style,
+            ));
+            prefixed.push(Span::styled(" ", card_style));
+            prefixed.extend(line.spans.clone());
+            *line = Line::from(prefixed).patch_style(card_style);
             if let Some(fill_width) = selected_fill_width {
                 let width = line.width();
                 if fill_width > width {
@@ -549,26 +620,57 @@ impl TimelineItem {
     }
 
     fn base_card_style(&self) -> Style {
-        match self {
+        let background = match self {
             TimelineItem::Text {
                 role: MessageRoleTag::User,
                 ..
-            } => Style::default().bg(Color::Rgb(20, 36, 62)),
-            _ => Style::default().bg(Color::Rgb(24, 24, 31)),
-        }
+            } => Color::Rgb(20, 36, 62),
+            _ => Color::Rgb(24, 24, 31),
+        };
+        Style::default().bg(background)
     }
 
     fn selected_card_style(&self) -> Style {
+        let background = match self {
+            TimelineItem::Text {
+                role: MessageRoleTag::User,
+                ..
+            } => Color::Rgb(33, 63, 108),
+            _ => Color::Rgb(58, 58, 74),
+        };
+        Style::default().bg(background).add_modifier(Modifier::BOLD)
+    }
+
+    fn card_gutter_style(&self, selected: bool) -> Style {
+        let background = if selected {
+            self.selected_card_bg()
+        } else {
+            self.base_card_bg()
+        };
+        Style::default().bg(background).fg(if selected {
+            Color::Rgb(104, 181, 255)
+        } else {
+            Color::Rgb(70, 70, 84)
+        })
+    }
+
+    fn base_card_bg(&self) -> Color {
         match self {
             TimelineItem::Text {
                 role: MessageRoleTag::User,
                 ..
-            } => Style::default()
-                .bg(Color::Rgb(33, 63, 108))
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default()
-                .bg(Color::Rgb(58, 58, 74))
-                .add_modifier(Modifier::BOLD),
+            } => Color::Rgb(20, 36, 62),
+            _ => Color::Rgb(24, 24, 31),
+        }
+    }
+
+    fn selected_card_bg(&self) -> Color {
+        match self {
+            TimelineItem::Text {
+                role: MessageRoleTag::User,
+                ..
+            } => Color::Rgb(33, 63, 108),
+            _ => Color::Rgb(58, 58, 74),
         }
     }
 
@@ -678,6 +780,10 @@ impl TimelineItem {
             } => None,
         }
     }
+}
+
+fn badge_chip(label: &str, style: Style) -> Span<'static> {
+    Span::styled(format!(" {} ", label), style)
 }
 
 fn pretty_json_lines(value: &serde_json::Value) -> Vec<String> {
