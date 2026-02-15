@@ -31,6 +31,17 @@ pub fn validate_config(config: &NeuromancerConfig, config_path: &Path) -> Result
         }
     }
 
+    if config.orchestrator.self_improvement.enabled
+        && !config
+            .agents
+            .contains_key(&config.orchestrator.self_improvement.audit_agent_id)
+    {
+        anyhow::bail!(
+            "self-improvement requires audit agent '{}' in [agents]",
+            config.orchestrator.self_improvement.audit_agent_id
+        );
+    }
+
     // Check agent model slot references
     for (name, agent) in &config.agents {
         for slot in [
@@ -191,9 +202,14 @@ mod tests {
         dir
     }
 
-    fn write_config(dir: &Path, include_prompts: bool) -> PathBuf {
+    fn write_config(
+        dir: &Path,
+        include_prompts: bool,
+        enable_self_improvement: bool,
+        include_audit_agent: bool,
+    ) -> PathBuf {
         let config_path = dir.join("neuromancer.toml");
-        let config = r#"
+        let mut config = r#"
 [global]
 instance_id = "test"
 workspace_dir = "/tmp"
@@ -206,6 +222,7 @@ model = "test-double"
 [orchestrator]
 model_slot = "executor"
 system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+max_iterations = 30
 
 [agents.planner]
 models.executor = "executor"
@@ -217,6 +234,52 @@ capabilities.secrets = []
 capabilities.memory_partitions = []
 capabilities.filesystem_roots = []
 "#;
+        if enable_self_improvement {
+            config = r#"
+[global]
+instance_id = "test"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "mock"
+model = "test-double"
+
+[orchestrator]
+model_slot = "executor"
+system_prompt_path = "prompts/orchestrator/SYSTEM.md"
+max_iterations = 30
+
+[orchestrator.self_improvement]
+enabled = true
+audit_agent_id = "audit-agent"
+require_admin_message_for_mutations = true
+verify_before_authorize = true
+canary_before_promote = true
+
+[orchestrator.self_improvement.thresholds]
+max_success_rate_drop_pct = 3.0
+max_tool_failure_increase_pct = 2.0
+max_policy_denial_increase_pct = 5.0
+
+[agents.planner]
+models.executor = "executor"
+system_prompt_path = "prompts/agents/planner/SYSTEM.md"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+        }
+        let config = if include_audit_agent {
+            format!(
+                "{config}\n[agents.audit-agent]\nmodels.executor = \"executor\"\nsystem_prompt_path = \"prompts/agents/audit-agent/SYSTEM.md\"\ncapabilities.skills = []\ncapabilities.mcp_servers = []\ncapabilities.a2a_peers = []\ncapabilities.secrets = []\ncapabilities.memory_partitions = []\ncapabilities.filesystem_roots = []\n"
+            )
+        } else {
+            config.to_string()
+        };
         fs::write(&config_path, config).expect("config write");
 
         if include_prompts {
@@ -232,6 +295,12 @@ capabilities.filesystem_roots = []
                 .expect("planner dir");
             fs::write(&orchestrator_path, "# System0").expect("orchestrator prompt");
             fs::write(&planner_path, "# Planner").expect("planner prompt");
+            if include_audit_agent {
+                let audit_path = dir.join("prompts/agents/audit-agent/SYSTEM.md");
+                fs::create_dir_all(audit_path.parent().expect("audit parent should exist"))
+                    .expect("audit dir");
+                fs::write(&audit_path, "# Audit").expect("audit prompt");
+            }
         }
 
         config_path
@@ -240,7 +309,7 @@ capabilities.filesystem_roots = []
     #[test]
     fn validate_config_fails_when_prompt_files_are_missing() {
         let dir = temp_dir("nm_cfg_missing_prompts");
-        let config_path = write_config(&dir, false);
+        let config_path = write_config(&dir, false, false, false);
         let config = load_config(&config_path).expect("load");
         let err = validate_config(&config, &config_path).expect_err("missing prompts must fail");
         assert!(err.to_string().contains("system prompt is invalid"));
@@ -249,7 +318,27 @@ capabilities.filesystem_roots = []
     #[test]
     fn validate_config_succeeds_when_prompt_files_exist() {
         let dir = temp_dir("nm_cfg_with_prompts");
-        let config_path = write_config(&dir, true);
+        let config_path = write_config(&dir, true, false, false);
+        let config = load_config(&config_path).expect("load");
+        validate_config(&config, &config_path).expect("validation should pass");
+    }
+
+    #[test]
+    fn validate_config_fails_when_self_improvement_audit_agent_missing() {
+        let dir = temp_dir("nm_cfg_missing_audit_agent");
+        let config_path = write_config(&dir, true, true, false);
+        let config = load_config(&config_path).expect("load");
+        let err = validate_config(&config, &config_path).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("self-improvement requires audit agent")
+        );
+    }
+
+    #[test]
+    fn validate_config_succeeds_when_self_improvement_audit_agent_present() {
+        let dir = temp_dir("nm_cfg_with_audit_agent");
+        let config_path = write_config(&dir, true, true, true);
         let config = load_config(&config_path).expect("load");
         validate_config(&config, &config_path).expect("validation should pass");
     }
