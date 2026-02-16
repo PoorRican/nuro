@@ -1,7 +1,8 @@
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 pub(super) const DEFAULT_MAX_VISIBLE_LINES: usize = 10;
-const INPUT_PREFIX: &str = "> ";
+pub(super) const INPUT_PREFIX: &str = "❯ ";
 
 #[derive(Debug, Clone)]
 pub(super) struct ComposerState {
@@ -136,7 +137,17 @@ impl ComposerState {
     pub(super) fn prefixed_lines(&self) -> Vec<Line<'static>> {
         self.logical_lines()
             .into_iter()
-            .map(|line| Line::from(format!("{INPUT_PREFIX}{line}")))
+            .map(|line| {
+                Line::from(vec![
+                    Span::styled(
+                        INPUT_PREFIX,
+                        Style::default()
+                            .fg(Color::Rgb(140, 235, 255))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line.to_string()),
+                ])
+            })
             .collect()
     }
 

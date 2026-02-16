@@ -1,12 +1,12 @@
 ---
 name: visualize-chat-ui
-description: Capture a text snapshot of the Neuromancer chat TUI in demo mode via tmux
+description: Capture a text or PNG snapshot of the Neuromancer chat TUI in demo mode via tmux
 user_invocable: true
 ---
 
 # Visualize Chat UI
 
-Captures a text rendering of the `neuroctl orchestrator chat --demo` TUI using tmux, so you can see the chat interface without a TTY.
+Captures a text or PNG rendering of the `neuroctl orchestrator chat --demo` TUI using tmux, so you can see the chat interface without a TTY.
 
 ## Usage
 
@@ -28,7 +28,33 @@ Custom dimensions and wait time:
 .claude/skills/visualize-chat-ui/scripts/capture.sh --width 160 --height 50 --wait 3
 ```
 
+### PNG Screenshot
+
+To capture a PNG image with full ANSI styling (colors, bold, underline), use the screenshot script:
+
+```bash
+.claude/skills/visualize-chat-ui/scripts/capture-screenshot.sh
+```
+
+By default, this outputs to `/tmp/neuromancer-chat-<timestamp>.png`.
+
+Specify a custom output path:
+
+```bash
+.claude/skills/visualize-chat-ui/scripts/capture-screenshot.sh --out /tmp/chat.png
+```
+
+The `--keys`, `--width`, `--height`, and `--wait` flags work the same as the text capture:
+
+```bash
+.claude/skills/visualize-chat-ui/scripts/capture-screenshot.sh --keys "Tab Down Space" --width 160 --height 50 --wait 3
+```
+
+Requires `uv` (used to run the Python renderer that converts ANSI output to PNG).
+
 ## Interpreting the Output
+
+The PNG output preserves full ANSI styling (colors, bold, underline) from the TUI, while the text capture is plain text only.
 
 The captured text is a plain-text rendering of the ratatui TUI. Layout regions:
 
