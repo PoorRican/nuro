@@ -1,5 +1,6 @@
-// TODO: only `dispatch_tool` is used. Minimize module exports.
-pub mod dispatch;
-pub(crate) mod adaptive_actions;
-pub(crate) mod authenticated_adaptive_actions;
-pub(crate) mod runtime_actions;
+//! Tool action handlers. Only `dispatch::dispatch_tool` is used externally.
+
+pub(crate) mod dispatch;
+mod adaptive_actions;
+mod authenticated_adaptive_actions;
+mod runtime_actions;
