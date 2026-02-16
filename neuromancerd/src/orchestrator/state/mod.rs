@@ -1,4 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+pub(crate) mod agent_registry;
+pub(crate) mod proposal_store;
+pub(crate) mod run_tracker;
+pub(crate) mod self_improvement;
+pub(crate) mod thread_registry;
+pub(crate) mod turn_context;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
@@ -6,27 +13,31 @@ use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
-    DelegatedRun, DelegatedTask, OrchestratorOutputItem, OrchestratorToolInvocation,
+    DelegatedRun, TurnDelegation, OrchestratorOutputItem, OrchestratorToolInvocation,
 };
-use neuromancer_core::tool::{ToolCall, ToolOutput, ToolSource, ToolSpec};
+use neuromancer_core::tool::{ToolSource, ToolSpec};
 use neuromancer_core::trigger::TriggerType;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::orchestrator::actions::dispatch::is_self_improvement_tool;
 use crate::orchestrator::proposals::lifecycle::{new_proposal, transition};
 use crate::orchestrator::proposals::model::{
-    ChangeProposal, ChangeProposalKind, ProposalState, SkillQualityStats,
+    ChangeProposal, ChangeProposalKind, ProposalState,
 };
 use crate::orchestrator::proposals::verification::verify_proposal;
-use crate::orchestrator::security::audit::{
-    AuditRiskLevel, MutationAuditRecord, audit_proposal, mutation_audit_record,
-};
+use crate::orchestrator::security::audit::{AuditRiskLevel, audit_proposal};
 use crate::orchestrator::security::execution_guard::ExecutionGuard;
 use crate::orchestrator::tools::default_system0_tools;
 use crate::orchestrator::tracing::thread_journal::{ThreadJournal, now_rfc3339};
 
+pub(crate) use agent_registry::AgentRegistry;
+pub(crate) use proposal_store::ProposalStore;
+pub(crate) use run_tracker::RunTracker;
+pub(crate) use self_improvement::SelfImprovementState;
+pub(crate) use thread_registry::ThreadRegistry;
+pub(crate) use turn_context::TurnContext;
+
 pub(crate) const SYSTEM0_AGENT_ID: &str = "system0";
-const OUTPUT_QUEUE_MAX_ITEMS: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SubAgentThreadState {
@@ -49,35 +60,14 @@ pub(crate) struct System0ToolBroker {
 }
 
 pub(crate) struct System0BrokerInner {
-    pub(crate) subagents: HashMap<String, Arc<AgentRuntime>>,
-    pub(crate) config_snapshot: serde_json::Value,
-    pub(crate) allowlisted_tools: HashSet<String>,
-    pub(crate) known_skill_ids: HashSet<String>,
-    pub(crate) self_improvement: SelfImprovementConfig,
-    pub(crate) execution_guard: Arc<dyn ExecutionGuard>,
-    pub(crate) session_store: InMemorySessionStore,
-    pub(crate) thread_journal: ThreadJournal,
-    pub(crate) current_trigger_type: TriggerType,
-    pub(crate) current_turn_id: uuid::Uuid,
-    pub(crate) current_turn_user_query: String,
-    pub(crate) delegated_tasks_by_turn: HashMap<uuid::Uuid, Vec<DelegatedTask>>,
-    pub(crate) tool_invocations_by_turn: HashMap<uuid::Uuid, Vec<OrchestratorToolInvocation>>,
-    pub(crate) runs_index: HashMap<String, DelegatedRun>,
-    pub(crate) runs_order: Vec<String>,
-    pub(crate) thread_states: HashMap<String, SubAgentThreadState>,
-    pub(crate) pending_output_queue: VecDeque<OrchestratorOutputItem>,
-    pub(crate) proposals_index: HashMap<String, ChangeProposal>,
-    pub(crate) proposals_order: Vec<String>,
-    pub(crate) mutation_audit_log: Vec<MutationAuditRecord>,
-    pub(crate) managed_skills: HashMap<String, String>,
-    pub(crate) managed_agents: HashMap<String, serde_json::Value>,
-    pub(crate) config_patch_history: Vec<String>,
-    pub(crate) lessons_learned: Vec<String>,
-    pub(crate) skill_quality_stats: HashMap<String, SkillQualityStats>,
-    pub(crate) last_known_good_snapshot: serde_json::Value,
+    pub(crate) turn: TurnContext,
+    pub(crate) agents: AgentRegistry,
+    pub(crate) runs: RunTracker,
+    pub(crate) threads: ThreadRegistry,
+    pub(crate) proposals: ProposalStore,
+    pub(crate) improvement: SelfImprovementState,
 }
 
-// TODO: there seems to be a divergence between "runs" and "tasks"
 impl System0ToolBroker {
     pub(crate) fn new(
         subagents: HashMap<String, Arc<AgentRuntime>>,
@@ -89,7 +79,7 @@ impl System0ToolBroker {
         known_skill_ids: &[String],
         execution_guard: Arc<dyn ExecutionGuard>,
     ) -> Self {
-        let allowlisted_tools = if allowlisted_tools.is_empty() {
+        let allowlisted_tools: HashSet<String> = if allowlisted_tools.is_empty() {
             default_system0_tools().into_iter().collect()
         } else {
             allowlisted_tools.iter().cloned().collect()
@@ -97,32 +87,24 @@ impl System0ToolBroker {
 
         Self {
             inner: Arc::new(AsyncMutex::new(System0BrokerInner {
-                subagents,
-                config_snapshot: config_snapshot.clone(),
-                allowlisted_tools,
-                known_skill_ids: known_skill_ids.iter().cloned().collect(),
-                self_improvement,
-                execution_guard,
-                session_store,
-                thread_journal,
-                current_trigger_type: TriggerType::Admin,
-                current_turn_id: uuid::Uuid::nil(),
-                current_turn_user_query: String::new(),
-                delegated_tasks_by_turn: HashMap::new(),
-                tool_invocations_by_turn: HashMap::new(),
-                runs_index: HashMap::new(),
-                runs_order: Vec::new(),
-                thread_states: HashMap::new(),
-                pending_output_queue: VecDeque::new(),
-                proposals_index: HashMap::new(),
-                proposals_order: Vec::new(),
-                mutation_audit_log: Vec::new(),
-                managed_skills: HashMap::new(),
-                managed_agents: HashMap::new(),
-                config_patch_history: Vec::new(),
-                lessons_learned: Vec::new(),
-                skill_quality_stats: HashMap::new(),
-                last_known_good_snapshot: config_snapshot,
+                turn: TurnContext::new(),
+                agents: AgentRegistry {
+                    subagents,
+                    session_store,
+                    execution_guard,
+                },
+                runs: RunTracker::new(),
+                threads: ThreadRegistry {
+                    thread_states: HashMap::new(),
+                    thread_journal,
+                },
+                proposals: ProposalStore::new(),
+                improvement: SelfImprovementState::new(
+                    self_improvement,
+                    allowlisted_tools,
+                    known_skill_ids.iter().cloned().collect(),
+                    config_snapshot,
+                ),
             })),
         }
     }
@@ -134,17 +116,18 @@ impl System0ToolBroker {
         user_query: String,
     ) {
         let mut inner = self.inner.lock().await;
-        inner.current_turn_id = turn_id;
-        inner.current_trigger_type = trigger_type;
-        inner.current_turn_user_query = user_query;
-        inner.delegated_tasks_by_turn.remove(&turn_id);
-        inner.tool_invocations_by_turn.remove(&turn_id);
+        inner.turn.current_turn_id = turn_id;
+        inner.turn.current_trigger_type = trigger_type;
+        inner.turn.current_turn_user_query = user_query;
+        inner.runs.delegations_by_turn.remove(&turn_id);
+        inner.runs.tool_invocations_by_turn.remove(&turn_id);
     }
 
-    pub(crate) async fn take_delegated_tasks(&self, turn_id: uuid::Uuid) -> Vec<DelegatedTask> {
+    pub(crate) async fn take_delegations(&self, turn_id: uuid::Uuid) -> Vec<TurnDelegation> {
         let mut inner = self.inner.lock().await;
         inner
-            .delegated_tasks_by_turn
+            .runs
+            .delegations_by_turn
             .remove(&turn_id)
             .unwrap_or_default()
     }
@@ -155,6 +138,7 @@ impl System0ToolBroker {
     ) -> Vec<OrchestratorToolInvocation> {
         let mut inner = self.inner.lock().await;
         inner
+            .runs
             .tool_invocations_by_turn
             .remove(&turn_id)
             .unwrap_or_default()
@@ -163,63 +147,69 @@ impl System0ToolBroker {
     pub(crate) async fn list_runs(&self) -> Vec<DelegatedRun> {
         let inner = self.inner.lock().await;
         inner
+            .runs
             .runs_order
             .iter()
-            .filter_map(|run_id| inner.runs_index.get(run_id).cloned())
+            .filter_map(|run_id| inner.runs.runs_index.get(run_id).cloned())
             .collect()
     }
 
     pub(crate) async fn get_run(&self, run_id: &str) -> Option<DelegatedRun> {
         let inner = self.inner.lock().await;
-        inner.runs_index.get(run_id).cloned()
+        inner.runs.runs_index.get(run_id).cloned()
     }
 
     pub(crate) async fn session_store(&self) -> InMemorySessionStore {
         let inner = self.inner.lock().await;
-        inner.session_store.clone()
+        inner.agents.session_store.clone()
     }
 
     pub(crate) async fn runtime_for_agent(&self, agent_id: &str) -> Option<Arc<AgentRuntime>> {
         let inner = self.inner.lock().await;
-        inner.subagents.get(agent_id).cloned()
+        inner.agents.subagents.get(agent_id).cloned()
     }
 
     pub(crate) async fn list_thread_states(&self) -> Vec<SubAgentThreadState> {
         let inner = self.inner.lock().await;
-        let mut states = inner.thread_states.values().cloned().collect::<Vec<_>>();
+        let mut states = inner
+            .threads
+            .thread_states
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         states.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         states
     }
 
     pub(crate) async fn get_thread_state(&self, thread_id: &str) -> Option<SubAgentThreadState> {
         let inner = self.inner.lock().await;
-        inner.thread_states.get(thread_id).cloned()
+        inner.threads.thread_states.get(thread_id).cloned()
     }
 
     pub(crate) async fn upsert_thread_state(&self, state: SubAgentThreadState) {
         let mut inner = self.inner.lock().await;
-        inner.thread_states.insert(state.thread_id.clone(), state);
+        inner
+            .threads
+            .thread_states
+            .insert(state.thread_id.clone(), state);
     }
 
     pub(crate) async fn pull_outputs(&self, limit: usize) -> (Vec<OrchestratorOutputItem>, usize) {
         let mut inner = self.inner.lock().await;
-        let take = limit.max(1).min(inner.pending_output_queue.len());
+        let take = limit.max(1).min(inner.runs.pending_output_queue.len());
         let mut outputs = Vec::with_capacity(take);
         for _ in 0..take {
-            if let Some(item) = inner.pending_output_queue.pop_front() {
+            if let Some(item) = inner.runs.pending_output_queue.pop_front() {
                 outputs.push(item);
             }
         }
-        let remaining = inner.pending_output_queue.len();
+        let remaining = inner.runs.pending_output_queue.len();
         (outputs, remaining)
     }
 
     pub(crate) async fn push_output(&self, item: OrchestratorOutputItem) {
         let mut inner = self.inner.lock().await;
-        if inner.pending_output_queue.len() >= OUTPUT_QUEUE_MAX_ITEMS {
-            inner.pending_output_queue.pop_front();
-        }
-        inner.pending_output_queue.push_back(item);
+        inner.runs.push_output(item);
     }
 
     pub(crate) async fn record_subagent_turn_result(
@@ -229,11 +219,14 @@ impl System0ToolBroker {
         persisted_message_count: usize,
     ) {
         let mut inner = self.inner.lock().await;
-        inner.runs_index.insert(run.run_id.clone(), run.clone());
-        if !inner.runs_order.iter().any(|id| id == &run.run_id) {
-            inner.runs_order.push(run.run_id.clone());
+        inner
+            .runs
+            .runs_index
+            .insert(run.run_id.clone(), run.clone());
+        if !inner.runs.runs_order.iter().any(|id| id == &run.run_id) {
+            inner.runs.runs_order.push(run.run_id.clone());
         }
-        if let Some(state) = inner.thread_states.get_mut(thread_id) {
+        if let Some(state) = inner.threads.thread_states.get_mut(thread_id) {
             state.latest_run_id = Some(run.run_id.clone());
             state.state = run.state.clone();
             state.summary = run.summary.clone();
@@ -544,7 +537,7 @@ impl System0ToolBroker {
         allowed_tools: &[String],
     ) -> Vec<ToolSpec> {
         let allowed_from_context: HashSet<String> = if allowed_tools.is_empty() {
-            inner.allowlisted_tools.clone()
+            inner.improvement.allowlisted_tools.clone()
         } else {
             allowed_tools.iter().cloned().collect()
         };
@@ -552,62 +545,11 @@ impl System0ToolBroker {
         Self::build_tool_specs()
             .into_iter()
             .filter(|spec| {
-                inner.allowlisted_tools.contains(&spec.id)
+                inner.improvement.allowlisted_tools.contains(&spec.id)
                     && allowed_from_context.contains(&spec.id)
-                    && (inner.self_improvement.enabled || !is_self_improvement_tool(&spec.id))
+                    && (inner.improvement.config.enabled || !is_self_improvement_tool(&spec.id))
             })
             .collect()
-    }
-
-    pub(crate) fn record_invocation(
-        inner: &mut System0BrokerInner,
-        turn_id: uuid::Uuid,
-        call: &ToolCall,
-        output: &ToolOutput,
-    ) {
-        let (status, rendered_output) = match output {
-            ToolOutput::Success(value) => ("success".to_string(), value.clone()),
-            ToolOutput::Error(err) => ("error".to_string(), serde_json::json!({ "error": err })),
-        };
-
-        inner
-            .tool_invocations_by_turn
-            .entry(turn_id)
-            .or_default()
-            .push(OrchestratorToolInvocation {
-                call_id: call.id.clone(),
-                tool_id: call.tool_id.clone(),
-                arguments: call.arguments.clone(),
-                status,
-                output: rendered_output,
-            });
-    }
-
-    pub(crate) fn record_invocation_err(
-        inner: &mut System0BrokerInner,
-        turn_id: uuid::Uuid,
-        call: &ToolCall,
-        err: &NeuromancerError,
-    ) {
-        Self::record_invocation(inner, turn_id, call, &ToolOutput::Error(err.to_string()));
-    }
-
-    pub(crate) fn record_mutation_audit(
-        inner: &mut System0BrokerInner,
-        action: &str,
-        outcome: &str,
-        trigger_type: TriggerType,
-        proposal: Option<&ChangeProposal>,
-        details: serde_json::Value,
-    ) {
-        inner.mutation_audit_log.push(mutation_audit_record(
-            action,
-            outcome,
-            trigger_type,
-            proposal.as_ref().map(|p| p.proposal_id.as_str()),
-            proposal.as_ref().map(|p| p.proposal_hash.as_str()),
-            details,
-        ));
     }
 
     pub(crate) fn create_proposal(
@@ -618,15 +560,20 @@ impl System0ToolBroker {
     ) -> ChangeProposal {
         let mut proposal = new_proposal(kind.clone(), target_id, payload);
 
-        let subagent_ids = inner.subagents.keys().cloned().collect::<HashSet<_>>();
-        let managed_agent_ids = inner.managed_agents.keys().cloned().collect::<HashSet<_>>();
+        let subagent_ids = inner.agents.subagents.keys().cloned().collect::<HashSet<_>>();
+        let managed_agent_ids = inner
+            .improvement
+            .managed_agents
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let verification = verify_proposal(
             &kind,
             proposal.target_id.as_deref(),
             &proposal.payload,
-            &inner.known_skill_ids,
-            &inner.managed_skills,
-            &inner.config_snapshot,
+            &inner.improvement.known_skill_ids,
+            &inner.improvement.managed_skills,
+            &inner.improvement.config_snapshot,
             &subagent_ids,
             &managed_agent_ids,
         );
@@ -644,7 +591,7 @@ impl System0ToolBroker {
             transition(&mut proposal, ProposalState::AuditBlocked);
         }
 
-        if let Err(err) = inner.execution_guard.pre_verify_proposal(&proposal) {
+        if let Err(err) = inner.agents.execution_guard.pre_verify_proposal(&proposal) {
             proposal.verification_report.passed = false;
             proposal.verification_report.blocked_by_guard = true;
             proposal.verification_report.issues.push(err.to_string());
@@ -668,6 +615,7 @@ impl System0ToolBroker {
         ) && let Some(skill_id) = proposal.target_id.as_deref()
         {
             let stat = inner
+                .improvement
                 .skill_quality_stats
                 .entry(skill_id.to_string())
                 .or_default();
