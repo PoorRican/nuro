@@ -13,30 +13,27 @@ use crate::orchestrator::proposals::model::{
 use crate::orchestrator::security::audit::AuditRiskLevel;
 use crate::orchestrator::security::trigger_gate::ensure_admin_trigger;
 use crate::orchestrator::state::System0ToolBroker;
+use crate::orchestrator::tool_id::AuthenticatedAdaptiveToolId;
 
 impl System0ToolBroker {
     pub(crate) async fn handle_authenticated_adaptive_action(
         &self,
+        id: AuthenticatedAdaptiveToolId,
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
         let mut inner = self.inner.lock().await;
         let turn_id = inner.turn.current_turn_id;
         let trigger_type = inner.turn.current_trigger_type;
 
-        match call.tool_id.as_str() {
-            "authorize_proposal" => {
+        match id {
+            AuthenticatedAdaptiveToolId::AuthorizeProposal => {
                 handle_authorize_proposal(&mut inner, call, turn_id, trigger_type)
             }
-            "apply_authorized_proposal" => {
+            AuthenticatedAdaptiveToolId::ApplyAuthorizedProposal => {
                 handle_apply_authorized_proposal(&mut inner, call, turn_id, trigger_type)
             }
-            "modify_skill" => {
+            AuthenticatedAdaptiveToolId::ModifySkill => {
                 handle_modify_skill(&mut inner, call, turn_id, trigger_type)
-            }
-            _ => {
-                let err = Self::not_found_err(&call.tool_id);
-                inner.runs.record_invocation_err(turn_id, &call, &err);
-                Err(err)
             }
         }
     }

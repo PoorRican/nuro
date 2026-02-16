@@ -1,3 +1,5 @@
+//! Broker state: tool specs, sub-agent refs, runs, threads, proposals, self-improvement config.
+
 pub(crate) mod agent_registry;
 pub(crate) mod proposal_store;
 pub(crate) mod run_tracker;
@@ -19,7 +21,7 @@ use neuromancer_core::tool::{ToolSource, ToolSpec};
 use neuromancer_core::trigger::TriggerType;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::orchestrator::actions::dispatch::is_self_improvement_tool;
+use crate::orchestrator::tool_id::System0ToolId;
 use crate::orchestrator::proposals::lifecycle::{new_proposal, transition};
 use crate::orchestrator::proposals::model::{
     ChangeProposal, ChangeProposalKind, ProposalState,
@@ -547,7 +549,9 @@ impl System0ToolBroker {
             .filter(|spec| {
                 inner.improvement.allowlisted_tools.contains(&spec.id)
                     && allowed_from_context.contains(&spec.id)
-                    && (inner.improvement.config.enabled || !is_self_improvement_tool(&spec.id))
+                    && (inner.improvement.config.enabled
+                        || !System0ToolId::try_from(spec.id.as_str())
+                            .is_ok_and(|id| id.is_self_improvement()))
             })
             .collect()
     }

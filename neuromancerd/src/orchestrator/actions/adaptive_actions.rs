@@ -9,18 +9,19 @@ use crate::orchestrator::adaptation::redteam::run_redteam_eval;
 use crate::orchestrator::proposals::model::ChangeProposalKind;
 use crate::orchestrator::proposals::verification::known_skills;
 use crate::orchestrator::state::System0ToolBroker;
+use crate::orchestrator::tool_id::AdaptiveToolId;
 
 impl System0ToolBroker {
     pub(crate) async fn handle_adaptive_action(
         &self,
+        id: AdaptiveToolId,
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
         let mut inner = self.inner.lock().await;
         let turn_id = inner.turn.current_turn_id;
 
-        // TODO: can we use an enum?
-        match call.tool_id.as_str() {
-            "list_proposals" => {
+        match id {
+            AdaptiveToolId::ListProposals => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -49,7 +50,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "get_proposal" => {
+            AdaptiveToolId::GetProposal => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -82,11 +83,11 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "propose_config_change"
-            | "propose_skill_add"
-            | "propose_skill_update"
-            | "propose_agent_add"
-            | "propose_agent_update" => {
+            AdaptiveToolId::ProposeConfigChange
+            | AdaptiveToolId::ProposeSkillAdd
+            | AdaptiveToolId::ProposeSkillUpdate
+            | AdaptiveToolId::ProposeAgentAdd
+            | AdaptiveToolId::ProposeAgentUpdate => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -94,9 +95,8 @@ impl System0ToolBroker {
                     return Ok(result);
                 }
 
-                // TODO: break out sub-functions?
-                let (kind, target_id, payload) = match call.tool_id.as_str() {
-                    "propose_config_change" => (
+                let (kind, target_id, payload) = match id {
+                    AdaptiveToolId::ProposeConfigChange => (
                         ChangeProposalKind::ConfigChange,
                         None,
                         serde_json::json!({
@@ -105,7 +105,7 @@ impl System0ToolBroker {
                             "required_safeguards": call.arguments.get("required_safeguards").cloned().unwrap_or(serde_json::json!([])),
                         }),
                     ),
-                    "propose_skill_add" => (
+                    AdaptiveToolId::ProposeSkillAdd => (
                         ChangeProposalKind::SkillAdd,
                         call.arguments
                             .get("skill_id")
@@ -117,7 +117,7 @@ impl System0ToolBroker {
                             "required_safeguards": call.arguments.get("required_safeguards").cloned().unwrap_or(serde_json::json!([])),
                         }),
                     ),
-                    "propose_skill_update" => (
+                    AdaptiveToolId::ProposeSkillUpdate => (
                         ChangeProposalKind::SkillUpdate,
                         call.arguments
                             .get("skill_id")
@@ -129,7 +129,7 @@ impl System0ToolBroker {
                             "required_safeguards": call.arguments.get("required_safeguards").cloned().unwrap_or(serde_json::json!([])),
                         }),
                     ),
-                    "propose_agent_add" => (
+                    AdaptiveToolId::ProposeAgentAdd => (
                         ChangeProposalKind::AgentAdd,
                         call.arguments
                             .get("agent_id")
@@ -141,7 +141,7 @@ impl System0ToolBroker {
                             "required_safeguards": call.arguments.get("required_safeguards").cloned().unwrap_or(serde_json::json!([])),
                         }),
                     ),
-                    "propose_agent_update" => (
+                    AdaptiveToolId::ProposeAgentUpdate => (
                         ChangeProposalKind::AgentUpdate,
                         call.arguments
                             .get("agent_id")
@@ -153,7 +153,7 @@ impl System0ToolBroker {
                             "required_safeguards": call.arguments.get("required_safeguards").cloned().unwrap_or(serde_json::json!([])),
                         }),
                     ),
-                    _ => unreachable!(),
+                    _ => unreachable!("non-proposal variants handled above"),
                 };
 
                 if target_id
@@ -187,7 +187,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "analyze_failures" => {
+            AdaptiveToolId::AnalyzeFailures => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -201,7 +201,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "score_skills" => {
+            AdaptiveToolId::ScoreSkills => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -221,7 +221,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "adapt_routing" => {
+            AdaptiveToolId::AdaptRouting => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -236,7 +236,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "record_lesson" => {
+            AdaptiveToolId::RecordLesson => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -266,7 +266,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "run_redteam_eval" => {
+            AdaptiveToolId::RunRedteamEval => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -279,7 +279,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "list_audit_records" => {
+            AdaptiveToolId::ListAuditRecords => {
                 if !inner.improvement.config.enabled {
                     let result = self_improvement_disabled_result(&call);
                     inner.runs.record_invocation(turn_id, &call, &result.output);
@@ -293,11 +293,6 @@ impl System0ToolBroker {
                 };
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
-            }
-            _ => {
-                let err = Self::not_found_err(&call.tool_id);
-                inner.runs.record_invocation_err(turn_id, &call, &err);
-                Err(err)
             }
         }
     }

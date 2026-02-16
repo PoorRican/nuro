@@ -11,6 +11,7 @@ use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
 use crate::orchestrator::state::{SubAgentThreadState, System0ToolBroker};
+use crate::orchestrator::tool_id::RuntimeToolId;
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message,
 };
@@ -21,13 +22,14 @@ use crate::orchestrator::tracing::thread_journal::{
 impl System0ToolBroker {
     pub(crate) async fn handle_runtime_action(
         &self,
+        id: RuntimeToolId,
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
         let mut inner = self.inner.lock().await;
         let turn_id = inner.turn.current_turn_id;
 
-        match call.tool_id.as_str() {
-            "list_agents" => {
+        match id {
+            RuntimeToolId::ListAgents => {
                 let result = ToolResult {
                     call_id: call.id.clone(),
                     output: ToolOutput::Success(serde_json::json!({
@@ -37,7 +39,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "read_config" => {
+            RuntimeToolId::ReadConfig => {
                 let result = ToolResult {
                     call_id: call.id.clone(),
                     output: ToolOutput::Success(inner.improvement.config_snapshot.clone()),
@@ -45,7 +47,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "queue_status" => {
+            RuntimeToolId::QueueStatus => {
                 let mut queued = 0usize;
                 let mut running = 0usize;
                 let mut completed = 0usize;
@@ -91,7 +93,7 @@ impl System0ToolBroker {
                 inner.runs.record_invocation(turn_id, &call, &result.output);
                 Ok(result)
             }
-            "delegate_to_agent" => {
+            RuntimeToolId::DelegateToAgent => {
                 let resolved_arguments =
                     expand_user_query_tokens(&call.arguments, &inner.turn.current_turn_user_query);
 
@@ -235,11 +237,6 @@ impl System0ToolBroker {
                 });
 
                 Ok(tool_result)
-            }
-            _ => {
-                let err = Self::not_found_err(&call.tool_id);
-                inner.runs.record_invocation_err(turn_id, &call, &err);
-                Err(err)
             }
         }
     }
