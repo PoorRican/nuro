@@ -37,6 +37,9 @@ pub fn build_llm_client(
         return Ok(Arc::new(EchoLlmClient));
     };
 
+    // TODO: this should NOT be part of production code
+    //  When running a test, the [`build_llm_client`] should simply be overwritten
+    //  using build flags / config flags
     match slot.provider.as_str() {
         "mock" => Ok(Arc::new(TwoStepMockLlmClient::default())),
         provider => {
