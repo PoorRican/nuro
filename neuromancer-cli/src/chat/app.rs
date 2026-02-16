@@ -1540,7 +1540,7 @@ fn build_thread_lines(
         let item_lines = item.lines(
             selected_item,
             &assistant_label,
-            selected_item.then_some(selected_fill_width),
+            Some(selected_fill_width),
             timeline_focused,
         );
         lines.extend(item_lines);
