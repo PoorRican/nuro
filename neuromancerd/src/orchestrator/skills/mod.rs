@@ -1,8 +1,2 @@
-// TODO: shouldn't this functionality be in `neuromancer-skills`?
-pub mod aliases;
-pub mod broker;
-pub mod csv;
-pub mod path_policy;
-pub mod script_runner;
-
-pub(crate) use broker::SkillToolBroker;
+//! Skill tool broker re-export. Core logic lives in `neuromancer-skills`.
+pub(crate) use neuromancer_skills::SkillToolBroker;

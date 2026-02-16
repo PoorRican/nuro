@@ -5,24 +5,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use neuromancer_core::error::{NeuromancerError, ToolError};
+use neuromancer_core::security::ExecutionGuard;
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
 };
-use neuromancer_skills::{Skill, SkillRegistry};
 
-use crate::orchestrator::error::System0Error;
-use crate::orchestrator::security::execution_guard::ExecutionGuard;
-use crate::orchestrator::skills::aliases::build_skill_tool_aliases;
-use crate::orchestrator::skills::csv::parse_csv_content;
-use crate::orchestrator::skills::path_policy::{
-    resolve_local_data_path, resolve_skill_script_path,
-};
-use crate::orchestrator::skills::script_runner::run_skill_script;
+use crate::aliases::build_skill_tool_aliases;
+use crate::csv::parse_csv_content;
+use crate::path_policy::{resolve_local_data_path, resolve_skill_script_path};
+use crate::script_runner::run_skill_script;
+use crate::{Skill, SkillError, SkillRegistry};
 
 const DEFAULT_SKILL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
-pub(crate) struct SkillToolBroker {
+pub struct SkillToolBroker {
     tools: HashMap<String, SkillTool>,
     tool_aliases: HashMap<String, String>,
     aliases_by_tool: HashMap<String, Vec<String>>,
@@ -42,17 +39,17 @@ struct SkillTool {
 }
 
 impl SkillToolBroker {
-    pub(crate) fn new(
+    pub fn new(
         agent_id: &str,
         allowed_skills: &[String],
         skill_registry: &SkillRegistry,
         local_root: PathBuf,
         execution_guard: Arc<dyn ExecutionGuard>,
-    ) -> Result<Self, System0Error> {
+    ) -> Result<Self, SkillError> {
         let mut tools = HashMap::new();
         for skill_name in allowed_skills {
             let skill = skill_registry.get(skill_name).ok_or_else(|| {
-                System0Error::Config(format!(
+                SkillError::Config(format!(
                     "agent '{}' references missing skill '{}'",
                     agent_id, skill_name
                 ))

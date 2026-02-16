@@ -1,10 +1,13 @@
 pub mod aliases;
+pub mod broker;
 pub mod csv;
 mod linter;
 mod metadata;
 pub mod path_policy;
 mod registry;
+pub mod script_runner;
 
+pub use broker::SkillToolBroker;
 pub use linter::{LintResult, LintSeverity, LintWarning, SkillLinter};
 pub use metadata::SkillMetadata;
 pub use registry::SkillRegistry;
@@ -66,4 +69,16 @@ pub enum SkillError {
         actual: usize,
         path: String,
     },
+
+    #[error("script_execution: {0}")]
+    ScriptExecution(String),
+
+    #[error("script_timeout: {0}")]
+    ScriptTimeout(String),
+
+    #[error("script_invalid_json: {0}")]
+    ScriptInvalidOutput(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
 }
