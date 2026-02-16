@@ -294,6 +294,7 @@ fn build_system0_thread() -> ThreadView {
         resurrected: false,
         read_only: false,
         items,
+        render_revision: 0,
     }
 }
 
@@ -351,6 +352,7 @@ fn build_planner_thread() -> ThreadView {
         resurrected: false,
         read_only: false,
         items,
+        render_revision: 0,
     }
 }
 
@@ -389,6 +391,7 @@ fn build_researcher_thread() -> ThreadView {
         resurrected: false,
         read_only: true,
         items,
+        render_revision: 0,
     }
 }
 

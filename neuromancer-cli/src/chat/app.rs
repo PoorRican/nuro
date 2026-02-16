@@ -102,6 +102,7 @@ pub(super) struct ThreadView {
     pub(super) resurrected: bool,
     pub(super) read_only: bool,
     pub(super) items: Vec<TimelineItem>,
+    pub(super) render_revision: u64,
 }
 
 impl ThreadView {
@@ -116,6 +117,7 @@ impl ThreadView {
             resurrected: false,
             read_only: false,
             items: vec![],
+            render_revision: 0,
         }
     }
 
@@ -148,6 +150,7 @@ impl ThreadView {
             resurrected: summary.resurrected,
             read_only,
             items: vec![],
+            render_revision: 0,
         }
     }
 
@@ -180,6 +183,24 @@ impl ThreadView {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadRenderCacheKey {
+    thread_id: String,
+    revision: u64,
+    selected: usize,
+    selected_fill_width: usize,
+    filter: MainFilter,
+    timeline_focused: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadRenderCache {
+    key: ThreadRenderCacheKey,
+    lines: Vec<Line<'static>>,
+    ranges: Vec<(usize, usize)>,
+    selected_visible_idx: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ChatApp {
     threads: Vec<ThreadView>,
@@ -200,6 +221,7 @@ pub(super) struct ChatApp {
     esc_armed_at: Option<Instant>,
     pending_thread_id: Option<String>,
     pending_placeholder_index_by_thread: HashMap<String, usize>,
+    thread_render_cache: Option<ThreadRenderCache>,
 }
 
 impl ChatApp {
@@ -223,6 +245,7 @@ impl ChatApp {
             esc_armed_at: None,
             pending_thread_id: None,
             pending_placeholder_index_by_thread: HashMap::new(),
+            thread_render_cache: None,
         }
     }
 
@@ -392,6 +415,7 @@ impl ChatApp {
                     MessageRoleTag::System,
                     "Saved sub-agent thread. Press Enter to resurrect and continue.",
                 ));
+                thread.render_revision = thread.render_revision.wrapping_add(1);
             }
             threads.push(thread);
         }
@@ -456,6 +480,7 @@ impl ChatApp {
             .find(|thread| thread.id == thread_id)
         {
             thread.items = items;
+            thread.render_revision = thread.render_revision.wrapping_add(1);
             let selected = self
                 .selected_item_by_thread
                 .get(thread_id)
@@ -493,6 +518,7 @@ impl ChatApp {
                     MessageRoleTag::System,
                     format!("SYSTEM ERROR: {message}"),
                 ));
+                thread.render_revision = thread.render_revision.wrapping_add(1);
                 let selected = thread.items.len().saturating_sub(1);
                 self.selected_item_by_thread
                     .insert(thread_id.clone(), selected);
@@ -648,46 +674,86 @@ impl ChatApp {
             return;
         }
 
-        let thread = self.current_thread().clone();
+        let (thread_id, thread_revision, item_count) = {
+            let thread = self.current_thread();
+            (
+                thread.id.clone(),
+                thread.render_revision,
+                thread.items.len(),
+            )
+        };
         let selected = self
             .current_thread_selected_item()
-            .min(thread.items.len().saturating_sub(1));
+            .min(item_count.saturating_sub(1));
         let horizontal_offset = self
             .horizontal_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0);
         let visible_width = area.width as usize;
         let selected_fill_width = horizontal_offset.saturating_add(visible_width.max(1));
         let timeline_focused =
             self.mode == InteractionMode::Navigate || self.focus == FocusPane::Main;
-        let (lines, ranges, selected_visible_idx) = build_thread_lines(
-            &thread,
+
+        let cache_key = ThreadRenderCacheKey {
+            thread_id: thread_id.clone(),
+            revision: thread_revision,
             selected,
             selected_fill_width,
-            self.main_filter,
+            filter: self.main_filter,
             timeline_focused,
-        );
+        };
+        let cache_miss = self
+            .thread_render_cache
+            .as_ref()
+            .map_or(true, |cache| cache.key != cache_key);
+        if cache_miss {
+            let (lines, ranges, selected_visible_idx) = {
+                let thread = self.current_thread();
+                build_thread_lines(
+                    thread,
+                    selected,
+                    selected_fill_width,
+                    self.main_filter,
+                    timeline_focused,
+                )
+            };
+            self.thread_render_cache = Some(ThreadRenderCache {
+                key: cache_key,
+                lines,
+                ranges,
+                selected_visible_idx,
+            });
+        }
+
+        let selected_range = self
+            .thread_render_cache
+            .as_ref()
+            .and_then(|cache| cache.ranges.get(cache.selected_visible_idx).copied());
         let viewport_rows = area.height as usize;
         self.last_main_viewport_rows = viewport_rows.max(1);
 
-        self.ensure_selected_visible_for(
-            &thread.id,
-            &ranges,
-            viewport_rows.max(1),
-            selected_visible_idx,
-        );
+        self.ensure_selected_visible_for(&thread_id, selected_range, viewport_rows.max(1));
 
-        let max_vertical = lines.len().saturating_sub(viewport_rows.max(1));
+        let max_vertical = self
+            .thread_render_cache
+            .as_ref()
+            .map(|cache| cache.lines.len().saturating_sub(viewport_rows.max(1)))
+            .unwrap_or(0);
         let mut vertical_offset = self
             .vertical_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0)
             .min(max_vertical);
         self.vertical_scroll_by_thread
-            .insert(thread.id.clone(), vertical_offset);
+            .insert(thread_id.clone(), vertical_offset);
 
+        let lines = self
+            .thread_render_cache
+            .as_ref()
+            .map(|cache| cache.lines.clone())
+            .unwrap_or_default();
         let paragraph = Paragraph::new(Text::from(lines))
             .scroll((vertical_offset as u16, horizontal_offset as u16));
 
@@ -695,12 +761,12 @@ impl ChatApp {
 
         vertical_offset = self
             .vertical_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0)
             .min(max_vertical);
         self.vertical_scroll_by_thread
-            .insert(thread.id, vertical_offset);
+            .insert(thread_id, vertical_offset);
     }
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1176,6 +1242,7 @@ impl ChatApp {
             thread
                 .items
                 .push(TimelineItem::text(MessageRoleTag::Assistant, "Thinking..."));
+            thread.render_revision = thread.render_revision.wrapping_add(1);
             let placeholder_idx = thread.items.len().saturating_sub(1);
             self.pending_placeholder_index_by_thread
                 .insert(thread.id.clone(), placeholder_idx);
@@ -1202,7 +1269,6 @@ impl ChatApp {
         let current_pos = selected_visible_position(&visible, selected);
         let new_pos = current_pos.saturating_sub(1);
         self.set_current_thread_selected_item(visible[new_pos]);
-        self.ensure_selected_visible_current();
     }
 
     fn select_main_next(&mut self) {
@@ -1214,23 +1280,22 @@ impl ChatApp {
         let current_pos = selected_visible_position(&visible, selected);
         let new_pos = (current_pos + 1).min(visible.len().saturating_sub(1));
         self.set_current_thread_selected_item(visible[new_pos]);
-        self.ensure_selected_visible_current();
     }
 
     fn toggle_selected_item(&mut self) {
         self.align_selection_to_filter_current();
         let selected = self.current_thread_selected_item();
         let thread_id = self.current_thread().id.clone();
-        if let Some(item) = self
+        if let Some(thread) = self
             .threads
             .iter_mut()
             .find(|thread| thread.id == thread_id)
-            .and_then(|thread| thread.items.get_mut(selected))
+            && let Some(item) = thread.items.get_mut(selected)
             && item.is_toggleable()
         {
             item.toggle();
+            thread.render_revision = thread.render_revision.wrapping_add(1);
         }
-        self.ensure_selected_visible_current();
     }
 
     fn open_selected_sidebar_thread(&mut self) -> AppAction {
@@ -1239,17 +1304,20 @@ impl ChatApp {
             .min(self.threads.len().saturating_sub(1));
         self.focus = FocusPane::Main;
 
-        let thread = self.current_thread().clone();
-        if thread.id == SYSTEM_THREAD_ID {
+        let (thread_id, read_only) = {
+            let thread = self.current_thread();
+            (thread.id.clone(), thread.read_only)
+        };
+        if thread_id == SYSTEM_THREAD_ID {
             return AppAction::OpenThread {
-                thread_id: thread.id,
+                thread_id,
                 resurrect: false,
             };
         }
 
         AppAction::OpenThread {
-            thread_id: thread.id,
-            resurrect: thread.read_only,
+            thread_id,
+            resurrect: read_only,
         }
     }
 
@@ -1329,7 +1397,6 @@ impl ChatApp {
     fn set_main_filter(&mut self, filter: MainFilter) {
         self.main_filter = filter;
         self.align_selection_to_filter_current();
-        self.ensure_selected_visible_current();
         self.status = Some(format!("Main filter: {}", self.main_filter.label()));
     }
 
@@ -1367,36 +1434,17 @@ impl ChatApp {
         self.set_current_thread_selected_item(fallback);
     }
 
-    fn ensure_selected_visible_current(&mut self) {
-        let thread = self.current_thread().clone();
-        let selected = self
-            .current_thread_selected_item()
-            .min(thread.items.len().saturating_sub(1));
-        let (_, ranges, selected_visible_idx) =
-            build_thread_lines(&thread, selected, 1, self.main_filter, false);
-        self.ensure_selected_visible_for(
-            &thread.id,
-            &ranges,
-            self.last_main_viewport_rows.max(1),
-            selected_visible_idx,
-        );
-    }
-
     fn ensure_selected_visible_for(
         &mut self,
         thread_id: &str,
-        ranges: &[(usize, usize)],
+        selected_range: Option<(usize, usize)>,
         viewport_rows: usize,
-        selected_idx: usize,
     ) {
-        if ranges.is_empty() {
+        let Some((start, end)) = selected_range else {
             self.vertical_scroll_by_thread
                 .insert(thread_id.to_string(), 0);
             return;
-        }
-
-        let selected = selected_idx.min(ranges.len().saturating_sub(1));
-        let (start, end) = ranges[selected];
+        };
 
         let mut offset = self
             .vertical_scroll_by_thread
@@ -1432,6 +1480,10 @@ impl ChatApp {
             "thread_id": SYSTEM_THREAD_ID,
             "messages": messages,
         })
+    }
+
+    pub(super) fn animation_active(&self) -> bool {
+        false
     }
 }
 
@@ -1484,10 +1536,11 @@ fn build_thread_lines(
     for (visible_pos, idx) in visible_indices.iter().enumerate() {
         let item = &thread.items[*idx];
         let start = lines.len();
+        let selected_item = visible_pos == selected_visible_idx;
         let item_lines = item.lines(
-            visible_pos == selected_visible_idx,
+            selected_item,
             &assistant_label,
-            Some(selected_fill_width),
+            selected_item.then_some(selected_fill_width),
             timeline_focused,
         );
         lines.extend(item_lines);
