@@ -1,3 +1,5 @@
+//! Thread event journaling, conversation reconstruction, query filtering.
+
 pub mod conversation_projection;
 pub mod event_query;
 pub mod jsonl_io;
