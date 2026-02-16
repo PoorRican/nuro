@@ -16,12 +16,12 @@ use neuromancer_core::rpc::{
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
-    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
-    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
-    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
-    OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
-    OrchestratorTurnResult,
+    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorRunDiagnoseParams,
+    OrchestratorRunDiagnoseResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
+    OrchestratorRunsListResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnParams,
+    OrchestratorSubagentTurnResult, OrchestratorThreadGetParams, OrchestratorThreadGetResult,
+    OrchestratorThreadResurrectParams, OrchestratorThreadResurrectResult,
+    OrchestratorThreadsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
 };
 
 #[derive(Clone)]
@@ -89,6 +89,22 @@ async fn op_orchestrator_runs_list(
         .await
         .map_err(map_orchestrator_runtime_error)?;
     Ok(OrchestratorRunsListResult { runs })
+}
+
+async fn op_orchestrator_outputs_pull(
+    state: &AppState,
+    params: OrchestratorOutputsPullParams,
+) -> Result<OrchestratorOutputsPullResult, RpcMethodError> {
+    let Some(runtime) = &state.orchestrator_runtime else {
+        return Err(RpcMethodError::internal(
+            "orchestrator runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .orchestrator_outputs_pull(params.limit)
+        .await
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_run_get(
@@ -379,6 +395,15 @@ async fn dispatch_rpc(
                 }
             }
         }
+        "orchestrator.outputs.pull" => {
+            match parse_params::<OrchestratorOutputsPullParams>(params) {
+                Ok(req) => match op_orchestrator_outputs_pull(state, req).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            }
+        }
         "orchestrator.runs.get" => match parse_params::<OrchestratorRunGetParams>(params) {
             Ok(req) => match op_orchestrator_run_get(state, req).await {
                 Ok(result) => to_value(&result),
@@ -588,6 +613,23 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 13,
                 "method": "orchestrator.runs.list"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn rpc_orchestrator_outputs_pull_requires_runtime() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1337,
+                "method": "orchestrator.outputs.pull",
+                "params": {"limit": 5}
             }),
         )
         .await;

@@ -178,6 +178,10 @@ pub enum OrchestratorCommand {
         #[command(subcommand)]
         command: OrchestratorThreadsCommand,
     },
+    Outputs {
+        #[command(subcommand)]
+        command: OrchestratorOutputsCommand,
+    },
     Subagent {
         #[command(subcommand)]
         command: OrchestratorSubagentCommand,
@@ -211,6 +215,11 @@ pub enum OrchestratorThreadsCommand {
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorSubagentCommand {
     Turn(OrchestratorSubagentTurnArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorOutputsCommand {
+    Pull(OrchestratorOutputsPullArgs),
 }
 
 #[derive(Debug, Args)]
@@ -287,6 +296,12 @@ pub struct OrchestratorSubagentTurnArgs {
     pub thread_id: String,
 
     pub message: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorOutputsPullArgs {
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -581,6 +596,30 @@ mod tests {
                 OrchestratorSubagentCommand::Turn(args) => {
                     assert_eq!(args.thread_id, "thread-123");
                     assert_eq!(args.message, "continue from here");
+                }
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_outputs_pull_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "outputs",
+            "pull",
+            "--limit",
+            "25",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Outputs { command },
+            } => match command {
+                OrchestratorOutputsCommand::Pull(args) => {
+                    assert_eq!(args.limit, Some(25));
                 }
             },
             other => panic!("unexpected command parsed: {other:?}"),

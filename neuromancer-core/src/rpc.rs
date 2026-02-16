@@ -103,6 +103,14 @@ pub struct DelegatedRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatedTask {
+    pub run_id: String,
+    pub agent_id: String,
+    pub thread_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorToolInvocation {
     pub call_id: String,
     pub tool_id: String,
@@ -115,7 +123,7 @@ pub struct OrchestratorToolInvocation {
 pub struct OrchestratorTurnResult {
     pub turn_id: String,
     pub response: String,
-    pub delegated_runs: Vec<DelegatedRun>,
+    pub delegated_tasks: Vec<DelegatedTask>,
     pub tool_invocations: Vec<OrchestratorToolInvocation>,
 }
 
@@ -218,6 +226,31 @@ pub struct OrchestratorSubagentTurnResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorOutputsPullParams {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorOutputItem {
+    pub output_id: String,
+    pub run_id: String,
+    pub thread_id: String,
+    pub agent_id: String,
+    pub state: String,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub no_reply: bool,
+    pub content: Option<String>,
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorOutputsPullResult {
+    pub outputs: Vec<OrchestratorOutputItem>,
+    pub remaining: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorEventsQueryParams {
     pub thread_id: Option<String>,
     pub run_id: Option<String>,
@@ -316,14 +349,11 @@ mod tests {
         let result = OrchestratorTurnResult {
             turn_id: "turn-1".to_string(),
             response: "response".to_string(),
-            delegated_runs: vec![DelegatedRun {
+            delegated_tasks: vec![DelegatedTask {
                 run_id: "run-1".to_string(),
                 agent_id: "finance_manager".to_string(),
-                state: "completed".to_string(),
-                summary: Some("delegation summary".to_string()),
-                thread_id: Some("thread-1".to_string()),
-                initial_instruction: Some("collect balances".to_string()),
-                error: None,
+                thread_id: "thread-1".to_string(),
+                state: "queued".to_string(),
             }],
             tool_invocations: vec![OrchestratorToolInvocation {
                 call_id: "call-1".to_string(),
@@ -336,6 +366,30 @@ mod tests {
 
         let encoded = serde_json::to_string(&result).expect("result should serialize");
         let decoded: OrchestratorTurnResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn orchestrator_outputs_pull_result_roundtrip() {
+        let result = OrchestratorOutputsPullResult {
+            outputs: vec![OrchestratorOutputItem {
+                output_id: "out-1".to_string(),
+                run_id: "run-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                agent_id: "planner".to_string(),
+                state: "completed".to_string(),
+                summary: Some("finished".to_string()),
+                error: None,
+                no_reply: false,
+                content: Some("raw output text".to_string()),
+                published_at: "2026-02-16T00:00:00Z".to_string(),
+            }],
+            remaining: 0,
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: OrchestratorOutputsPullResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }

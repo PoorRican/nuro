@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -626,25 +627,70 @@ fn orchestrator_turn_routes_finance_queries_to_finance_manager_with_numeric_summ
     let json = parse_json_output(&output);
     assert_eq!(json["ok"], Value::Bool(true));
 
-    let delegated_runs = json["result"]["delegated_runs"]
+    let delegated_tasks = json["result"]["delegated_tasks"]
         .as_array()
-        .expect("delegated runs should exist");
-    let finance_run = delegated_runs.first().expect("finance run should exist");
+        .expect("delegated tasks should exist");
+    let finance_run = delegated_tasks.first().expect("finance task should exist");
     assert_eq!(
         finance_run["agent_id"].as_str(),
         Some("finance-manager"),
         "finance queries should be delegated to finance-manager"
     );
-    let run_summary = finance_run["summary"]
+    assert_eq!(finance_run["state"].as_str(), Some("queued"));
+    let run_id = finance_run["run_id"]
         .as_str()
-        .expect("delegated run summary should exist");
+        .expect("delegated run id should exist")
+        .to_string();
+
+    let mut completed_output = None;
+    for _ in 0..30 {
+        let pulled = neuroctl()
+            .arg("--json")
+            .arg("--addr")
+            .arg(&addr)
+            .arg("orchestrator")
+            .arg("outputs")
+            .arg("pull")
+            .arg("--limit")
+            .arg("10")
+            .env("XDG_CONFIG_HOME", &xdg_config_home)
+            .env("XDG_DATA_HOME", &xdg_data_home)
+            .env("HOME", &home_dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let pull_json = parse_json_output(&pulled);
+        let outputs = pull_json["result"]["outputs"]
+            .as_array()
+            .expect("outputs should be an array");
+        if let Some(found) = outputs
+            .iter()
+            .find(|item| item["run_id"].as_str() == Some(run_id.as_str()))
+        {
+            completed_output = Some(found.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let completed_output = completed_output.expect("expected completed output for delegated run");
+    let run_summary = completed_output["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let run_content = completed_output["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
-        run_summary.contains("1360.00"),
-        "bill total should appear in summary: {run_summary}"
+        run_summary.contains("1360.00") || run_content.contains("1360.00"),
+        "bill total should appear in output: summary={run_summary}, content={run_content}"
     );
     assert!(
-        run_summary.contains("4600.50"),
-        "account total should appear in summary: {run_summary}"
+        run_summary.contains("4600.50") || run_content.contains("4600.50"),
+        "account total should appear in output: summary={run_summary}, content={run_content}"
     );
 
     let tool_invocations = json["result"]["tool_invocations"]

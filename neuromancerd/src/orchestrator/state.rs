@@ -1,11 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::rpc::{DelegatedRun, OrchestratorToolInvocation};
+use neuromancer_core::rpc::{
+    DelegatedRun, DelegatedTask, OrchestratorOutputItem, OrchestratorToolInvocation,
+};
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolSource, ToolSpec};
 use neuromancer_core::trigger::TriggerType;
 use tokio::sync::Mutex as AsyncMutex;
@@ -24,6 +26,7 @@ use crate::orchestrator::tools::default_system0_tools;
 use crate::orchestrator::tracing::thread_journal::{ThreadJournal, now_rfc3339};
 
 pub(crate) const SYSTEM0_AGENT_ID: &str = "system0";
+const OUTPUT_QUEUE_MAX_ITEMS: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SubAgentThreadState {
@@ -56,13 +59,13 @@ pub(crate) struct System0BrokerInner {
     pub(crate) thread_journal: ThreadJournal,
     pub(crate) current_trigger_type: TriggerType,
     pub(crate) current_turn_id: uuid::Uuid,
-    pub(crate) runs_by_turn: HashMap<uuid::Uuid, Vec<DelegatedRun>>,
+    pub(crate) current_turn_user_query: String,
+    pub(crate) delegated_tasks_by_turn: HashMap<uuid::Uuid, Vec<DelegatedTask>>,
     pub(crate) tool_invocations_by_turn: HashMap<uuid::Uuid, Vec<OrchestratorToolInvocation>>,
     pub(crate) runs_index: HashMap<String, DelegatedRun>,
     pub(crate) runs_order: Vec<String>,
-    pub(crate) running_agents: HashMap<String, String>,
     pub(crate) thread_states: HashMap<String, SubAgentThreadState>,
-    pub(crate) thread_id_by_agent: HashMap<String, String>,
+    pub(crate) pending_output_queue: VecDeque<OrchestratorOutputItem>,
     pub(crate) proposals_index: HashMap<String, ChangeProposal>,
     pub(crate) proposals_order: Vec<String>,
     pub(crate) mutation_audit_log: Vec<MutationAuditRecord>,
@@ -103,13 +106,13 @@ impl System0ToolBroker {
                 thread_journal,
                 current_trigger_type: TriggerType::Admin,
                 current_turn_id: uuid::Uuid::nil(),
-                runs_by_turn: HashMap::new(),
+                current_turn_user_query: String::new(),
+                delegated_tasks_by_turn: HashMap::new(),
                 tool_invocations_by_turn: HashMap::new(),
                 runs_index: HashMap::new(),
                 runs_order: Vec::new(),
-                running_agents: HashMap::new(),
                 thread_states: HashMap::new(),
-                thread_id_by_agent: HashMap::new(),
+                pending_output_queue: VecDeque::new(),
                 proposals_index: HashMap::new(),
                 proposals_order: Vec::new(),
                 mutation_audit_log: Vec::new(),
@@ -123,17 +126,26 @@ impl System0ToolBroker {
         }
     }
 
-    pub(crate) async fn set_turn_context(&self, turn_id: uuid::Uuid, trigger_type: TriggerType) {
+    pub(crate) async fn set_turn_context(
+        &self,
+        turn_id: uuid::Uuid,
+        trigger_type: TriggerType,
+        user_query: String,
+    ) {
         let mut inner = self.inner.lock().await;
         inner.current_turn_id = turn_id;
         inner.current_trigger_type = trigger_type;
-        inner.runs_by_turn.remove(&turn_id);
+        inner.current_turn_user_query = user_query;
+        inner.delegated_tasks_by_turn.remove(&turn_id);
         inner.tool_invocations_by_turn.remove(&turn_id);
     }
 
-    pub(crate) async fn take_runs(&self, turn_id: uuid::Uuid) -> Vec<DelegatedRun> {
+    pub(crate) async fn take_delegated_tasks(&self, turn_id: uuid::Uuid) -> Vec<DelegatedTask> {
         let mut inner = self.inner.lock().await;
-        inner.runs_by_turn.remove(&turn_id).unwrap_or_default()
+        inner
+            .delegated_tasks_by_turn
+            .remove(&turn_id)
+            .unwrap_or_default()
     }
 
     pub(crate) async fn take_tool_invocations(
@@ -185,10 +197,28 @@ impl System0ToolBroker {
 
     pub(crate) async fn upsert_thread_state(&self, state: SubAgentThreadState) {
         let mut inner = self.inner.lock().await;
-        inner
-            .thread_id_by_agent
-            .insert(state.agent_id.clone(), state.thread_id.clone());
         inner.thread_states.insert(state.thread_id.clone(), state);
+    }
+
+    pub(crate) async fn pull_outputs(&self, limit: usize) -> (Vec<OrchestratorOutputItem>, usize) {
+        let mut inner = self.inner.lock().await;
+        let take = limit.max(1).min(inner.pending_output_queue.len());
+        let mut outputs = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(item) = inner.pending_output_queue.pop_front() {
+                outputs.push(item);
+            }
+        }
+        let remaining = inner.pending_output_queue.len();
+        (outputs, remaining)
+    }
+
+    pub(crate) async fn push_output(&self, item: OrchestratorOutputItem) {
+        let mut inner = self.inner.lock().await;
+        if inner.pending_output_queue.len() >= OUTPUT_QUEUE_MAX_ITEMS {
+            inner.pending_output_queue.pop_front();
+        }
+        inner.pending_output_queue.push_back(item);
     }
 
     pub(crate) async fn record_subagent_turn_result(
@@ -248,6 +278,17 @@ impl System0ToolBroker {
                 id: "read_config".to_string(),
                 name: "read_config".to_string(),
                 description: "Read orchestrator configuration snapshot.".to_string(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                source: ToolSource::Builtin,
+            },
+            ToolSpec {
+                id: "queue_status".to_string(),
+                name: "queue_status".to_string(),
+                description: "Get delegation queue/run status and pending output counts.".to_string(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},

@@ -9,9 +9,10 @@ use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorRunDiagnoseResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnResult,
-    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadMessage,
-    OrchestratorThreadResurrectResult, OrchestratorTurnResult, ThreadEvent, ThreadSummary,
+    OrchestratorOutputsPullResult, OrchestratorRunDiagnoseResult, OrchestratorStatsGetResult,
+    OrchestratorSubagentTurnResult, OrchestratorThreadGetParams, OrchestratorThreadGetResult,
+    OrchestratorThreadMessage, OrchestratorThreadResurrectResult, OrchestratorTurnResult,
+    ThreadEvent, ThreadSummary,
 };
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
@@ -80,7 +81,7 @@ impl RuntimeCore {
             "orchestrator_turn_started"
         );
         self.system0_broker
-            .set_turn_context(turn_id, trigger_type)
+            .set_turn_context(turn_id, trigger_type, message.clone())
             .await;
 
         let _ = self
@@ -154,7 +155,7 @@ impl RuntimeCore {
 
         let response =
             extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
-        let delegated_runs = self.system0_broker.take_runs(turn_id).await;
+        let delegated_tasks = self.system0_broker.take_delegated_tasks(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
 
         for invocation in &tool_invocations {
@@ -234,7 +235,7 @@ impl RuntimeCore {
             .await;
         tracing::info!(
             turn_id = %turn_id,
-            delegated_runs = delegated_runs.len(),
+            delegated_tasks = delegated_tasks.len(),
             tool_invocations = tool_invocations.len(),
             duration_ms = turn_started_at.elapsed().as_millis(),
             "orchestrator_turn_finished"
@@ -243,7 +244,7 @@ impl RuntimeCore {
         Ok(OrchestratorTurnResult {
             turn_id: turn_id.to_string(),
             response,
-            delegated_runs,
+            delegated_tasks,
             tool_invocations,
         })
     }
@@ -483,6 +484,15 @@ impl OrchestratorRuntime {
         &self,
     ) -> Result<Vec<DelegatedRun>, OrchestratorRuntimeError> {
         Ok(self.system0_broker.list_runs().await)
+    }
+
+    pub async fn orchestrator_outputs_pull(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<OrchestratorOutputsPullResult, OrchestratorRuntimeError> {
+        let limit = limit.unwrap_or(100).clamp(1, 1_000);
+        let (outputs, remaining) = self.system0_broker.pull_outputs(limit).await;
+        Ok(OrchestratorOutputsPullResult { outputs, remaining })
     }
 
     pub async fn orchestrator_run_get(

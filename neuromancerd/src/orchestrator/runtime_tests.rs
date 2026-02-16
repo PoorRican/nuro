@@ -90,7 +90,7 @@ fn error_output(result: ToolResult) -> String {
 async fn non_admin_apply_authorized_proposal_is_denied() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User, String::new())
         .await;
 
     let result = broker
@@ -112,7 +112,7 @@ async fn non_admin_apply_authorized_proposal_is_denied() {
 async fn non_admin_authorize_proposal_is_denied() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User, String::new())
         .await;
 
     let result = broker
@@ -134,7 +134,7 @@ async fn non_admin_authorize_proposal_is_denied() {
 async fn admin_can_authorize_and_apply_after_verify_and_audit() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
 
     let propose = broker
@@ -195,7 +195,7 @@ async fn admin_can_authorize_and_apply_after_verify_and_audit() {
 async fn dangerous_skill_proposal_is_blocked_by_lint_and_audit() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
 
     let propose = broker
@@ -230,7 +230,7 @@ async fn agent_update_with_unknown_skill_is_blocked() {
             .insert("planner".to_string(), serde_json::json!({}));
     }
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
 
     let propose = broker
@@ -272,7 +272,7 @@ async fn agent_update_with_unknown_skill_is_blocked() {
 async fn canary_regression_rolls_back_proposal() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
 
     let propose = broker
@@ -326,7 +326,7 @@ async fn canary_regression_rolls_back_proposal() {
 async fn mutation_audit_records_include_trigger_and_proposal_hash() {
     let broker = test_system0_broker();
     broker
-        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin)
+        .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
 
     let propose = broker

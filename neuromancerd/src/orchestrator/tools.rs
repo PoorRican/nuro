@@ -3,6 +3,7 @@ pub fn default_system0_tools() -> Vec<String> {
         "delegate_to_agent".to_string(),
         "list_agents".to_string(),
         "read_config".to_string(),
+        "queue_status".to_string(),
         "list_proposals".to_string(),
         "get_proposal".to_string(),
         "propose_config_change".to_string(),

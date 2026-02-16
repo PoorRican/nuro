@@ -2,15 +2,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+// TODO: CLI commands must be stripped down to minimal required.
+//  Primary UI for management and observability should be chat.
+//  Rename `orchestrator chat` to `ui` or similar to simplify.
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
-    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
-    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
-    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
-    OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
-    OrchestratorTurnResult,
+    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorRunDiagnoseParams,
+    OrchestratorRunDiagnoseResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
+    OrchestratorRunsListResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnParams,
+    OrchestratorSubagentTurnResult, OrchestratorThreadGetParams, OrchestratorThreadGetResult,
+    OrchestratorThreadResurrectParams, OrchestratorThreadResurrectResult,
+    OrchestratorThreadsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -253,6 +256,20 @@ impl RpcClient {
         &self,
     ) -> Result<OrchestratorStatsGetResult, RpcClientError> {
         self.call_typed("orchestrator.stats.get", None).await
+    }
+
+    pub async fn orchestrator_outputs_pull(
+        &self,
+        params: OrchestratorOutputsPullParams,
+    ) -> Result<OrchestratorOutputsPullResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.outputs.pull",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
     }
 }
 

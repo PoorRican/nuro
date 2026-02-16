@@ -170,7 +170,7 @@ fn mock_delegate_call(messages: &[rig::completion::Message]) -> ToolCall {
             tool_id: "delegate_to_agent".to_string(),
             arguments: serde_json::json!({
                 "agent_id": "finance-manager",
-                "instruction": "Use manage-bills and manage-accounts to answer with due totals and available balance."
+                "instruction": "{{USER_QUERY}}\nUse manage-bills and manage-accounts to answer with due totals and available balance."
             }),
         }
     } else {
@@ -179,7 +179,7 @@ fn mock_delegate_call(messages: &[rig::completion::Message]) -> ToolCall {
             tool_id: "delegate_to_agent".to_string(),
             arguments: serde_json::json!({
                 "agent_id": "planner",
-                "instruction": "Summarize the user request"
+                "instruction": "{{USER_QUERY}}"
             }),
         }
     }
