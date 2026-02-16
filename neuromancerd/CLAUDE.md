@@ -92,7 +92,7 @@ neuroctl orchestrator turn "message"
           -> System0 `AgentRuntime::execute_turn(..., TriggerSource::Cli, ...)`
             -> `System0ToolBroker.call_tool` -> dispatch -> action handler
           -> journal tool invocations + `message_assistant`
-      <- `OrchestratorTurnResult { turn_id, response, delegated_runs, tool_invocations }`
+      <- `OrchestratorTurnResult { turn_id, response, delegated_tasks, tool_invocations }`
 ```
 
 Current ingress behavior: orchestrator turns are enqueued with `TriggerType::Admin` (CLI/chat boundary).

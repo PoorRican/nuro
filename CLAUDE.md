@@ -56,7 +56,7 @@ CLI (`neuroctl orchestrator turn`)
             -> `System0ToolBroker` -> `actions::dispatch::dispatch_tool`
               -> runtime/adaptive/authenticated_adaptive action handlers
           -> thread/event journaling + delegated run updates
-      <- `OrchestratorTurnResult { turn_id, response, delegated_runs, tool_invocations }`
+      <- `OrchestratorTurnResult { turn_id, response, delegated_tasks, tool_invocations }`
 ```
 
 ### Orchestrator Internals
@@ -86,7 +86,7 @@ High/critical risk defaults to blocked for authorization unless explicitly force
 
 ### Tool Classes
 
-- Runtime tools: `delegate_to_agent`, `list_agents`, `read_config`
+- Runtime tools: `delegate_to_agent`, `list_agents`, `read_config`, `queue_status`
 - Adaptive tools: `list_proposals`, `get_proposal`, `propose_config_change`, `propose_skill_add`, `propose_skill_update`, `propose_agent_add`, `propose_agent_update`, `analyze_failures`, `score_skills`, `adapt_routing`, `record_lesson`, `run_redteam_eval`, `list_audit_records`
 - Authenticated adaptive tools: `authorize_proposal`, `apply_authorized_proposal`, `modify_skill`
 
@@ -105,6 +105,7 @@ JSON-RPC methods:
 - `orchestrator.runs.list`
 - `orchestrator.runs.get`
 - `orchestrator.runs.diagnose`
+- `orchestrator.outputs.pull`
 - `orchestrator.context.get`
 - `orchestrator.threads.list`
 - `orchestrator.threads.get`
