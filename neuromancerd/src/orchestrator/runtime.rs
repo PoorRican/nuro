@@ -210,7 +210,7 @@ impl System0Runtime {
         let local_root = layout.runtime_root();
         let config_dir = config_path
             .parent()
-            .unwrap_or_else(|| Path::new("."))
+            .unwrap_or_else(|| Path::new(".")) // TODO: is this a bad fallback?
             .to_path_buf();
 
         let thread_journal = ThreadJournal::new(layout.runtime_root().join("threads"))?;
