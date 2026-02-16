@@ -2,8 +2,8 @@
 
 ## 0. Status and scope
 
-**Status:** Active v0.1-alpha runtime specification.
-**Revision:** v0.1-alpha-r1 — System0 CLI runtime with prompt-path driven orchestrator/agent prompts.
+**Status:** Active v0.0.2-alpha runtime specification.
+**Revision:** v0.0.2-alpha — Orchestrator modularization + proposal/audit/canary self-improvement lifecycle with `TriggerType`-gated admin mutations.
 **Scope:** A Rust daemon ("Neuromancer") that provides a **System0 LLM orchestrator** supervising isolated **rig-powered sub-agents**, using:
 
 * **Agent Skills** for instruction bundles
@@ -13,7 +13,10 @@
 
 No new "plugin protocol" is introduced: external extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the "instruction + packaging" layer.
 
-**Key architectural invariant:** Public ingress is `orchestrator.turn`. The System0 orchestrator itself is a rig-backed LLM agent that mediates user/admin turns, delegates work, and maintains single-session history through `neuromancer-agent`.
+**Key architectural invariants:**
+* Public ingress is `orchestrator.turn`.
+* System0 is a rig-backed orchestrator agent that mediates turns, delegates work, and maintains single-session history through `neuromancer-agent`.
+* Mutation privilege boundary is `TriggerType::Admin` only; proposal analysis/read flows are allowed for non-admin triggers, but authorization/apply mutation flows are denied unless the active turn is admin.
 
 **v0.1-alpha directives (authoritative):**
 * No backward compatibility for removed RPC/CLI task/message surfaces.
@@ -27,12 +30,12 @@ No new "plugin protocol" is introduced: external extensibility is primarily via 
 
 ## 1. Motivation and problem statement
 
-Neuromancer is explicitly designed around failures we've now repeatedly seen in the wild:
+Neuromancer is explicitly designed around failures repeatedly seen in the wild:
 
 * **Secrets leaking into model context and logs**: there are reports of resolved provider API keys being serialized into the LLM prompt context on every turn in OpenClaw gateway setups—meaning keys can leak cross-provider and persist in provider logs. ([GitHub][1])
 * **"Leaky skills" as a systemic pattern**: security research found a non-trivial fraction of marketplace skills that *instruct the agent* to mishandle secrets/PII, forcing API keys/passwords/credit-card data into the LLM context window or plaintext logs—i.e., not "a bug," but a predictable outcome of the architecture. ([Snyk][2])
 * **Long-running instability and process leakage**: reports of orphaned child processes accumulating over 24–48 hours, memory pressure peaking in the tens of GB, and degraded Discord processing latency. ([GitHub][3])
-* **Supply chain reality**: credible practitioners are now converging on the same missing ingredients—provenance, mediated execution, and **specific + revocable permissions** tied to identity. ([1Password][4])
+* **Supply chain reality**: credible practitioners converge on the same missing ingredients—provenance, mediated execution, and **specific + revocable permissions** tied to identity. ([1Password][4])
 
 **Neuromancer v0.5** is therefore defined by: **least privilege**, **isolation**, **brokered secrets**, and **observable operations**, while staying compatible with the ecosystems forming around MCP, A2A, and skills.
 
@@ -67,7 +70,7 @@ Neuromancer is explicitly designed around failures we've now repeatedly seen in 
    * Export via OpenTelemetry OTLP
 
 6. **Admin API for runtime introspection**
-   Localhost HTTP endpoints for orchestrator turns, run inspection, agent health, and cron management.
+   Localhost admin surface with JSON-RPC methods for orchestrator turns, thread/event/run diagnostics, and configuration reload.
 
 ### 2.2 Non-goals (v0.1-alpha)
 
@@ -167,6 +170,25 @@ Discord / Cron -------->|     neuromancerd (control)     |<-------- Admin API
 
 **Key difference from v0.5-r1:** There is no deterministic global routing layer in v0.1-alpha. System0 handles turns directly as the orchestrator.
 
+### 3.4 Orchestrator module structure
+
+The daemon runtime is organized as an explicit `orchestrator/` module tree:
+
+* `orchestrator/runtime.rs` — orchestrator turn loop + RPC-facing runtime methods
+* `orchestrator/state.rs` — System0 broker/state containers and common helpers
+* `orchestrator/actions/`
+  * `runtime_actions.rs` — `delegate_to_agent`, `list_agents`, `read_config`
+  * `adaptive_actions.rs` — non-mutating adaptive/proposal/audit-read actions
+  * `authenticated_adaptive_actions.rs` — admin-authorized mutation actions (`authorize_proposal`, `apply_authorized_proposal`, `modify_skill` compatibility alias)
+  * `dispatch.rs` — tool class routing (`runtime`, `adaptive`, `authenticated_adaptive`)
+* `orchestrator/security/` — trigger gate, audit verdicting/records, execution guard, redaction
+* `orchestrator/proposals/` — proposal model, verification, lifecycle transitions, mutation apply
+* `orchestrator/adaptation/` — failure clustering, skill scoring, routing adaptation, canary checks, lessons/red-team helpers
+* `orchestrator/tracing/` — thread journal, event query filtering, conversation projection, JSONL I/O
+* `orchestrator/skills/` — skill broker, aliasing, path policy, CSV parsing, script runner
+
+This module tree is the source of truth for maintainability and ownership boundaries.
+
 ---
 
 ## 4. Protocol choices (why "no new plugin protocol" works)
@@ -238,7 +260,7 @@ Agent Skills as a broader convention emphasizes progressive disclosure: metadata
 * **Hierarchical, partitioned memory**
   Memory partitions per agent/scope with explicit sharing rules.
 * **Admin API for runtime introspection**
-  Localhost HTTP endpoints via axum for task/agent/cron/memory visibility and manual task submission.
+  Localhost axum admin surface with JSON-RPC methods for orchestrator turns, run/thread/event diagnostics, and config reload.
 
 ---
 
@@ -716,6 +738,45 @@ enum InfraError {
 
 All errors implement `std::error::Error` and produce structured OTEL events with the error variant as an attribute.
 
+### 6.8 Self-improvement lifecycle and admin-gated mutations
+
+The orchestrator includes proposal-based self-improvement flows. Mutations are not applied directly from analysis tools.
+
+**Lifecycle states:**
+
+1. `proposal_created`
+2. `verification_passed` or `verification_failed`
+3. `audit_passed` or `audit_blocked`
+4. `awaiting_admin_message`
+5. `authorized` (admin turn only)
+6. `applied_canary`
+7. `promoted` or `rolled_back`
+
+**Tool classes and privilege model:**
+
+* `runtime` tools: normal orchestrator operations (`delegate_to_agent`, `list_agents`, `read_config`)
+* `adaptive` tools: non-mutating proposals/analysis (`list/get/propose`, failure analysis, scoring, routing adaptation, lessons, red-team, audit-record reads)
+* `authenticated_adaptive` tools: mutating lifecycle operations
+  * `authorize_proposal`
+  * `apply_authorized_proposal`
+  * `modify_skill` (deprecated compatibility alias routed through proposal flow)
+
+**Admin gating:**
+
+* Mutations hard-fail unless the current turn trigger is `TriggerType::Admin`.
+* CLI/chat ingress emits admin turns for orchestrator interactions.
+* Non-admin sources (for example, user/internal triggers) may inspect/propose/analyze but cannot authorize/apply.
+
+**Audit and execution guard requirements:**
+
+* `orchestrator.self_improvement.audit_agent_id` is mandatory when self-improvement is enabled.
+* Every mutation attempt emits a mutation audit record with trigger type, proposal id/hash, action, outcome, and details.
+* `ExecutionGuard` runs pre-check hooks:
+  * `pre_verify_proposal`
+  * `pre_apply_proposal`
+  * `pre_skill_script_execution`
+* If required sandbox controls are not implemented, guard decisions fail closed with `blocked_missing_sandbox`.
+
 ---
 
 ## 7. LLM integration via Rig
@@ -851,7 +912,7 @@ This is a non-goal for v0.5 but the architecture accommodates it without breakin
 
 ---
 
-## 8. Skills system (still critical, now permissioned)
+## 8. Skills system (critical and permissioned)
 
 ### 8.1 Skill format
 
@@ -970,7 +1031,7 @@ A2A spec guidance around permissions and non-leaky error behavior is adopted (e.
 
 ### 10.3 "Out-of-bounds permission request" workflow
 
-This workflow is now formalized via the remediation protocol (§6.5):
+This workflow is formalized via the remediation protocol (§6.5):
 
 1. Sub-agent fails policy check → emits `SubAgentReport::PolicyDenied`
 2. Orchestrator evaluates: if `GrantTemporary` is appropriate (configured), issues a scoped grant
@@ -997,6 +1058,8 @@ For v0.1-alpha bootstrap:
 ### 11.1 Design principles
 
 * **Explicit capabilities**, no ambient permissions
+* **Proposal-first adaptive mutation model**: config/skill/agent mutations must flow through proposal → verify → audit → admin authorize/apply
+* **`TriggerType` privilege boundary**: only `TriggerType::Admin` can authorize or apply adaptive mutations
 * **Hierarchical inheritance** (org-tree):
 
   * children inherit parent defaults
@@ -1053,7 +1116,30 @@ model_slot = "executor"
 system_prompt_path = "prompts/orchestrator/SYSTEM.md"
 max_iterations = 30
 
+[orchestrator.self_improvement]
+enabled = true
+audit_agent_id = "audit-agent"
+require_admin_message_for_mutations = true
+verify_before_authorize = true
+canary_before_promote = true
+
+[orchestrator.self_improvement.thresholds]
+max_success_rate_drop_pct = 3.0
+max_tool_failure_increase_pct = 2.0
+max_policy_denial_increase_pct = 5.0
+
 # --- Agents (sub-agents only, no "core" agent) ---
+
+[agents.audit-agent]
+mode = "inproc"
+models.executor = "executor"
+system_prompt_path = "prompts/agents/audit-agent/SYSTEM.md"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
 
 [agents.planner]
 mode = "inproc"
@@ -1164,6 +1250,7 @@ Add a file watcher to reload config safely (with validation + diff). `notify` pr
 
 On reload:
 * Validate the new config fully before applying
+* If `orchestrator.self_improvement.enabled = true`, reject config unless `audit_agent_id` exists under `[agents]`
 * Diff against current config to determine what changed
 * Agent capability changes take effect on next task dispatch (not mid-task)
 * Routing rule changes take effect immediately
@@ -1475,11 +1562,8 @@ Instruction templates use `minijinja` for rendering. Available variables:
 
 #### 14.3.4 Management via Admin API
 
-Cron jobs can be managed at runtime through the Admin API (§21):
-* `GET /admin/cron` — list all cron jobs with next-fire times
-* `POST /admin/cron/{id}/trigger` — manually trigger a cron job now
-* `POST /admin/cron/{id}/disable` — disable without removing
-* `POST /admin/cron/{id}/enable` — re-enable
+For v0.1-alpha-r2, cron configuration is managed through TOML updates + config reload (`admin.config.reload`).
+Dedicated cron runtime management RPC methods are deferred.
 
 ---
 
@@ -1717,46 +1801,49 @@ On next startup, the daemon:
 
 ## 21. Admin API
 
-A localhost-only HTTP API for runtime introspection and management. Served by axum on a configurable port (default: `127.0.0.1:9090`).
+The admin surface is localhost-only and centered on JSON-RPC 2.0.
 
-### 21.1 Task endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/admin/tasks` | List tasks with optional filters (state, agent, time range) |
-| `GET` | `/admin/tasks/{id}` | Get task details including state, checkpoints, output |
-| `POST` | `/admin/tasks` | Submit a manual task (instruction + target agent) |
-| `POST` | `/admin/tasks/{id}/cancel` | Cancel a running task |
-
-### 21.2 Agent endpoints
+**HTTP routes:**
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/admin/agents` | List agents with health status and current task |
-| `GET` | `/admin/agents/{id}` | Agent details: config, health, recent tasks, circuit breaker state |
+| `POST` | `/rpc` | JSON-RPC request dispatch |
+| `GET` | `/admin/health` | Convenience health endpoint |
+| `POST` | `/admin/config/reload` | Convenience config reload endpoint |
 
-### 21.3 Cron endpoints
+### 21.1 JSON-RPC method set
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/admin/cron` | List cron jobs with schedule, next fire time, last result |
-| `POST` | `/admin/cron/{id}/trigger` | Manually trigger a cron job now |
-| `POST` | `/admin/cron/{id}/disable` | Disable a cron job |
-| `POST` | `/admin/cron/{id}/enable` | Enable a cron job |
+| Method name | Description |
+|---|---|
+| `admin.health` | Health/uptime/version status |
+| `admin.config.reload` | Trigger config reload |
+| `orchestrator.turn` | Submit one orchestrator admin turn |
+| `orchestrator.runs.list` | List delegated runs |
+| `orchestrator.runs.get` | Get delegated run by `run_id` |
+| `orchestrator.context.get` | Get projected System0 conversation messages |
+| `orchestrator.threads.list` | List thread summaries (system + subagent) |
+| `orchestrator.threads.get` | Paginated thread event read |
+| `orchestrator.threads.resurrect` | Rehydrate a subagent thread session from journaled events |
+| `orchestrator.subagent.turn` | Execute one direct turn on an existing subagent thread |
+| `orchestrator.events.query` | Filtered event query across thread journals |
+| `orchestrator.runs.diagnose` | Diagnose one run using correlated events/thread summary |
+| `orchestrator.stats.get` | Aggregate orchestrator stats (events/tools/agents/runs) |
 
-### 21.4 Memory and system endpoints
+### 21.2 JSON-RPC protocol behavior
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/admin/memory/stats` | Memory store stats: partition sizes, item counts, GC status |
-| `GET` | `/admin/health` | Daemon health: uptime, task counts, agent states, MCP server status |
-| `POST` | `/admin/config/reload` | Trigger config hot-reload (same as SIGHUP) |
+* JSON-RPC version must be `2.0`.
+* Single-request payloads only (batch requests are rejected).
+* Notifications are not supported (`id` is required).
+* Invalid request/params/method/parse failures return standard JSON-RPC error codes.
 
-### 21.5 Security
+### 21.3 Security and privilege boundaries
 
-* Bind to `127.0.0.1` only (no remote access by default).
-* Optional bearer token authentication for environments where localhost access is shared.
-* All admin actions are logged to OTEL with `admin.action` spans.
+* Admin API binds to `127.0.0.1` by default.
+* No transport authentication mechanism is implemented in v0.1-alpha-r2.
+* Mutation privilege is enforced inside the orchestrator by trigger type:
+  * `TriggerType::Admin` required for mutation lifecycle actions (`authorize_proposal`, `apply_authorized_proposal`, `modify_skill` compatibility flow).
+  * Non-admin trigger types can only use non-mutating runtime/adaptive actions.
+* All mutation attempts generate audit records with trigger type and proposal metadata.
 
 ---
 

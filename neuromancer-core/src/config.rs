@@ -124,6 +124,8 @@ pub struct OrchestratorConfig {
     pub system_prompt_path: Option<String>,
     #[serde(default = "default_orchestrator_max_iterations")]
     pub max_iterations: u32,
+    #[serde(default)]
+    pub self_improvement: SelfImprovementConfig,
 }
 
 impl Default for OrchestratorConfig {
@@ -133,12 +135,84 @@ impl Default for OrchestratorConfig {
             capabilities: AgentCapabilities::default(),
             system_prompt_path: None,
             max_iterations: default_orchestrator_max_iterations(),
+            self_improvement: SelfImprovementConfig::default(),
         }
     }
 }
 
 fn default_orchestrator_max_iterations() -> u32 {
     30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfImprovementConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_audit_agent_id")]
+    pub audit_agent_id: String,
+    #[serde(default = "default_true")]
+    pub require_admin_message_for_mutations: bool,
+    #[serde(default = "default_true")]
+    pub verify_before_authorize: bool,
+    #[serde(default = "default_true")]
+    pub canary_before_promote: bool,
+    #[serde(default)]
+    pub thresholds: SelfImprovementThresholds,
+}
+
+impl Default for SelfImprovementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            audit_agent_id: default_audit_agent_id(),
+            require_admin_message_for_mutations: true,
+            verify_before_authorize: true,
+            canary_before_promote: true,
+            thresholds: SelfImprovementThresholds::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfImprovementThresholds {
+    #[serde(default = "default_max_success_rate_drop_pct")]
+    pub max_success_rate_drop_pct: f64,
+    #[serde(default = "default_max_tool_failure_increase_pct")]
+    pub max_tool_failure_increase_pct: f64,
+    #[serde(default = "default_max_policy_denial_increase_pct")]
+    pub max_policy_denial_increase_pct: f64,
+}
+
+impl Default for SelfImprovementThresholds {
+    fn default() -> Self {
+        Self {
+            max_success_rate_drop_pct: default_max_success_rate_drop_pct(),
+            max_tool_failure_increase_pct: default_max_tool_failure_increase_pct(),
+            max_policy_denial_increase_pct: default_max_policy_denial_increase_pct(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_audit_agent_id() -> String {
+    "audit-agent".to_string()
+}
+
+fn default_max_success_rate_drop_pct() -> f64 {
+    3.0
+}
+
+fn default_max_tool_failure_increase_pct() -> f64 {
+    2.0
+}
+
+fn default_max_policy_denial_increase_pct() -> f64 {
+    5.0
 }
 
 /// Per-agent config as it appears in TOML (slightly different shape from runtime AgentConfig).
@@ -478,6 +552,94 @@ capabilities.filesystem_roots = []
                 .expect("executor model should be present")
                 .tool_call_retry_limit,
             3
+        );
+    }
+
+    #[test]
+    fn self_improvement_defaults_are_applied() {
+        let cfg = OrchestratorConfig::default();
+        assert!(!cfg.self_improvement.enabled);
+        assert_eq!(cfg.self_improvement.audit_agent_id, "audit-agent");
+        assert!(cfg.self_improvement.require_admin_message_for_mutations);
+        assert!(cfg.self_improvement.verify_before_authorize);
+        assert!(cfg.self_improvement.canary_before_promote);
+        assert_eq!(
+            cfg.self_improvement.thresholds.max_success_rate_drop_pct,
+            3.0
+        );
+        assert_eq!(
+            cfg.self_improvement
+                .thresholds
+                .max_tool_failure_increase_pct,
+            2.0
+        );
+        assert_eq!(
+            cfg.self_improvement
+                .thresholds
+                .max_policy_denial_increase_pct,
+            5.0
+        );
+    }
+
+    #[test]
+    fn self_improvement_custom_values_parse() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[orchestrator]
+
+[orchestrator.self_improvement]
+enabled = true
+audit_agent_id = "audit-alt"
+require_admin_message_for_mutations = true
+verify_before_authorize = false
+canary_before_promote = true
+
+[orchestrator.self_improvement.thresholds]
+max_success_rate_drop_pct = 1.25
+max_tool_failure_increase_pct = 0.75
+max_policy_denial_increase_pct = 2.5
+
+[agents.audit-alt]
+models.executor = "executor"
+capabilities.skills = []
+capabilities.mcp_servers = []
+capabilities.a2a_peers = []
+capabilities.secrets = []
+capabilities.memory_partitions = []
+capabilities.filesystem_roots = []
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert!(cfg.orchestrator.self_improvement.enabled);
+        assert_eq!(
+            cfg.orchestrator.self_improvement.audit_agent_id,
+            "audit-alt"
+        );
+        assert!(!cfg.orchestrator.self_improvement.verify_before_authorize);
+        assert_eq!(
+            cfg.orchestrator
+                .self_improvement
+                .thresholds
+                .max_success_rate_drop_pct,
+            1.25
+        );
+        assert_eq!(
+            cfg.orchestrator
+                .self_improvement
+                .thresholds
+                .max_tool_failure_increase_pct,
+            0.75
+        );
+        assert_eq!(
+            cfg.orchestrator
+                .self_improvement
+                .thresholds
+                .max_policy_denial_increase_pct,
+            2.5
         );
     }
 }

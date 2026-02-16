@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::message_runtime::{MessageRuntime, MessageRuntimeError};
+use crate::orchestrator::{OrchestratorRuntime, OrchestratorRuntimeError};
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
@@ -28,7 +28,7 @@ use neuromancer_core::rpc::{
 pub struct AppState {
     pub start_time: Instant,
     pub config_reload_tx: watch::Sender<()>,
-    pub message_runtime: Option<Arc<MessageRuntime>>,
+    pub orchestrator_runtime: Option<Arc<OrchestratorRuntime>>,
 }
 
 pub fn admin_router(state: AppState) -> Router {
@@ -63,31 +63,31 @@ async fn op_orchestrator_turn(
     state: &AppState,
     params: OrchestratorTurnParams,
 ) -> Result<OrchestratorTurnResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_turn(params.message)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_runs_list(
     state: &AppState,
 ) -> Result<OrchestratorRunsListResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     let runs = runtime
         .orchestrator_runs_list()
         .await
-        .map_err(map_message_runtime_error)?;
+        .map_err(map_orchestrator_runtime_error)?;
     Ok(OrchestratorRunsListResult { runs })
 }
 
@@ -95,48 +95,48 @@ async fn op_orchestrator_run_get(
     state: &AppState,
     params: OrchestratorRunGetParams,
 ) -> Result<OrchestratorRunGetResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     let run = runtime
         .orchestrator_run_get(params.run_id)
         .await
-        .map_err(map_message_runtime_error)?;
+        .map_err(map_orchestrator_runtime_error)?;
     Ok(OrchestratorRunGetResult { run })
 }
 
 async fn op_orchestrator_context_get(
     state: &AppState,
 ) -> Result<OrchestratorContextGetResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     let messages = runtime
         .orchestrator_context_get()
         .await
-        .map_err(map_message_runtime_error)?;
+        .map_err(map_orchestrator_runtime_error)?;
     Ok(OrchestratorContextGetResult { messages })
 }
 
 async fn op_orchestrator_threads_list(
     state: &AppState,
 ) -> Result<OrchestratorThreadsListResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     let threads = runtime
         .orchestrator_threads_list()
         .await
-        .map_err(map_message_runtime_error)?;
+        .map_err(map_orchestrator_runtime_error)?;
     Ok(OrchestratorThreadsListResult { threads })
 }
 
@@ -144,95 +144,95 @@ async fn op_orchestrator_thread_get(
     state: &AppState,
     params: OrchestratorThreadGetParams,
 ) -> Result<OrchestratorThreadGetResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_thread_get(params)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_thread_resurrect(
     state: &AppState,
     params: OrchestratorThreadResurrectParams,
 ) -> Result<OrchestratorThreadResurrectResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_thread_resurrect(params.thread_id)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_subagent_turn(
     state: &AppState,
     params: OrchestratorSubagentTurnParams,
 ) -> Result<OrchestratorSubagentTurnResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_subagent_turn(params.thread_id, params.message)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_events_query(
     state: &AppState,
     params: OrchestratorEventsQueryParams,
 ) -> Result<OrchestratorEventsQueryResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_events_query(params)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_run_diagnose(
     state: &AppState,
     params: OrchestratorRunDiagnoseParams,
 ) -> Result<OrchestratorRunDiagnoseResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_run_diagnose(params.run_id)
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 async fn op_orchestrator_stats_get(
     state: &AppState,
 ) -> Result<OrchestratorStatsGetResult, RpcMethodError> {
-    let Some(runtime) = &state.message_runtime else {
+    let Some(runtime) = &state.orchestrator_runtime else {
         return Err(RpcMethodError::internal(
-            "message runtime is not initialized".to_string(),
+            "orchestrator runtime is not initialized".to_string(),
         ));
     };
 
     runtime
         .orchestrator_stats_get()
         .await
-        .map_err(map_message_runtime_error)
+        .map_err(map_orchestrator_runtime_error)
 }
 
 #[derive(Debug)]
@@ -498,7 +498,7 @@ fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, RpcMethodError
         .map_err(|e| RpcMethodError::generic(format!("serialization error: {e}")))
 }
 
-fn map_message_runtime_error(err: MessageRuntimeError) -> RpcMethodError {
+fn map_orchestrator_runtime_error(err: OrchestratorRuntimeError) -> RpcMethodError {
     if err.is_invalid_request() {
         return RpcMethodError::invalid_params(err.to_string());
     }
@@ -532,7 +532,7 @@ mod tests {
         AppState {
             start_time: Instant::now(),
             config_reload_tx: reload_tx,
-            message_runtime: None,
+            orchestrator_runtime: None,
         }
     }
 
