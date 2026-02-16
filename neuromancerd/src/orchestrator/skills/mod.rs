@@ -1,4 +1,4 @@
-// TODO: shouldn't this functionality be in `neuromancerd-skills`?
+// TODO: shouldn't this functionality be in `neuromancer-skills`?
 pub mod aliases;
 pub mod broker;
 pub mod csv;

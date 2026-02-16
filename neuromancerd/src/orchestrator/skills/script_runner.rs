@@ -1,13 +1,14 @@
+// TODO: does this require the `System0Error`? This should be made generic for any agent runtime
 use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::orchestrator::error::System0Error;
 
-fn script_runtime_error(kind: &str, message: impl Into<String>) -> OrchestratorRuntimeError {
-    OrchestratorRuntimeError::Internal(format!("script_{kind}: {}", message.into()))
+fn script_runtime_error(kind: &str, message: impl Into<String>) -> System0Error {
+    System0Error::Internal(format!("script_{kind}: {}", message.into()))
 }
 
 pub(crate) async fn run_skill_script(
@@ -17,7 +18,7 @@ pub(crate) async fn run_skill_script(
     agent_id: &str,
     task_id: &str,
     tool_id: &str,
-) -> Result<serde_json::Value, OrchestratorRuntimeError> {
+) -> Result<serde_json::Value, System0Error> {
     let started_at = std::time::Instant::now();
     tracing::info!(
         agent_id = %agent_id,

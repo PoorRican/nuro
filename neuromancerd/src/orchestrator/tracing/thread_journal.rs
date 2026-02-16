@@ -8,7 +8,7 @@ use neuromancer_core::agent::SubAgentReport;
 use neuromancer_core::rpc::{OrchestratorThreadMessage, ThreadEvent, ThreadSummary};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::orchestrator::error::System0Error;
 use crate::orchestrator::security::redaction::{collect_secret_values, sanitize_event_payload};
 use crate::orchestrator::tracing::conversation_projection::infer_thread_state_from_events;
 use crate::orchestrator::tracing::jsonl_io::{
@@ -23,7 +23,7 @@ pub(crate) struct ThreadJournal {
     index_file: PathBuf,
     lock: Arc<AsyncMutex<()>>,
     seq_cache: Arc<AsyncMutex<HashMap<String, u64>>>,
-    // NOTE: why is this here?
+    /// Cached secret values used for redaction when writing events.
     secret_values: Arc<Vec<String>>,
 }
 
@@ -35,17 +35,17 @@ struct ThreadIndexEntry {
 }
 
 impl ThreadJournal {
-    pub(crate) fn new(base_dir: PathBuf) -> Result<Self, OrchestratorRuntimeError> {
+    pub(crate) fn new(base_dir: PathBuf) -> Result<Self, System0Error> {
         let system_dir = base_dir.join("system0");
         let subagents_dir = base_dir.join("subagents");
         fs::create_dir_all(&system_dir).map_err(|err| {
-            OrchestratorRuntimeError::Internal(format!(
+            System0Error::Internal(format!(
                 "failed to create thread journal system dir '{}': {err}",
                 system_dir.display()
             ))
         })?;
         fs::create_dir_all(&subagents_dir).map_err(|err| {
-            OrchestratorRuntimeError::Internal(format!(
+            System0Error::Internal(format!(
                 "failed to create thread journal subagent dir '{}': {err}",
                 subagents_dir.display()
             ))
@@ -58,7 +58,7 @@ impl ThreadJournal {
                 .append(true)
                 .open(&index_file)
                 .map_err(|err| {
-                    OrchestratorRuntimeError::Internal(format!(
+                    System0Error::Internal(format!(
                         "failed to create thread index '{}': {err}",
                         index_file.display()
                     ))
@@ -104,7 +104,7 @@ impl ThreadJournal {
     pub(crate) async fn append_event(
         &self,
         mut event: ThreadEvent,
-    ) -> Result<(), OrchestratorRuntimeError> {
+    ) -> Result<(), System0Error> {
         let _guard = self.lock.lock().await;
         let path = self.thread_file_for_event(&event);
         let current_seq = self.current_seq_for_locked(&event.thread_id, &path)?;
@@ -136,7 +136,7 @@ impl ThreadJournal {
     pub(crate) async fn append_index_snapshot(
         &self,
         summary: &ThreadSummary,
-    ) -> Result<(), OrchestratorRuntimeError> {
+    ) -> Result<(), System0Error> {
         let _guard = self.lock.lock().await;
         let entry = ThreadIndexEntry {
             event_id: uuid::Uuid::new_v4().to_string(),
@@ -148,7 +148,7 @@ impl ThreadJournal {
 
     pub(crate) fn load_latest_thread_summaries(
         &self,
-    ) -> Result<HashMap<String, ThreadSummary>, OrchestratorRuntimeError> {
+    ) -> Result<HashMap<String, ThreadSummary>, System0Error> {
         let mut by_thread = HashMap::<String, ThreadSummary>::new();
         if self.index_file.exists() {
             for line in read_jsonl_lines(&self.index_file)? {
@@ -165,7 +165,7 @@ impl ThreadJournal {
         let subagents_dir = self.base_dir.join("subagents");
         if subagents_dir.exists() {
             for dir_entry in fs::read_dir(&subagents_dir).map_err(|err| {
-                OrchestratorRuntimeError::Internal(format!(
+                System0Error::Internal(format!(
                     "failed to read subagent thread dir '{}': {err}",
                     subagents_dir.display()
                 ))
@@ -207,7 +207,7 @@ impl ThreadJournal {
     pub(crate) fn read_thread_events(
         &self,
         thread_id: &str,
-    ) -> Result<Vec<ThreadEvent>, OrchestratorRuntimeError> {
+    ) -> Result<Vec<ThreadEvent>, System0Error> {
         let path = self.thread_file_for_id(thread_id);
         if !path.exists() {
             return Ok(Vec::new());
@@ -217,7 +217,7 @@ impl ThreadJournal {
 
     pub(crate) fn read_all_thread_events(
         &self,
-    ) -> Result<Vec<ThreadEvent>, OrchestratorRuntimeError> {
+    ) -> Result<Vec<ThreadEvent>, System0Error> {
         let mut events = Vec::new();
 
         let system_file = self.system_thread_file();
@@ -228,7 +228,7 @@ impl ThreadJournal {
         let subagents_dir = self.base_dir.join("subagents");
         if subagents_dir.exists() {
             for dir_entry in fs::read_dir(&subagents_dir).map_err(|err| {
-                OrchestratorRuntimeError::Internal(format!(
+                System0Error::Internal(format!(
                     "failed to read subagent thread dir '{}': {err}",
                     subagents_dir.display()
                 ))
@@ -259,7 +259,7 @@ impl ThreadJournal {
         agent_id: Option<&str>,
         run_id: Option<&str>,
         messages: &[OrchestratorThreadMessage],
-    ) -> Result<(), OrchestratorRuntimeError> {
+    ) -> Result<(), System0Error> {
         for message in messages {
             let (event_type, payload) = match message {
                 OrchestratorThreadMessage::Text { role, content } => {
@@ -272,10 +272,7 @@ impl ThreadJournal {
                     };
                     (
                         event_type.to_string(),
-                        serde_json::json!({
-                            "role": role,
-                            "content": content,
-                        }),
+                        serde_json::json!({ "role": role, "content": content }),
                     )
                 }
                 OrchestratorThreadMessage::ToolInvocation {
@@ -296,24 +293,14 @@ impl ThreadJournal {
                 ),
             };
 
-            self.append_event(ThreadEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                thread_id: thread_id.to_string(),
-                thread_kind: thread_kind.to_string(),
-                seq: 0,
-                ts: now_rfc3339(),
+            self.append_event(make_event(
+                thread_id,
+                thread_kind,
                 event_type,
-                agent_id: agent_id.map(|value| value.to_string()),
-                run_id: run_id.map(|value| value.to_string()),
+                agent_id.map(str::to_string),
+                run_id.map(str::to_string),
                 payload,
-                redaction_applied: false,
-                turn_id: None,
-                parent_event_id: None,
-                call_id: None,
-                attempt: None,
-                duration_ms: None,
-                meta: None,
-            })
+            ))
             .await?;
         }
         Ok(())
@@ -323,7 +310,7 @@ impl ThreadJournal {
         &self,
         thread_id: &str,
         path: &Path,
-    ) -> Result<u64, OrchestratorRuntimeError> {
+    ) -> Result<u64, System0Error> {
         if let Some(seq) = self
             .seq_cache
             .try_lock()
@@ -349,6 +336,38 @@ impl ThreadJournal {
 
 pub(crate) fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Build a `ThreadEvent` with sensible defaults for the common fields.
+///
+/// Callers can override `turn_id`, `call_id`, `duration_ms`, etc. on the
+/// returned struct before passing it to `ThreadJournal::append_event`.
+pub(crate) fn make_event(
+    thread_id: impl Into<String>,
+    thread_kind: impl Into<String>,
+    event_type: impl Into<String>,
+    agent_id: Option<String>,
+    run_id: Option<String>,
+    payload: serde_json::Value,
+) -> ThreadEvent {
+    ThreadEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        thread_id: thread_id.into(),
+        thread_kind: thread_kind.into(),
+        seq: 0,
+        ts: now_rfc3339(),
+        event_type: event_type.into(),
+        agent_id,
+        run_id,
+        payload,
+        redaction_applied: false,
+        turn_id: None,
+        parent_event_id: None,
+        call_id: None,
+        attempt: None,
+        duration_ms: None,
+        meta: None,
+    }
 }
 
 pub(crate) fn sanitize_thread_file_component(input: &str) -> String {

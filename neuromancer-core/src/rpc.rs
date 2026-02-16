@@ -103,7 +103,7 @@ pub struct DelegatedRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegatedTask {
+pub struct TurnDelegation {
     pub run_id: String,
     pub agent_id: String,
     pub thread_id: String,
@@ -123,7 +123,7 @@ pub struct OrchestratorToolInvocation {
 pub struct OrchestratorTurnResult {
     pub turn_id: String,
     pub response: String,
-    pub delegated_tasks: Vec<DelegatedTask>,
+    pub delegated_tasks: Vec<TurnDelegation>,
     pub tool_invocations: Vec<OrchestratorToolInvocation>,
 }
 
@@ -349,7 +349,7 @@ mod tests {
         let result = OrchestratorTurnResult {
             turn_id: "turn-1".to_string(),
             response: "response".to_string(),
-            delegated_tasks: vec![DelegatedTask {
+            delegated_tasks: vec![TurnDelegation {
                 run_id: "run-1".to_string(),
                 agent_id: "finance_manager".to_string(),
                 thread_id: "thread-1".to_string(),

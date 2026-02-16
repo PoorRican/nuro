@@ -1,10 +1,10 @@
 use neuromancer_core::agent::{AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig};
 use neuromancer_core::config::NeuromancerConfig;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::orchestrator::error::System0Error;
 use crate::orchestrator::state::SYSTEM0_AGENT_ID;
 
-pub(crate) fn build_orchestrator_config(
+pub(crate) fn build_system0_agent_config(
     config: &NeuromancerConfig,
     allowlisted_tools: Vec<String>,
     system_prompt: String,
@@ -27,6 +27,6 @@ pub(crate) fn build_orchestrator_config(
     }
 }
 
-pub(crate) fn map_xdg_err(err: neuromancer_core::xdg::XdgError) -> OrchestratorRuntimeError {
-    OrchestratorRuntimeError::Config(err.to_string())
+pub(crate) fn map_xdg_err(err: neuromancer_core::xdg::XdgError) -> System0Error {
+    System0Error::Config(err.to_string())
 }

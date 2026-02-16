@@ -1,4 +1,4 @@
-mod admin;
+mod rpc;
 mod config;
 mod orchestrator;
 mod shutdown;
@@ -79,27 +79,27 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 5. Start admin API server
     // -----------------------------------------------------------------------
-    let orchestrator_runtime = Arc::new(
-        orchestrator::OrchestratorRuntime::new(&initial_config, &cli.config)
+    let system0_runtime = Arc::new(
+        orchestrator::System0Runtime::new(&initial_config, &cli.config)
             .await
             .map_err(|err| anyhow!("failed to initialize orchestrator runtime: {err}"))?,
     );
 
-    let admin_state = admin::AppState {
+    let rpc_state = rpc::AppState {
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        orchestrator_runtime: Some(orchestrator_runtime),
+        system0_runtime: Some(system0_runtime),
     };
 
-    let admin_router = admin::admin_router(admin_state);
+    let rpc_router = rpc::rpc_router(rpc_state);
     let bind_addr = initial_config.admin_api.bind_addr.clone();
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!(bind = %bind_addr, "admin API listening");
 
     // Spawn the admin server as a background task.
-    let admin_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, admin_router)
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, rpc_router)
             .with_graceful_shutdown(async move {
                 shutdown_rx.changed().await.ok();
             })
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
 
     // Wait for admin server to finish
     info!("graceful shutdown: stopping admin API");
-    let _ = admin_handle.await;
+    let _ = rpc_handle.await;
 
     // Flush OTEL spans (handled by TelemetryGuard drop, but explicit for clarity)
     info!("graceful shutdown: flushing OTEL spans");

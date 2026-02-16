@@ -1,5 +1,5 @@
 #[derive(Debug, thiserror::Error)]
-pub enum OrchestratorRuntimeError {
+pub enum System0Error {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
@@ -15,17 +15,11 @@ pub enum OrchestratorRuntimeError {
     #[error("resource not found: {0}")]
     ResourceNotFound(String),
 
-    #[error("path policy violation: {0}")]
-    PathViolation(String),
-
-    #[error("execution guard blocked action: {0}")]
-    GuardBlocked(String),
-
     #[error("internal runtime error: {0}")]
     Internal(String),
 }
 
-impl OrchestratorRuntimeError {
+impl System0Error {
     pub fn is_invalid_request(&self) -> bool {
         matches!(self, Self::InvalidRequest(_))
     }

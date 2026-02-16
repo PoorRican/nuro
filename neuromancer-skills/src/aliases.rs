@@ -1,4 +1,35 @@
-pub(crate) use neuromancer_skills::aliases::build_skill_tool_aliases;
+use std::collections::{HashMap, HashSet};
+
+pub fn build_skill_tool_aliases(
+    allowed_skills: &[String],
+) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
+    let canonical_skills: HashSet<&str> = allowed_skills.iter().map(String::as_str).collect();
+    let mut alias_to_canonical = HashMap::<String, String>::new();
+    let mut aliases_by_tool = HashMap::<String, Vec<String>>::new();
+
+    for canonical in allowed_skills {
+        let alias = canonical.replace('-', "_");
+        if alias == *canonical {
+            continue;
+        }
+
+        if canonical_skills.contains(alias.as_str()) {
+            continue;
+        }
+
+        if alias_to_canonical.contains_key(&alias) {
+            continue;
+        }
+
+        alias_to_canonical.insert(alias.clone(), canonical.clone());
+        aliases_by_tool
+            .entry(canonical.clone())
+            .or_default()
+            .push(alias);
+    }
+
+    (alias_to_canonical, aliases_by_tool)
+}
 
 #[cfg(test)]
 mod tests {

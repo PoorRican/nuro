@@ -8,7 +8,7 @@ use neuromancer_core::trigger::TriggerType;
 
 use crate::orchestrator::adaptation::lessons::LESSONS_MEMORY_PARTITION;
 use crate::orchestrator::llm_clients::resolve_tool_call_retry_limit;
-use crate::orchestrator::prompt::render_orchestrator_prompt;
+use crate::orchestrator::prompt::render_system0_prompt;
 use crate::orchestrator::security::execution_guard::PlaceholderExecutionGuard;
 use crate::orchestrator::state::System0ToolBroker;
 use crate::orchestrator::tools::default_system0_tools;
@@ -226,6 +226,7 @@ async fn agent_update_with_unknown_skill_is_blocked() {
     {
         let mut inner = broker.inner.lock().await;
         inner
+            .improvement
             .managed_agents
             .insert("planner".to_string(), serde_json::json!({}));
     }
@@ -416,8 +417,8 @@ capabilities.filesystem_roots = []
 }
 
 #[test]
-fn render_orchestrator_prompt_expands_placeholders() {
-    let rendered = render_orchestrator_prompt(
+fn render_system0_prompt_expands_placeholders() {
+    let rendered = render_system0_prompt(
         "id={{ORCHESTRATOR_ID}} agents={{AVAILABLE_AGENTS}} tools={{AVAILABLE_TOOLS}}",
         vec!["planner".into(), "browser".into()],
         vec!["read_config".into(), "list_agents".into()],
@@ -428,8 +429,8 @@ fn render_orchestrator_prompt_expands_placeholders() {
 }
 
 #[test]
-fn render_orchestrator_prompt_handles_empty_lists() {
-    let rendered = render_orchestrator_prompt(
+fn render_system0_prompt_handles_empty_lists() {
+    let rendered = render_system0_prompt(
         "agents={{AVAILABLE_AGENTS}} tools={{AVAILABLE_TOOLS}}",
         vec![],
         vec![],

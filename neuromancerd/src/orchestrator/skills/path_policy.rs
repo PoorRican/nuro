@@ -1,80 +1,13 @@
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-
-use crate::orchestrator::error::OrchestratorRuntimeError;
-
-pub fn resolve_local_data_path(
-    local_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
-    resolve_relative_path_under_root(local_root, relative, "data file")
-}
-
-pub fn resolve_skill_script_path(
-    skill_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
-    resolve_relative_path_under_root(skill_root, relative, "skill script")
-}
-
-fn resolve_relative_path_under_root(
-    root: &Path,
-    relative: &str,
-    file_type: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
-    let input = Path::new(relative);
-    if input.is_absolute() {
-        return Err(OrchestratorRuntimeError::PathViolation(format!(
-            "absolute paths are not allowed: {relative}"
-        )));
-    }
-
-    for component in input.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(OrchestratorRuntimeError::PathViolation(format!(
-                "path traversal is not allowed: {relative}"
-            )));
-        }
-    }
-
-    let root_canonical = fs::canonicalize(root).map_err(|err| {
-        OrchestratorRuntimeError::ResourceNotFound(format!(
-            "{} root '{}' is unavailable: {err}",
-            file_type,
-            root.display()
-        ))
-    })?;
-
-    let full_path = root.join(input);
-    let target_canonical = fs::canonicalize(&full_path).map_err(|err| {
-        OrchestratorRuntimeError::ResourceNotFound(format!(
-            "{} '{}' is unavailable: {err}",
-            file_type,
-            full_path.display()
-        ))
-    })?;
-
-    if !target_canonical.starts_with(&root_canonical) {
-        return Err(OrchestratorRuntimeError::PathViolation(format!(
-            "resolved path '{}' escapes '{}'",
-            target_canonical.display(),
-            root_canonical.display()
-        )));
-    }
-
-    Ok(target_canonical)
-}
+pub(crate) use neuromancer_skills::path_policy::{resolve_local_data_path, resolve_skill_script_path};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neuromancer_skills::SkillError;
 
-    fn temp_dir(prefix: &str) -> PathBuf {
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("{}_{}", prefix, uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(&dir).expect("temp dir");
         dir
     }
 
@@ -84,7 +17,7 @@ mod tests {
         let absolute = local_root.join("data/accounts.csv");
         let err = resolve_local_data_path(&local_root, absolute.to_string_lossy().as_ref())
             .expect_err("absolute path should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
@@ -92,20 +25,20 @@ mod tests {
         let local_root = temp_dir("nm_local_root");
         let err = resolve_local_data_path(&local_root, "../secrets.txt")
             .expect_err("parent traversal should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
     fn resolve_local_data_path_accepts_valid_relative_path() {
         let local_root = temp_dir("nm_local_root");
         let data_dir = local_root.join("data");
-        fs::create_dir_all(&data_dir).expect("data dir");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
         let file_path = data_dir.join("accounts.csv");
-        fs::write(&file_path, "account,balance\nchecking,1200").expect("write");
+        std::fs::write(&file_path, "account,balance\nchecking,1200").expect("write");
 
         let resolved = resolve_local_data_path(&local_root, "data/accounts.csv")
             .expect("relative path should resolve");
-        assert_eq!(resolved, fs::canonicalize(file_path).expect("canonical"));
+        assert_eq!(resolved, std::fs::canonicalize(file_path).expect("canonical"));
     }
 
     #[test]
@@ -114,7 +47,7 @@ mod tests {
         let absolute = skill_root.join("scripts/run.py");
         let err = resolve_skill_script_path(&skill_root, absolute.to_string_lossy().as_ref())
             .expect_err("absolute path should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
@@ -122,19 +55,19 @@ mod tests {
         let skill_root = temp_dir("nm_skill_root");
         let err = resolve_skill_script_path(&skill_root, "../run.py")
             .expect_err("parent traversal should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
     fn resolve_skill_script_path_accepts_valid_relative_path() {
         let skill_root = temp_dir("nm_skill_root");
         let script_dir = skill_root.join("scripts");
-        fs::create_dir_all(&script_dir).expect("script dir");
+        std::fs::create_dir_all(&script_dir).expect("script dir");
         let script = script_dir.join("run.py");
-        fs::write(&script, "print('{}')").expect("script write");
+        std::fs::write(&script, "print('{}')").expect("script write");
 
         let resolved = resolve_skill_script_path(&skill_root, "scripts/run.py")
             .expect("relative script path should resolve");
-        assert_eq!(resolved, fs::canonicalize(script).expect("canonical"));
+        assert_eq!(resolved, std::fs::canonicalize(script).expect("canonical"));
     }
 }

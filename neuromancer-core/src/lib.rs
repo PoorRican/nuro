@@ -1,11 +1,14 @@
 pub mod agent;
 pub mod argument_tokens;
+pub mod audit;
 pub mod config;
 pub mod error;
 pub mod memory;
 pub mod policy;
+pub mod proposal;
 pub mod rpc;
 pub mod secrets;
+pub mod security;
 pub mod task;
 pub mod tool;
 pub mod trigger;

@@ -10,7 +10,7 @@ use neuromancer_core::tool::{
 };
 use neuromancer_skills::{Skill, SkillRegistry};
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::orchestrator::error::System0Error;
 use crate::orchestrator::security::execution_guard::ExecutionGuard;
 use crate::orchestrator::skills::aliases::build_skill_tool_aliases;
 use crate::orchestrator::skills::csv::parse_csv_content;
@@ -48,11 +48,11 @@ impl SkillToolBroker {
         skill_registry: &SkillRegistry,
         local_root: PathBuf,
         execution_guard: Arc<dyn ExecutionGuard>,
-    ) -> Result<Self, OrchestratorRuntimeError> {
+    ) -> Result<Self, System0Error> {
         let mut tools = HashMap::new();
         for skill_name in allowed_skills {
             let skill = skill_registry.get(skill_name).ok_or_else(|| {
-                OrchestratorRuntimeError::Config(format!(
+                System0Error::Config(format!(
                     "agent '{}' references missing skill '{}'",
                     agent_id, skill_name
                 ))
@@ -244,7 +244,7 @@ impl ToolBroker for SkillToolBroker {
     }
 }
 
-fn map_tool_err(tool_id: &str) -> impl Fn(OrchestratorRuntimeError) -> NeuromancerError + '_ {
+fn map_tool_err<E: std::fmt::Display>(tool_id: &str) -> impl Fn(E) -> NeuromancerError + '_ {
     move |err| {
         NeuromancerError::Tool(ToolError::ExecutionFailed {
             tool_id: tool_id.to_string(),

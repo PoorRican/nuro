@@ -1,5 +1,8 @@
+pub mod aliases;
+pub mod csv;
 mod linter;
 mod metadata;
+pub mod path_policy;
 mod registry;
 
 pub use linter::{LintResult, LintSeverity, LintWarning, SkillLinter};
@@ -47,4 +50,20 @@ pub enum SkillError {
 
     #[error("lint failures: {0} warnings")]
     LintFailures(usize),
+
+    #[error("path violation: {0}")]
+    PathViolation(String),
+
+    #[error("path unavailable: {0}")]
+    PathUnavailable(String),
+
+    #[error("csv file is empty: {0}")]
+    CsvEmpty(String),
+
+    #[error("csv column mismatch: expected {expected} columns, got {actual} in {path}")]
+    CsvColumnMismatch {
+        expected: usize,
+        actual: usize,
+        path: String,
+    },
 }

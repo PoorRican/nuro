@@ -1,5 +1,5 @@
-// NOTE: these are redundant exports. All that is necessary is `dispatch::dispatch_tool
-pub mod adaptive_actions;
-pub mod authenticated_adaptive_actions;
+// TODO: only `dispatch_tool` is used. Minimize module exports.
 pub mod dispatch;
-pub mod runtime_actions;
+pub(crate) mod adaptive_actions;
+pub(crate) mod authenticated_adaptive_actions;
+pub(crate) mod runtime_actions;
