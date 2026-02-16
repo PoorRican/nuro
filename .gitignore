@@ -1,1 +1,7 @@
 /target
+
+.env
+.idea/
+
+# personal notes, configs, and commentary. will move to obsidian soon.
+/NOTES.md
