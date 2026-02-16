@@ -250,8 +250,17 @@ impl RuntimeCore {
     }
 }
 
+// TODO: there is naming confusion between daemon <-> orchestrator <-> System0 model
+//  daemon = the background service which provides the RPC surface to interact with system0 + sub-agents
+//  System0 = the primary mediator between the user, and the sub-agents
+//    - Receives `TriggerType::Admin` commands for administration
+//    - Delegates user requests to sub-agents
+//    - Facilitates self-improvement commands
+//    - Assists sub-agents when they are unable to complete a task: surface errors, propose fixes via self-improvement tools, etc
 impl OrchestratorRuntime {
+    // TODO: this should be simplified via a builder pattern
     pub async fn new(
+        // TODO: add clarity to arguments. These seem redundant.
         config: &NeuromancerConfig,
         config_path: &Path,
     ) -> Result<Self, OrchestratorRuntimeError> {
@@ -322,6 +331,8 @@ impl OrchestratorRuntime {
         let allowlisted_system0_tools =
             effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
         let mut subagents = std::collections::HashMap::<String, Arc<AgentRuntime>>::new();
+        
+        // TODO: isolate sub-agent creation
         for (agent_id, agent_toml) in &config.agents {
             let prompt_path = resolve_path(
                 agent_toml.system_prompt_path.as_deref(),
@@ -356,6 +367,7 @@ impl OrchestratorRuntime {
         let config_snapshot = serde_json::to_value(config)
             .map_err(|err| OrchestratorRuntimeError::Config(err.to_string()))?;
 
+        // TODO: isolate system0 instantiation
         let system0_broker = System0ToolBroker::new(
             subagents,
             config_snapshot,
@@ -368,6 +380,7 @@ impl OrchestratorRuntime {
         );
         let runtime_broker = system0_broker.clone();
 
+        // TODO: unify around `system0_*` naming
         let orchestrator_prompt_path = resolve_path(
             config.orchestrator.system_prompt_path.as_deref(),
             layout.default_orchestrator_system_prompt_path(),
@@ -395,6 +408,8 @@ impl OrchestratorRuntime {
             orchestrator_tool_call_retry_limit,
         ));
 
+        // TODO: what is the purpose of `RuntimeCore`? Why does there need to be a separate `system0_broker`?
+        //  what is the difference between `RuntimeCore` and `OrchestratorRuntime`? Seems to be severe overlap.
         let core = Arc::new(AsyncMutex::new(RuntimeCore {
             orchestrator_runtime,
             session_store: session_store.clone(),
@@ -458,6 +473,7 @@ impl OrchestratorRuntime {
             ));
         }
 
+        // NOTE: what happens here? What is `oneshot`?
         let (response_tx, response_rx) = oneshot::channel();
         self.turn_tx
             .send(TurnRequest {

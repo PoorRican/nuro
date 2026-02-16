@@ -20,6 +20,7 @@ pub const TOOL_IDS: &[&str] = &[
     "modify_skill",
 ];
 
+// NOTE: redundant. Move to `classify_tool`
 pub fn contains(tool_id: &str) -> bool {
     TOOL_IDS.contains(&tool_id)
 }

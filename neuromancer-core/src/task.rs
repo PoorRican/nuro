@@ -83,6 +83,7 @@ impl TaskState {
     }
 }
 
+// TODO: where is priority used?
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskPriority {
     Low = 0,

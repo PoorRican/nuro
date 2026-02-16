@@ -23,6 +23,7 @@ pub const TOOL_IDS: &[&str] = &[
     "queue_status",
 ];
 
+// NOTE: redundant. Move to `classify_tool`
 pub fn contains(tool_id: &str) -> bool {
     TOOL_IDS.contains(&tool_id)
 }

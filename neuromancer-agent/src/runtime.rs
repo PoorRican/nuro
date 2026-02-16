@@ -47,6 +47,8 @@ impl AgentRuntime {
         }
     }
 
+    // TODO: there seems to be significant code duplication between `execute` and `execute_turn`
+
     /// Execute a task through the full state machine lifecycle.
     /// Returns the final TaskOutput on success.
     pub async fn execute(&self, task: &mut Task) -> Result<TaskOutput, NeuromancerError> {
@@ -546,6 +548,7 @@ fn available_tool_names(specs: &[ToolSpec]) -> Vec<String> {
     names
 }
 
+// TODO: [low-pri] This is overfit, and provider-specific
 fn is_invalid_tool_call_reason(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     lower.contains("tool call validation failed")
@@ -554,6 +557,7 @@ fn is_invalid_tool_call_reason(reason: &str) -> bool {
         || lower.contains("tool_use_failed")
 }
 
+// TODO: [low-pri] This is overfit, and provider-specific
 fn extract_attempted_tool_name(reason: &str) -> Option<String> {
     for marker in [
         "attempted to call tool '",

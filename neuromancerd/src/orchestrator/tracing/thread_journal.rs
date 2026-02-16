@@ -23,6 +23,7 @@ pub(crate) struct ThreadJournal {
     index_file: PathBuf,
     lock: Arc<AsyncMutex<()>>,
     seq_cache: Arc<AsyncMutex<HashMap<String, u64>>>,
+    // NOTE: why is this here?
     secret_values: Arc<Vec<String>>,
 }
 

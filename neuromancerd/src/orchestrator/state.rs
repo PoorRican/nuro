@@ -77,6 +77,7 @@ pub(crate) struct System0BrokerInner {
     pub(crate) last_known_good_snapshot: serde_json::Value,
 }
 
+// TODO: there seems to be a divergence between "runs" and "tasks"
 impl System0ToolBroker {
     pub(crate) fn new(
         subagents: HashMap<String, Arc<AgentRuntime>>,

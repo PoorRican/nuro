@@ -26,6 +26,7 @@ pub const TOOL_IDS: &[&str] = &[
     "list_audit_records",
 ];
 
+// NOTE: redundant. Move to `classify_tool`
 pub fn contains(tool_id: &str) -> bool {
     TOOL_IDS.contains(&tool_id)
 }

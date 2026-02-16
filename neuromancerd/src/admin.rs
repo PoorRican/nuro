@@ -1,3 +1,7 @@
+//! RPC endpoints for neuromancerd
+//! 
+//! Only used for CLI. Incoming inputs from 
+// TODO: file should likely be renamed to `rpc.rs` to reflect purpose.
 use std::sync::Arc;
 use std::time::Instant;
 
