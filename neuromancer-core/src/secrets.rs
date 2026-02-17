@@ -14,10 +14,48 @@ pub enum SecretKind {
     /// API keys, bearer tokens, passwords.
     #[default]
     Credential,
+    /// TOTP seed metadata is parsed from config; runtime generation is not integrated yet.
+    TotpSeed,
     /// Browser session cookies/tokens. Supports agent write-back and TTL expiry.
     BrowserSession,
     /// TLS certificates, SSH keys. Injected via file mount.
     CertificateOrKey,
+}
+
+/// TOTP secret policy from config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotpPolicy {
+    Autonomous,
+    Escalate,
+}
+
+/// TOTP algorithm from config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotpAlgorithm {
+    #[default]
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+/// Parsed TOTP parameters (stub for future runtime integration).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpParams {
+    pub digits: u32,
+    pub period: u64,
+    pub algorithm: TotpAlgorithm,
+}
+
+impl Default for TotpParams {
+    fn default() -> Self {
+        Self {
+            digits: 6,
+            period: 30,
+            algorithm: TotpAlgorithm::Sha1,
+        }
+    }
 }
 
 /// How a resolved secret should be injected into a tool execution context.
