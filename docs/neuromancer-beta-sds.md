@@ -1366,6 +1366,11 @@ enum TotpPolicy {
 }
 ```
 
+**Implementation note (beta codebase):**
+
+* `browser_session` remains supported as a beta extension for browser cookie/session write-back (`store_session` flow).
+* `totp_seed` config parsing/modeling is currently stubbed for SDS compatibility; end-to-end runtime TOTP tool integration is still deferred.
+
 Each secret has:
 
 * `kind`: `Credential` | `TotpSeed` | `CertificateOrKey`
@@ -1975,4 +1980,3 @@ These three items are the highest-risk and should be built first:
 [23]: https://docs.rs/axum/latest/axum/
 [24]: https://docs.rs/rustls
 [25]: https://docs.rs/minijinja
-
