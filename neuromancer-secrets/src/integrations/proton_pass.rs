@@ -75,32 +75,9 @@ impl ProtonPassResolver {
 
     /// Create a new login credential in Proton Pass.
     pub async fn create_credential(params: CreateCredentialParams) -> Result<(), NeuromancerError> {
+        let args = build_create_login_args(&params);
         let mut cmd = Command::new("pass-cli");
-        cmd.args([
-            "item",
-            "create",
-            "login",
-            "--vault-name",
-            &params.vault_name,
-            "--title",
-            &params.title,
-            "--password",
-            &params.password,
-            "--output",
-            "json",
-        ]);
-
-        if let Some(ref username) = params.username {
-            cmd.args(["--username", username]);
-        }
-
-        if let Some(ref email) = params.email {
-            cmd.args(["--email", email]);
-        }
-
-        for url in &params.urls {
-            cmd.args(["--url", url]);
-        }
+        cmd.args(&args);
 
         let output = cmd.output().await.map_err(|e| {
             NeuromancerError::Infra(InfraError::Database(format!(
@@ -117,6 +94,37 @@ impl ProtonPassResolver {
 
         Ok(())
     }
+}
+
+fn build_create_login_args(params: &CreateCredentialParams) -> Vec<String> {
+    let mut args = vec![
+        "item".to_string(),
+        "create".to_string(),
+        "login".to_string(),
+        "--vault-name".to_string(),
+        params.vault_name.clone(),
+        "--title".to_string(),
+        params.title.clone(),
+        "--password".to_string(),
+        params.password.clone(),
+    ];
+
+    if let Some(ref username) = params.username {
+        args.push("--username".to_string());
+        args.push(username.clone());
+    }
+
+    if let Some(ref email) = params.email {
+        args.push("--email".to_string());
+        args.push(email.clone());
+    }
+
+    for url in &params.urls {
+        args.push("--url".to_string());
+        args.push(url.clone());
+    }
+
+    args
 }
 
 /// Parameters for creating a new credential in Proton Pass.
@@ -138,6 +146,71 @@ mod tests {
         // Verify URI format is accepted (no parsing needed — pass-cli handles it natively)
         let uri = "pass://Work/GitHub/password";
         assert!(uri.starts_with("pass://"));
+    }
+
+    #[test]
+    fn create_login_args_include_required_and_optional_fields() {
+        let params = CreateCredentialParams {
+            vault_name: "Work".into(),
+            title: "GitHub".into(),
+            username: Some("octocat".into()),
+            password: "secret".into(),
+            email: Some("octocat@example.com".into()),
+            urls: vec!["https://github.com".into()],
+        };
+
+        let args = build_create_login_args(&params);
+        let expected = vec![
+            "item",
+            "create",
+            "login",
+            "--vault-name",
+            "Work",
+            "--title",
+            "GitHub",
+            "--password",
+            "secret",
+            "--username",
+            "octocat",
+            "--email",
+            "octocat@example.com",
+            "--url",
+            "https://github.com",
+        ];
+        assert_eq!(
+            args,
+            expected
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn create_login_args_support_repeated_urls_and_no_output_flag() {
+        let params = CreateCredentialParams {
+            vault_name: "Work".into(),
+            title: "Service".into(),
+            username: None,
+            password: "secret".into(),
+            email: None,
+            urls: vec!["https://a.example".into(), "https://b.example".into()],
+        };
+
+        let args = build_create_login_args(&params);
+        assert!(!args.iter().any(|arg| arg == "--output"));
+
+        let urls = args
+            .windows(2)
+            .filter_map(|window| {
+                if window[0] == "--url" {
+                    Some(window[1].clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<String>>();
+        assert_eq!(urls, params.urls);
     }
 
     #[tokio::test]
