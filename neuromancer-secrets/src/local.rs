@@ -207,7 +207,10 @@ impl SecretsBroker for LocalSecretsBroker {
         usage: SecretUsage,
     ) -> Result<ResolvedSecret, NeuromancerError> {
         if !ctx.allowed_secrets.contains(&secret_ref) {
-            warn!(secret.outcome = "denied", "secret not in agent context allowlist");
+            warn!(
+                secret.outcome = "denied",
+                "secret not in agent context allowlist"
+            );
             return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
                 agent_id: ctx.agent_id.clone(),
                 secret_ref,
@@ -249,6 +252,13 @@ impl SecretsBroker for LocalSecretsBroker {
 
         // Check ACL
         self.check_acl(ctx, &acl)?;
+
+        if !acl.allowed_skills.is_empty() && !acl.allowed_skills.contains(&usage.tool_id) {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: ctx.agent_id.clone(),
+                secret_ref: acl.secret_id.clone(),
+            }));
+        }
 
         if !ctx.allowed_mcp_servers.is_empty() && !ctx.allowed_mcp_servers.contains(&usage.tool_id)
         {
@@ -483,8 +493,7 @@ struct SecretRow {
 
 impl SecretRow {
     fn to_acl(&self) -> SecretAcl {
-        let kind: SecretKind =
-            serde_json::from_str(&self.kind).unwrap_or(SecretKind::Credential);
+        let kind: SecretKind = serde_json::from_str(&self.kind).unwrap_or(SecretKind::Credential);
         let expires_at = self
             .expires_at
             .as_ref()
@@ -602,7 +611,11 @@ mod tests {
             .unwrap();
 
         broker
-            .store("restricted", "secret-val", test_acl("restricted", vec!["browser"]))
+            .store(
+                "restricted",
+                "secret-val",
+                test_acl("restricted", vec!["browser"]),
+            )
             .await
             .unwrap();
 
@@ -631,7 +644,11 @@ mod tests {
             .unwrap();
 
         broker
-            .store("context-guarded", "secret-val", test_acl("context-guarded", vec!["browser"]))
+            .store(
+                "context-guarded",
+                "secret-val",
+                test_acl("context-guarded", vec!["browser"]),
+            )
             .await
             .unwrap();
 
@@ -670,7 +687,10 @@ mod tests {
             expires_at: None,
         };
 
-        broker.store("mcp-guarded", "secret-val", acl).await.unwrap();
+        broker
+            .store("mcp-guarded", "secret-val", acl)
+            .await
+            .unwrap();
 
         let ctx = test_ctx_with_caps("browser", vec!["mcp-guarded"], vec!["filesystem"]);
         let usage = SecretUsage {
@@ -690,6 +710,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_honors_secret_acl_allowed_skills_denied() {
+        let pool = test_pool().await;
+        let broker = LocalSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
+
+        let acl = SecretAcl {
+            secret_id: "skill-guarded".into(),
+            kind: SecretKind::Credential,
+            allowed_agents: vec!["browser".into()],
+            allowed_skills: vec!["allowed-skill".into()],
+            allowed_mcp_servers: vec![],
+            injection_modes: vec![],
+            expires_at: None,
+        };
+
+        broker
+            .store("skill-guarded", "secret-val", acl)
+            .await
+            .unwrap();
+
+        let ctx = test_ctx_with_caps("browser", vec!["skill-guarded"], vec![]);
+        let usage = SecretUsage {
+            tool_id: "forbidden-skill".into(),
+            purpose: "test".into(),
+        };
+
+        let err = broker
+            .resolve_handle_for_tool(&ctx, "skill-guarded".into(), usage)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_honors_secret_acl_allowed_skills_allowed() {
+        let pool = test_pool().await;
+        let broker = LocalSecretsBroker::new(pool, test_master_key())
+            .await
+            .unwrap();
+
+        let acl = SecretAcl {
+            secret_id: "skill-allowed".into(),
+            kind: SecretKind::Credential,
+            allowed_agents: vec!["browser".into()],
+            allowed_skills: vec!["allowed-skill".into()],
+            allowed_mcp_servers: vec![],
+            injection_modes: vec![],
+            expires_at: None,
+        };
+
+        broker
+            .store("skill-allowed", "secret-val", acl)
+            .await
+            .unwrap();
+
+        let ctx = test_ctx_with_caps("browser", vec!["skill-allowed"], vec![]);
+        let usage = SecretUsage {
+            tool_id: "allowed-skill".into(),
+            purpose: "test".into(),
+        };
+
+        let resolved = broker
+            .resolve_handle_for_tool(&ctx, "skill-allowed".into(), usage)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.value, "secret-val");
+    }
+
+    #[tokio::test]
     async fn list_handles_filters_by_agent() {
         let pool = test_pool().await;
         let broker = LocalSecretsBroker::new(pool, test_master_key())
@@ -697,11 +792,19 @@ mod tests {
             .unwrap();
 
         broker
-            .store("browser-key", "val1", test_acl("browser-key", vec!["browser"]))
+            .store(
+                "browser-key",
+                "val1",
+                test_acl("browser-key", vec!["browser"]),
+            )
             .await
             .unwrap();
         broker
-            .store("planner-key", "val2", test_acl("planner-key", vec!["planner"]))
+            .store(
+                "planner-key",
+                "val2",
+                test_acl("planner-key", vec!["planner"]),
+            )
             .await
             .unwrap();
 
@@ -803,7 +906,11 @@ mod tests {
 
         // Store a Credential-kind secret
         broker
-            .store("cred-secret", "initial", test_acl("cred-secret", vec!["browser"]))
+            .store(
+                "cred-secret",
+                "initial",
+                test_acl("cred-secret", vec!["browser"]),
+            )
             .await
             .unwrap();
 
@@ -835,7 +942,10 @@ mod tests {
             injection_modes: vec![],
             expires_at: None,
         };
-        broker.store("session", "initial-session", acl).await.unwrap();
+        broker
+            .store("session", "initial-session", acl)
+            .await
+            .unwrap();
 
         let ctx = test_ctx("browser");
         broker
@@ -903,7 +1013,10 @@ mod tests {
             injection_modes: vec![],
             expires_at: Some(past),
         };
-        broker.store("expired-session", "old-cookies", acl).await.unwrap();
+        broker
+            .store("expired-session", "old-cookies", acl)
+            .await
+            .unwrap();
 
         let ctx = test_ctx_with_caps("browser", vec!["expired-session"], vec![]);
         let usage = SecretUsage {
@@ -939,7 +1052,10 @@ mod tests {
             injection_modes: vec![],
             expires_at: Some(future),
         };
-        broker.store("fresh-session", "fresh-cookies", acl).await.unwrap();
+        broker
+            .store("fresh-session", "fresh-cookies", acl)
+            .await
+            .unwrap();
 
         let ctx = test_ctx_with_caps("browser", vec!["fresh-session"], vec![]);
         let usage = SecretUsage {
@@ -963,6 +1079,7 @@ mod tests {
 
         for kind in [
             SecretKind::Credential,
+            SecretKind::TotpSeed,
             SecretKind::BrowserSession,
             SecretKind::CertificateOrKey,
         ] {

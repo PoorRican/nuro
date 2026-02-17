@@ -8,7 +8,7 @@ use tracing::{info, instrument, warn};
 use neuromancer_core::config::SecretEntryConfig;
 use neuromancer_core::error::{NeuromancerError, PolicyError};
 use neuromancer_core::secrets::{
-    ResolvedSecret, SecretAcl, SecretInjectionMode, SecretRef, SecretUsage,
+    ResolvedSecret, SecretAcl, SecretInjectionMode, SecretKind, SecretRef, SecretUsage,
     SecretsBroker,
 };
 use neuromancer_core::tool::AgentContext;
@@ -20,7 +20,7 @@ pub mod local;
 pub mod scanner;
 
 pub use local::LocalSecretsBroker;
-pub use scanner::{new_shared_scanner, rebuild_scanner, SecretScanner, SharedScanner};
+pub use scanner::{SecretScanner, SharedScanner, new_shared_scanner, rebuild_scanner};
 
 /// Composite secrets broker that dispatches between local SQLite storage
 /// and Proton Pass CLI based on per-entry config.
@@ -61,7 +61,7 @@ impl CompositeSecretsBroker {
     async fn sync_entries_to_sqlite(&self) -> Result<(), NeuromancerError> {
         for (id, entry) in &self.entries {
             // Warn about env_var injection mode
-            for mode in &entry.injection_modes {
+            for mode in &entry.allowed_injection_modes {
                 if matches!(mode, SecretInjectionMode::EnvVar { .. }) {
                     warn!(
                         secret.id = %id,
@@ -80,15 +80,22 @@ impl CompositeSecretsBroker {
                 secret_id: id.clone(),
                 kind: entry.kind.clone(),
                 allowed_agents: entry.allowed_agents.clone(),
-                allowed_skills: vec![],
+                allowed_skills: entry.allowed_skills.clone(),
                 allowed_mcp_servers: entry.allowed_mcp_servers.clone(),
-                injection_modes: if entry.injection_modes.is_empty() {
+                injection_modes: if entry.allowed_injection_modes.is_empty() {
                     vec![SecretInjectionMode::HandleReplacement]
                 } else {
-                    entry.injection_modes.clone()
+                    entry.allowed_injection_modes.clone()
                 },
                 expires_at,
             };
+
+            // TODO(secrets): persist parsed TOTP metadata (policy/params) in SQLite once
+            // runtime TOTP integration is implemented end-to-end.
+            if entry.kind == SecretKind::TotpSeed {
+                let _ = entry.totp_policy.clone();
+                let _ = entry.effective_totp_params();
+            }
 
             self.local.upsert_acl(&acl).await?;
         }
@@ -155,6 +162,25 @@ impl CompositeSecretsBroker {
         }
         Ok(())
     }
+
+    /// Check optional skill-level ACL from TOML entries config.
+    fn check_entry_skill_scope(
+        &self,
+        id: &str,
+        agent_id: &str,
+        tool_id: &str,
+    ) -> Result<(), NeuromancerError> {
+        if let Some(entry) = self.entries.get(id)
+            && !entry.allowed_skills.is_empty()
+            && !entry.allowed_skills.contains(&tool_id.to_string())
+        {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: agent_id.to_string(),
+                secret_ref: id.to_string(),
+            }));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -172,6 +198,7 @@ impl SecretsBroker for CompositeSecretsBroker {
     ) -> Result<ResolvedSecret, NeuromancerError> {
         // Check TOML-level ACL first
         self.check_entry_acl(&secret_ref, &ctx.agent_id)?;
+        self.check_entry_skill_scope(&secret_ref, &ctx.agent_id, &usage.tool_id)?;
 
         // If this is a pass:// sourced secret, resolve via Proton Pass
         if let Some(uri) = self.is_pass_sourced(&secret_ref) {
@@ -183,13 +210,12 @@ impl SecretsBroker for CompositeSecretsBroker {
                 }));
             }
 
-            let value =
-                integrations::proton_pass::ProtonPassResolver::resolve(uri).await?;
+            let value = integrations::proton_pass::ProtonPassResolver::resolve(uri).await?;
 
             let injection_mode = self
                 .entries
                 .get(&secret_ref)
-                .and_then(|e| e.injection_modes.first().cloned())
+                .and_then(|e| e.allowed_injection_modes.first().cloned())
                 .unwrap_or(SecretInjectionMode::HandleReplacement);
 
             info!(
@@ -218,7 +244,10 @@ impl SecretsBroker for CompositeSecretsBroker {
 
         // Add pass:// entries that this agent can access
         for (id, entry) in &self.entries {
-            if entry.source.as_ref().is_some_and(|s| s.starts_with("pass://"))
+            if entry
+                .source
+                .as_ref()
+                .is_some_and(|s| s.starts_with("pass://"))
                 && entry.allowed_agents.contains(&ctx.agent_id)
                 && (ctx.allowed_secrets.is_empty() || ctx.allowed_secrets.contains(id))
                 && !handles.contains(id)
@@ -231,11 +260,21 @@ impl SecretsBroker for CompositeSecretsBroker {
     }
 
     async fn store(&self, id: &str, value: &str, acl: SecretAcl) -> Result<(), NeuromancerError> {
-        self.local.store(id, value, acl).await
+        self.local.store(id, value, acl).await?;
+        if let Err(err) = self.build_scanner().await {
+            warn!(secret.id = %id, operation = "store", error = %err, "scanner rebuild failed");
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn revoke(&self, id: &str) -> Result<(), NeuromancerError> {
-        self.local.revoke(id).await
+        self.local.revoke(id).await?;
+        if let Err(err) = self.build_scanner().await {
+            warn!(secret.id = %id, operation = "revoke", error = %err, "scanner rebuild failed");
+            return Err(err);
+        }
+        Ok(())
     }
 
     #[instrument(skip(self, ctx, value), fields(
@@ -252,8 +291,14 @@ impl SecretsBroker for CompositeSecretsBroker {
         self.local.store_session(ctx, id, value, expires_at).await?;
 
         // Rebuild scanner to include the new session value
-        if let Err(e) = self.build_scanner().await {
-            warn!(error = %e, "failed to rebuild scanner after session store");
+        if let Err(err) = self.build_scanner().await {
+            warn!(
+                secret.id = %id,
+                operation = "store_session",
+                error = %err,
+                "scanner rebuild failed"
+            );
+            return Err(err);
         }
 
         Ok(())
@@ -333,9 +378,15 @@ mod tests {
                 kind: SecretKind::Credential,
                 source: None,
                 allowed_agents: vec!["browser".into()],
+                allowed_skills: vec![],
                 allowed_mcp_servers: vec![],
-                injection_modes: vec![],
+                allowed_injection_modes: vec![],
+                totp_policy: None,
+                totp_digits: None,
+                totp_period: None,
+                totp_algorithm: None,
                 ttl: None,
+                rotation_metadata: None,
             },
         );
 
@@ -370,9 +421,15 @@ mod tests {
                 kind: SecretKind::Credential,
                 source: Some("pass://Work/Test/password".into()),
                 allowed_agents: vec!["browser".into()],
+                allowed_skills: vec![],
                 allowed_mcp_servers: vec![],
-                injection_modes: vec![],
+                allowed_injection_modes: vec![],
+                totp_policy: None,
+                totp_digits: None,
+                totp_period: None,
+                totp_algorithm: None,
                 ttl: None,
+                rotation_metadata: None,
             },
         );
 
@@ -431,8 +488,105 @@ mod tests {
         broker.build_scanner().await.unwrap();
 
         let scanner = broker.scanner();
-        let found = scanner.load().scan("response contained my-secret-api-token-xyz in output");
+        let found = scanner
+            .load()
+            .scan("response contained my-secret-api-token-xyz in output");
         assert_eq!(found, vec!["scannable"]);
+    }
+
+    #[tokio::test]
+    async fn composite_broker_store_rebuilds_scanner() {
+        let pool = test_pool().await;
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), HashMap::new())
+            .await
+            .unwrap();
+
+        let acl = SecretAcl {
+            secret_id: "stored-secret".into(),
+            kind: SecretKind::Credential,
+            allowed_agents: vec!["browser".into()],
+            allowed_skills: vec![],
+            allowed_mcp_servers: vec![],
+            injection_modes: vec![],
+            expires_at: None,
+        };
+        broker
+            .store("stored-secret", "stored-secret-value-123", acl)
+            .await
+            .unwrap();
+
+        let scanner = broker.scanner();
+        let found = scanner.load().scan("stored-secret-value-123");
+        assert_eq!(found, vec!["stored-secret"]);
+    }
+
+    #[tokio::test]
+    async fn composite_broker_revoke_rebuilds_scanner() {
+        let pool = test_pool().await;
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), HashMap::new())
+            .await
+            .unwrap();
+
+        let acl = SecretAcl {
+            secret_id: "revoked-secret".into(),
+            kind: SecretKind::Credential,
+            allowed_agents: vec!["browser".into()],
+            allowed_skills: vec![],
+            allowed_mcp_servers: vec![],
+            injection_modes: vec![],
+            expires_at: None,
+        };
+        broker
+            .store("revoked-secret", "revoked-secret-value-123", acl)
+            .await
+            .unwrap();
+        broker.revoke("revoked-secret").await.unwrap();
+
+        let scanner = broker.scanner();
+        let found = scanner.load().scan("revoked-secret-value-123");
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn composite_broker_pass_secret_honors_allowed_skills() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "pass-secret".into(),
+            SecretEntryConfig {
+                kind: SecretKind::Credential,
+                source: Some("pass://Work/Test/password".into()),
+                allowed_agents: vec!["browser".into()],
+                allowed_skills: vec!["allowed-tool".into()],
+                allowed_mcp_servers: vec![],
+                allowed_injection_modes: vec![],
+                totp_policy: None,
+                totp_digits: None,
+                totp_period: None,
+                totp_algorithm: None,
+                ttl: None,
+                rotation_metadata: None,
+            },
+        );
+
+        let pool = test_pool().await;
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), entries)
+            .await
+            .unwrap();
+
+        let ctx = test_ctx_with_caps("browser", vec!["pass-secret"], vec![]);
+        let usage = SecretUsage {
+            tool_id: "forbidden-tool".into(),
+            purpose: "test".into(),
+        };
+        let err = broker
+            .resolve_handle_for_tool(&ctx, "pass-secret".into(), usage)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
+        ));
     }
 
     #[tokio::test]
