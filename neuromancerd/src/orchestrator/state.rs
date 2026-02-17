@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
+use neuromancer_core::agent::SubAgentReport;
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{DelegatedRun, OrchestratorToolInvocation};
@@ -11,6 +12,7 @@ use neuromancer_core::trigger::TriggerType;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::orchestrator::actions::dispatch::is_self_improvement_tool;
+use crate::orchestrator::collaboration::remediation::{self, RemediationContext};
 use crate::orchestrator::proposals::lifecycle::{new_proposal, transition};
 use crate::orchestrator::proposals::model::{
     ChangeProposal, ChangeProposalKind, ProposalState, SkillQualityStats,
@@ -21,7 +23,9 @@ use crate::orchestrator::security::audit::{
 };
 use crate::orchestrator::security::execution_guard::ExecutionGuard;
 use crate::orchestrator::tools::default_system0_tools;
-use crate::orchestrator::tracing::thread_journal::{ThreadJournal, now_rfc3339};
+use crate::orchestrator::tracing::thread_journal::{
+    ThreadJournal, now_rfc3339, subagent_report_task_id, subagent_report_type,
+};
 
 pub(crate) const SYSTEM0_AGENT_ID: &str = "system0";
 
@@ -38,6 +42,24 @@ pub(crate) struct SubAgentThreadState {
     pub(crate) active: bool,
     pub(crate) updated_at: String,
     pub(crate) persisted_message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveRunContext {
+    pub(crate) run_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) call_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunReportSnapshot {
+    pub(crate) report_type: String,
+    pub(crate) report: serde_json::Value,
+    pub(crate) recommended_action: Option<String>,
+    pub(crate) recommended_reason: Option<String>,
+    pub(crate) recommended_remediation: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -61,6 +83,9 @@ pub(crate) struct System0BrokerInner {
     pub(crate) runs_index: HashMap<String, DelegatedRun>,
     pub(crate) runs_order: Vec<String>,
     pub(crate) running_agents: HashMap<String, String>,
+    pub(crate) active_runs_by_run_id: HashMap<String, ActiveRunContext>,
+    pub(crate) report_counts_by_run_and_type: HashMap<(String, String), usize>,
+    pub(crate) last_report_by_run: HashMap<String, RunReportSnapshot>,
     pub(crate) thread_states: HashMap<String, SubAgentThreadState>,
     pub(crate) thread_id_by_agent: HashMap<String, String>,
     pub(crate) proposals_index: HashMap<String, ChangeProposal>,
@@ -108,6 +133,9 @@ impl System0ToolBroker {
                 runs_index: HashMap::new(),
                 runs_order: Vec::new(),
                 running_agents: HashMap::new(),
+                active_runs_by_run_id: HashMap::new(),
+                report_counts_by_run_and_type: HashMap::new(),
+                last_report_by_run: HashMap::new(),
                 thread_states: HashMap::new(),
                 thread_id_by_agent: HashMap::new(),
                 proposals_index: HashMap::new(),
@@ -161,6 +189,18 @@ impl System0ToolBroker {
         inner.runs_index.get(run_id).cloned()
     }
 
+    pub(crate) async fn register_active_run(&self, context: ActiveRunContext) {
+        let mut inner = self.inner.lock().await;
+        inner
+            .active_runs_by_run_id
+            .insert(context.run_id.clone(), context);
+    }
+
+    pub(crate) async fn last_report_for_run(&self, run_id: &str) -> Option<RunReportSnapshot> {
+        let inner = self.inner.lock().await;
+        inner.last_report_by_run.get(run_id).cloned()
+    }
+
     pub(crate) async fn session_store(&self) -> InMemorySessionStore {
         let inner = self.inner.lock().await;
         inner.session_store.clone()
@@ -212,6 +252,370 @@ impl System0ToolBroker {
             state.active = true;
             state.updated_at = now_rfc3339();
             state.persisted_message_count = persisted_message_count;
+        }
+    }
+
+    pub(crate) async fn ingest_subagent_report(
+        &self,
+        report: SubAgentReport,
+    ) -> Result<(), crate::orchestrator::error::OrchestratorRuntimeError> {
+        let run_id = subagent_report_task_id(&report);
+        let report_type = subagent_report_type(&report).to_string();
+        let report_value = serde_json::to_value(&report).map_err(|err| {
+            crate::orchestrator::error::OrchestratorRuntimeError::Internal(err.to_string())
+        })?;
+
+        let (
+            run_context,
+            recommendation_name,
+            recommendation_reason,
+            recommendation_value,
+            recommendation_action_payload,
+            thread_journal,
+        ) = {
+            let mut inner = self.inner.lock().await;
+            let context = inner
+                .active_runs_by_run_id
+                .get(&run_id)
+                .cloned()
+                .or_else(|| {
+                    inner.runs_index.get(&run_id).and_then(|run| {
+                        run.thread_id.clone().map(|thread_id| ActiveRunContext {
+                            run_id: run.run_id.clone(),
+                            agent_id: run.agent_id.clone(),
+                            thread_id,
+                            turn_id: None,
+                            call_id: None,
+                        })
+                    })
+                });
+
+            let report_count = {
+                let count = inner
+                    .report_counts_by_run_and_type
+                    .entry((run_id.clone(), report_type.clone()))
+                    .or_insert(0);
+                *count += 1;
+                *count
+            };
+
+            let recommendation = context.as_ref().and_then(|ctx| {
+                let mut available_agents = inner.subagents.keys().cloned().collect::<Vec<_>>();
+                available_agents.sort();
+                remediation::recommend(
+                    &report,
+                    &RemediationContext {
+                        report_repeat_count: report_count,
+                        current_agent_id: ctx.agent_id.clone(),
+                        available_agent_ids: available_agents,
+                    },
+                )
+            });
+
+            let recommendation_name = recommendation.as_ref().map(|r| r.action_name.clone());
+            let recommendation_reason = recommendation.as_ref().map(|r| r.reason.clone());
+            let recommendation_value = recommendation
+                .as_ref()
+                .and_then(|r| serde_json::to_value(&r.action).ok());
+            let recommendation_action_payload = recommendation.as_ref().map(|r| {
+                serde_json::to_value(&r.action)
+                    .unwrap_or_else(|_| serde_json::json!({ "error": "serialization_failed" }))
+            });
+
+            inner.last_report_by_run.insert(
+                run_id.clone(),
+                RunReportSnapshot {
+                    report_type: report_type.clone(),
+                    report: report_value.clone(),
+                    recommended_action: recommendation_name.clone(),
+                    recommended_reason: recommendation_reason.clone(),
+                    recommended_remediation: recommendation_value.clone(),
+                },
+            );
+
+            Self::apply_report_to_run_locked(&mut inner, &run_id, &report, context.as_ref());
+
+            if matches!(
+                report,
+                SubAgentReport::Completed { .. }
+                    | SubAgentReport::Failed { .. }
+                    | SubAgentReport::Stuck { .. }
+            ) {
+                inner.active_runs_by_run_id.remove(&run_id);
+            }
+
+            (
+                context,
+                recommendation_name,
+                recommendation_reason,
+                recommendation_value,
+                recommendation_action_payload,
+                inner.thread_journal.clone(),
+            )
+        };
+
+        tracing::info!(
+            run_id = %run_id,
+            report_type = %report_type,
+            recommended_action = recommendation_name.as_deref().unwrap_or("none"),
+            "subagent.report.received"
+        );
+
+        let source_thread_id = run_context
+            .as_ref()
+            .map(|ctx| ctx.thread_id.clone())
+            .unwrap_or_else(|| SYSTEM0_AGENT_ID.to_string());
+        let source_agent_id = run_context
+            .as_ref()
+            .map(|ctx| ctx.agent_id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let source_turn_id = run_context.as_ref().and_then(|ctx| ctx.turn_id.clone());
+        let source_call_id = run_context.as_ref().and_then(|ctx| ctx.call_id.clone());
+
+        let subagent_report_payload = serde_json::json!({
+            "report_type": report_type,
+            "report": report_value,
+            "source_thread_id": source_thread_id,
+            "source_agent_id": source_agent_id,
+        });
+        let system_report_payload = subagent_report_payload.clone();
+
+        if let Some(ctx) = run_context.as_ref() {
+            thread_journal
+                .append_event(neuromancer_core::rpc::ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: ctx.thread_id.clone(),
+                    thread_kind: "subagent".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "subagent_report".to_string(),
+                    agent_id: Some(ctx.agent_id.clone()),
+                    run_id: Some(run_id.clone()),
+                    payload: subagent_report_payload,
+                    redaction_applied: false,
+                    turn_id: source_turn_id.clone(),
+                    parent_event_id: None,
+                    call_id: source_call_id.clone(),
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
+                })
+                .await?;
+        }
+
+        thread_journal
+            .append_event(neuromancer_core::rpc::ThreadEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: SYSTEM0_AGENT_ID.to_string(),
+                thread_kind: "system".to_string(),
+                seq: 0,
+                ts: now_rfc3339(),
+                event_type: "subagent_report".to_string(),
+                agent_id: Some(source_agent_id.clone()),
+                run_id: Some(run_id.clone()),
+                payload: system_report_payload,
+                redaction_applied: false,
+                turn_id: source_turn_id.clone(),
+                parent_event_id: None,
+                call_id: source_call_id.clone(),
+                attempt: None,
+                duration_ms: None,
+                meta: None,
+            })
+            .await?;
+
+        if let (Some(action), Some(reason), Some(action_payload)) = (
+            recommendation_name.as_deref(),
+            recommendation_reason.as_deref(),
+            recommendation_action_payload.as_ref(),
+        ) {
+            tracing::info!(
+                run_id = %run_id,
+                report_type = %subagent_report_type(&report),
+                recommended_action = %action,
+                "remediation.action"
+            );
+            let remediation_payload = serde_json::json!({
+                "source_report_type": subagent_report_type(&report),
+                "action": action,
+                "action_payload": action_payload,
+                "reason": reason,
+                "run_id": run_id,
+                "agent_id": source_agent_id,
+                "recommended_remediation": recommendation_value,
+            });
+
+            if let Some(ctx) = run_context.as_ref() {
+                thread_journal
+                    .append_event(neuromancer_core::rpc::ThreadEvent {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        thread_id: ctx.thread_id.clone(),
+                        thread_kind: "subagent".to_string(),
+                        seq: 0,
+                        ts: now_rfc3339(),
+                        event_type: "remediation_action".to_string(),
+                        agent_id: Some(ctx.agent_id.clone()),
+                        run_id: Some(run_id.clone()),
+                        payload: remediation_payload.clone(),
+                        redaction_applied: false,
+                        turn_id: source_turn_id.clone(),
+                        parent_event_id: None,
+                        call_id: source_call_id.clone(),
+                        attempt: None,
+                        duration_ms: None,
+                        meta: None,
+                    })
+                    .await?;
+            }
+
+            thread_journal
+                .append_event(neuromancer_core::rpc::ThreadEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    thread_id: SYSTEM0_AGENT_ID.to_string(),
+                    thread_kind: "system".to_string(),
+                    seq: 0,
+                    ts: now_rfc3339(),
+                    event_type: "remediation_action".to_string(),
+                    agent_id: Some(source_agent_id),
+                    run_id: Some(run_id),
+                    payload: remediation_payload,
+                    redaction_applied: false,
+                    turn_id: source_turn_id,
+                    parent_event_id: None,
+                    call_id: source_call_id,
+                    attempt: None,
+                    duration_ms: None,
+                    meta: None,
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_report_to_run_locked(
+        inner: &mut System0BrokerInner,
+        run_id: &str,
+        report: &SubAgentReport,
+        context: Option<&ActiveRunContext>,
+    ) {
+        if let Some(run) = inner.runs_index.get_mut(run_id) {
+            match report {
+                SubAgentReport::Progress { description, .. } => {
+                    run.state = "running".to_string();
+                    run.summary = Some(description.clone());
+                }
+                SubAgentReport::InputRequired { question, .. } => {
+                    run.state = "input_required".to_string();
+                    run.summary = Some(question.clone());
+                    run.error = None;
+                }
+                SubAgentReport::ToolFailure {
+                    tool_id,
+                    error,
+                    retry_eligible,
+                    attempted_count,
+                    ..
+                } => {
+                    if *retry_eligible {
+                        run.state = "running".to_string();
+                    } else {
+                        run.state = "failed".to_string();
+                    }
+                    run.summary = Some(format!(
+                        "tool failure ({tool_id}) attempt={attempted_count}: {error}"
+                    ));
+                    run.error = if *retry_eligible {
+                        None
+                    } else {
+                        Some(error.clone())
+                    };
+                }
+                SubAgentReport::PolicyDenied {
+                    action,
+                    policy_code,
+                    capability_needed,
+                    ..
+                } => {
+                    run.state = "failed".to_string();
+                    run.summary = Some(format!(
+                        "policy denied action='{action}' capability='{capability_needed}'"
+                    ));
+                    run.error = Some(format!("{policy_code}: {capability_needed}"));
+                }
+                SubAgentReport::Stuck { reason, .. } => {
+                    run.state = "failed".to_string();
+                    run.summary = Some(reason.clone());
+                    run.error = Some(reason.clone());
+                }
+                SubAgentReport::Completed { summary, .. } => {
+                    run.state = "completed".to_string();
+                    run.summary = Some(summary.clone());
+                    run.error = None;
+                }
+                SubAgentReport::Failed { error, .. } => {
+                    run.state = "failed".to_string();
+                    run.summary = Some(error.clone());
+                    run.error = Some(error.clone());
+                }
+            }
+        }
+
+        let thread_id = context
+            .map(|ctx| ctx.thread_id.as_str())
+            .or_else(|| {
+                inner
+                    .runs_index
+                    .get(run_id)
+                    .and_then(|run| run.thread_id.as_deref())
+            })
+            .map(ToString::to_string);
+
+        if let Some(thread_id) = thread_id
+            && let Some(state) = inner.thread_states.get_mut(&thread_id)
+        {
+            match report {
+                SubAgentReport::Progress { description, .. } => {
+                    state.state = "running".to_string();
+                    state.summary = Some(description.clone());
+                }
+                SubAgentReport::InputRequired { question, .. } => {
+                    state.state = "input_required".to_string();
+                    state.summary = Some(question.clone());
+                }
+                SubAgentReport::ToolFailure {
+                    tool_id,
+                    error,
+                    retry_eligible,
+                    ..
+                } => {
+                    state.state = if *retry_eligible {
+                        "running".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    state.summary = Some(format!("tool '{tool_id}' failed: {error}"));
+                }
+                SubAgentReport::PolicyDenied {
+                    capability_needed, ..
+                } => {
+                    state.state = "failed".to_string();
+                    state.summary = Some(format!("policy denied: {capability_needed}"));
+                }
+                SubAgentReport::Stuck { reason, .. } => {
+                    state.state = "failed".to_string();
+                    state.summary = Some(reason.clone());
+                }
+                SubAgentReport::Completed { summary, .. } => {
+                    state.state = "completed".to_string();
+                    state.summary = Some(summary.clone());
+                }
+                SubAgentReport::Failed { error, .. } => {
+                    state.state = "failed".to_string();
+                    state.summary = Some(error.clone());
+                }
+            }
+            state.updated_at = now_rfc3339();
         }
     }
 

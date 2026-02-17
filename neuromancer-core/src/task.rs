@@ -29,9 +29,23 @@ impl Task {
         instruction: String,
         assigned_agent: AgentId,
     ) -> Self {
+        Self::new_with_id(
+            TaskId::new_v4(),
+            trigger_source,
+            instruction,
+            assigned_agent,
+        )
+    }
+
+    pub fn new_with_id(
+        id: TaskId,
+        trigger_source: TriggerSource,
+        instruction: String,
+        assigned_agent: AgentId,
+    ) -> Self {
         let now = Utc::now();
         Self {
-            id: TaskId::new_v4(),
+            id,
             parent_id: None,
             trigger_source,
             instruction,

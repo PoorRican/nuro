@@ -12,8 +12,8 @@ use clap::Parser;
 use chat::run_orchestrator_chat;
 use cli::{
     Cli, Command, ConfigCommand, DaemonCommand, E2eCommand, OrchestratorCommand,
-    OrchestratorEventsCommand, OrchestratorRunsCommand, OrchestratorStatsCommand,
-    OrchestratorSubagentCommand, OrchestratorThreadsCommand, RpcCommand,
+    OrchestratorEventsCommand, OrchestratorReportsCommand, OrchestratorRunsCommand,
+    OrchestratorStatsCommand, OrchestratorSubagentCommand, OrchestratorThreadsCommand, RpcCommand,
 };
 use daemon::{
     DaemonRestartOptions, DaemonStartOptions, DaemonStopOptions, daemon_status, restart_daemon,
@@ -22,9 +22,9 @@ use daemon::{
 use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{
-    OrchestratorEventsQueryParams, OrchestratorRunDiagnoseParams, OrchestratorRunGetParams,
-    OrchestratorSubagentTurnParams, OrchestratorThreadGetParams, OrchestratorThreadResurrectParams,
-    OrchestratorTurnParams,
+    OrchestratorEventsQueryParams, OrchestratorReportsQueryParams, OrchestratorRunDiagnoseParams,
+    OrchestratorRunGetParams, OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
+    OrchestratorThreadResurrectParams, OrchestratorTurnParams,
 };
 use rpc_client::RpcClient;
 
@@ -243,6 +243,22 @@ async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
                                 tool_id: args.tool_id,
                                 event_type: args.event_type,
                                 error_contains: args.error_contains,
+                                offset: args.offset,
+                                limit: args.limit,
+                            })
+                            .await?;
+                        Ok(RunOutcome::Payload(serde_json::json!(response)))
+                    }
+                },
+                OrchestratorCommand::Reports { command } => match command {
+                    OrchestratorReportsCommand::Query(args) => {
+                        let response = rpc
+                            .orchestrator_reports_query(OrchestratorReportsQueryParams {
+                                thread_id: args.thread_id,
+                                run_id: args.run_id,
+                                agent_id: args.agent_id,
+                                report_type: args.report_type,
+                                include_remediation: args.include_remediation,
                                 offset: args.offset,
                                 limit: args.limit,
                             })

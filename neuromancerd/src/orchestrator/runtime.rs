@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
+    OrchestratorReportRecord, OrchestratorReportsQueryParams, OrchestratorReportsQueryResult,
     OrchestratorRunDiagnoseResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnResult,
     OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadMessage,
     OrchestratorThreadResurrectResult, OrchestratorTurnResult, ThreadEvent, ThreadSummary,
@@ -26,7 +27,9 @@ use crate::orchestrator::llm_clients::{build_llm_client, resolve_tool_call_retry
 use crate::orchestrator::prompt::{load_system_prompt_file, render_orchestrator_prompt};
 use crate::orchestrator::security::execution_guard::{ExecutionGuard, PlaceholderExecutionGuard};
 use crate::orchestrator::skills::SkillToolBroker;
-use crate::orchestrator::state::{SYSTEM0_AGENT_ID, SubAgentThreadState, System0ToolBroker};
+use crate::orchestrator::state::{
+    ActiveRunContext, SYSTEM0_AGENT_ID, SubAgentThreadState, System0ToolBroker,
+};
 use crate::orchestrator::tools::effective_system0_tool_allowlist;
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message, reconstruct_subagent_conversation,
@@ -35,13 +38,12 @@ use crate::orchestrator::tracing::conversation_projection::{
 use crate::orchestrator::tracing::event_query::{
     event_error_text, event_matches_query, event_tool_id,
 };
-use crate::orchestrator::tracing::thread_journal::{
-    ThreadJournal, now_rfc3339, subagent_report_task_id, subagent_report_type,
-};
+use crate::orchestrator::tracing::thread_journal::{ThreadJournal, now_rfc3339};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_THREAD_PAGE_LIMIT: usize = 100;
 const DEFAULT_EVENTS_QUERY_LIMIT: usize = 200;
+const DEFAULT_REPORTS_QUERY_LIMIT: usize = 200;
 
 pub struct OrchestratorRuntime {
     turn_tx: mpsc::Sender<TurnRequest>,
@@ -285,36 +287,6 @@ impl OrchestratorRuntime {
         }
 
         let (report_tx, mut report_rx) = mpsc::channel(256);
-        let report_thread_journal = thread_journal.clone();
-        let report_worker = tokio::spawn(async move {
-            while let Some(report) = report_rx.recv().await {
-                let event = ThreadEvent {
-                    event_id: uuid::Uuid::new_v4().to_string(),
-                    thread_id: SYSTEM0_AGENT_ID.to_string(),
-                    thread_kind: "system".to_string(),
-                    seq: 0,
-                    ts: now_rfc3339(),
-                    event_type: "subagent_report".to_string(),
-                    agent_id: None,
-                    run_id: Some(subagent_report_task_id(&report)),
-                    payload: serde_json::json!({
-                        "report_type": subagent_report_type(&report),
-                        "report": report,
-                    }),
-                    redaction_applied: false,
-                    turn_id: None,
-                    parent_event_id: None,
-                    call_id: None,
-                    attempt: None,
-                    duration_ms: None,
-                    meta: None,
-                };
-
-                if let Err(err) = report_thread_journal.append_event(event).await {
-                    tracing::error!(error = ?err, "thread_journal_report_write_failed");
-                }
-            }
-        });
         let session_store = InMemorySessionStore::new();
         let session_id = uuid::Uuid::new_v4();
 
@@ -366,6 +338,14 @@ impl OrchestratorRuntime {
             execution_guard.clone(),
         );
         let runtime_broker = system0_broker.clone();
+        let report_broker = runtime_broker.clone();
+        let report_worker = tokio::spawn(async move {
+            while let Some(report) = report_rx.recv().await {
+                if let Err(err) = report_broker.ingest_subagent_report(report).await {
+                    tracing::error!(error = ?err, "subagent_report_ingest_failed");
+                }
+            }
+        });
 
         let orchestrator_prompt_path = resolve_path(
             config.orchestrator.system_prompt_path.as_deref(),
@@ -716,18 +696,26 @@ impl OrchestratorRuntime {
                 OrchestratorRuntimeError::ResourceNotFound(format!("agent '{}'", state.agent_id))
             })?;
         let session_store = self.system0_broker.session_store().await;
+        let run_uuid = uuid::Uuid::new_v4();
+        let run_id = run_uuid.to_string();
+        self.system0_broker
+            .register_active_run(ActiveRunContext {
+                run_id: run_id.clone(),
+                agent_id: state.agent_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                call_id: None,
+            })
+            .await;
         let run_result = runtime
-            .execute_turn(
+            .execute_turn_with_task_id(
                 &session_store,
                 state.session_id,
                 TriggerSource::Internal,
                 message.clone(),
+                run_uuid,
             )
             .await;
-        let run_id = run_result
-            .as_ref()
-            .map(|run| run.task_id.to_string())
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let (run_state, response, error) = match run_result {
             Ok(run) => (
                 "completed".to_string(),
@@ -872,6 +860,161 @@ impl OrchestratorRuntime {
         })
     }
 
+    pub async fn orchestrator_reports_query(
+        &self,
+        params: OrchestratorReportsQueryParams,
+    ) -> Result<OrchestratorReportsQueryResult, OrchestratorRuntimeError> {
+        let offset = params.offset.unwrap_or(0);
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_REPORTS_QUERY_LIMIT)
+            .clamp(1, 1000);
+        let include_remediation = params.include_remediation.unwrap_or(true);
+        let report_type_filter = params
+            .report_type
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase());
+
+        let events = self.thread_journal.read_all_thread_events()?;
+
+        let mut remediation_by_key =
+            HashMap::<(String, Option<String>, String), serde_json::Value>::new();
+        if include_remediation {
+            for event in &events {
+                if event.event_type != "remediation_action" {
+                    continue;
+                }
+                let Some(source_report_type) = event
+                    .payload
+                    .get("source_report_type")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+
+                remediation_by_key.insert(
+                    (
+                        event.thread_id.clone(),
+                        event.run_id.clone(),
+                        source_report_type.to_ascii_lowercase(),
+                    ),
+                    event.payload.clone(),
+                );
+            }
+        }
+
+        let mut reports = Vec::<OrchestratorReportRecord>::new();
+        for event in events {
+            if event.event_type != "subagent_report" {
+                continue;
+            }
+
+            if let Some(thread_id) = params.thread_id.as_deref()
+                && event.thread_id != thread_id
+            {
+                continue;
+            }
+
+            if let Some(run_id) = params.run_id.as_deref()
+                && event.run_id.as_deref() != Some(run_id)
+            {
+                continue;
+            }
+
+            let source_agent_id = event
+                .payload
+                .get("source_agent_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            if let Some(agent_id) = params.agent_id.as_deref()
+                && event.agent_id.as_deref() != Some(agent_id)
+                && source_agent_id.as_deref() != Some(agent_id)
+            {
+                continue;
+            }
+
+            let report_type = event
+                .payload
+                .get("report_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_ascii_lowercase();
+            if let Some(filter) = report_type_filter.as_deref()
+                && report_type != filter
+            {
+                continue;
+            }
+
+            let source_thread_id = event
+                .payload
+                .get("source_thread_id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            let report = event
+                .payload
+                .get("report")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let remediation_action = if include_remediation {
+                remediation_by_key
+                    .get(&(
+                        event.thread_id.clone(),
+                        event.run_id.clone(),
+                        report_type.clone(),
+                    ))
+                    .cloned()
+                    .or_else(|| {
+                        remediation_by_key
+                            .iter()
+                            .find_map(|((_, run_id, kind), payload)| {
+                                if *run_id == event.run_id && *kind == report_type {
+                                    Some(payload.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+            } else {
+                None
+            };
+
+            reports.push(OrchestratorReportRecord {
+                event_id: event.event_id,
+                ts: event.ts,
+                thread_id: event.thread_id,
+                run_id: event.run_id,
+                agent_id: event.agent_id,
+                source_thread_id,
+                source_agent_id,
+                report_type,
+                report,
+                remediation_action,
+            });
+        }
+
+        reports.sort_by(|a, b| {
+            if a.ts == b.ts {
+                a.event_id.cmp(&b.event_id)
+            } else {
+                a.ts.cmp(&b.ts)
+            }
+        });
+
+        let total = reports.len();
+        let reports = reports
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        Ok(OrchestratorReportsQueryResult {
+            reports,
+            total,
+            offset,
+            limit,
+        })
+    }
+
     pub async fn orchestrator_run_diagnose(
         &self,
         run_id: String,
@@ -914,13 +1057,66 @@ impl OrchestratorRuntime {
             None
         };
 
-        let inferred_failure_cause = events.iter().rev().find_map(event_error_text);
+        let snapshot = self.system0_broker.last_report_for_run(&run_id).await;
+        let latest_report_type = snapshot
+            .as_ref()
+            .map(|value| value.report_type.clone())
+            .or_else(|| {
+                events.iter().rev().find_map(|event| {
+                    if event.event_type != "subagent_report" {
+                        return None;
+                    }
+                    event
+                        .payload
+                        .get("report_type")
+                        .and_then(|value| value.as_str())
+                        .map(ToString::to_string)
+                })
+            });
+        let latest_report = snapshot
+            .as_ref()
+            .map(|value| value.report.clone())
+            .or_else(|| {
+                events.iter().rev().find_map(|event| {
+                    if event.event_type != "subagent_report" {
+                        return None;
+                    }
+                    event.payload.get("report").cloned()
+                })
+            });
+        let recommended_remediation = snapshot
+            .as_ref()
+            .and_then(|value| value.recommended_remediation.clone())
+            .or_else(|| {
+                events.iter().rev().find_map(|event| {
+                    if event.event_type != "remediation_action" {
+                        return None;
+                    }
+                    event
+                        .payload
+                        .get("recommended_remediation")
+                        .cloned()
+                        .or_else(|| event.payload.get("action_payload").cloned())
+                })
+            });
+
+        let inferred_failure_cause = latest_report_type
+            .as_deref()
+            .and_then(|report_type| {
+                latest_report
+                    .as_ref()
+                    .and_then(|report| infer_failure_from_subagent_report(report_type, report))
+            })
+            .or_else(|| events.iter().rev().find_map(event_error_text));
 
         Ok(OrchestratorRunDiagnoseResult {
             run,
             thread,
             events,
             inferred_failure_cause,
+            latest_report_type,
+            latest_report,
+            recommended_remediation,
         })
     }
 
@@ -934,6 +1130,8 @@ impl OrchestratorRuntime {
         let mut event_counts = BTreeMap::<String, usize>::new();
         let mut tool_counts = BTreeMap::<String, usize>::new();
         let mut agent_counts = BTreeMap::<String, usize>::new();
+        let mut subagent_report_counts = BTreeMap::<String, usize>::new();
+        let mut remediation_action_counts = BTreeMap::<String, usize>::new();
         for event in &events {
             *event_counts.entry(event.event_type.clone()).or_default() += 1;
             if let Some(tool_id) = event_tool_id(event) {
@@ -941,6 +1139,23 @@ impl OrchestratorRuntime {
             }
             if let Some(agent_id) = event.agent_id.clone() {
                 *agent_counts.entry(agent_id).or_default() += 1;
+            }
+            if event.event_type == "subagent_report"
+                && let Some(report_type) = event
+                    .payload
+                    .get("report_type")
+                    .and_then(|value| value.as_str())
+            {
+                *subagent_report_counts
+                    .entry(report_type.to_ascii_lowercase())
+                    .or_default() += 1;
+            }
+            if event.event_type == "remediation_action"
+                && let Some(action) = event.payload.get("action").and_then(|value| value.as_str())
+            {
+                *remediation_action_counts
+                    .entry(action.to_ascii_lowercase())
+                    .or_default() += 1;
             }
         }
 
@@ -957,6 +1172,8 @@ impl OrchestratorRuntime {
             event_counts,
             tool_counts,
             agent_counts,
+            subagent_report_counts,
+            remediation_action_counts,
         })
     }
 }
@@ -986,6 +1203,49 @@ impl ToolBroker for System0ToolBroker {
         }
 
         dispatch_tool(self, call).await
+    }
+}
+
+fn infer_failure_from_subagent_report(
+    report_type: &str,
+    report: &serde_json::Value,
+) -> Option<String> {
+    match report_type {
+        "stuck" => report
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|value| format!("sub-agent stuck: {value}")),
+        "tool_failure" => {
+            let tool_id = report.get("tool_id").and_then(|value| value.as_str());
+            let error = report.get("error").and_then(|value| value.as_str());
+            match (tool_id, error) {
+                (Some(tool), Some(error)) => Some(format!("tool failure ({tool}): {error}")),
+                (None, Some(error)) => Some(error.to_string()),
+                _ => None,
+            }
+        }
+        "policy_denied" => {
+            let code = report.get("policy_code").and_then(|value| value.as_str());
+            let capability = report
+                .get("capability_needed")
+                .and_then(|value| value.as_str());
+            match (code, capability) {
+                (Some(code), Some(capability)) => {
+                    Some(format!("policy denied ({code}): {capability}"))
+                }
+                (_, Some(capability)) => Some(format!("policy denied: {capability}")),
+                _ => None,
+            }
+        }
+        "input_required" => report
+            .get("question")
+            .and_then(|value| value.as_str())
+            .map(|value| format!("input required: {value}")),
+        "failed" => report
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        _ => None,
     }
 }
 

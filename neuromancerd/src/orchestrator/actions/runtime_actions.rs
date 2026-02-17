@@ -2,9 +2,11 @@ use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{DelegatedRun, ThreadEvent, ThreadSummary};
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::TriggerSource;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::orchestrator::state::{SubAgentThreadState, System0ToolBroker};
+use crate::orchestrator::state::{
+    ActiveRunContext, RunReportSnapshot, SubAgentThreadState, System0ToolBroker,
+};
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message,
 };
@@ -80,7 +82,8 @@ impl System0ToolBroker {
                     return Err(err);
                 };
 
-                let run_id = uuid::Uuid::new_v4().to_string();
+                let run_uuid = uuid::Uuid::new_v4();
+                let run_id = run_uuid.to_string();
                 let now = now_rfc3339();
                 let thread_id = inner
                     .thread_id_by_agent
@@ -151,6 +154,16 @@ impl System0ToolBroker {
                 if !inner.runs_order.iter().any(|id| id == &run_id) {
                     inner.runs_order.push(run_id.clone());
                 }
+                inner.active_runs_by_run_id.insert(
+                    run_id.clone(),
+                    ActiveRunContext {
+                        run_id: run_id.clone(),
+                        agent_id: agent_id.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: Some(turn_id.to_string()),
+                        call_id: Some(call.id.clone()),
+                    },
+                );
 
                 let session_store = inner.session_store.clone();
                 let thread_journal = inner.thread_journal.clone();
@@ -250,11 +263,12 @@ impl System0ToolBroker {
                 );
 
                 let result = runtime
-                    .execute_turn(
+                    .execute_turn_with_task_id(
                         &session_store,
                         session_id,
                         TriggerSource::Internal,
                         instruction.clone(),
+                        run_uuid,
                     )
                     .await;
 
@@ -359,6 +373,12 @@ impl System0ToolBroker {
                     initial_instruction: initial_instruction.clone(),
                     error: error.clone(),
                 };
+                let remediation_snapshot = if run_state == "failed" {
+                    self.await_report_snapshot_for_run(&run_id, Duration::from_millis(400))
+                        .await
+                } else {
+                    None
+                };
 
                 let mut thread_summary = None::<ThreadSummary>;
                 let mut inner = self.inner.lock().await;
@@ -395,11 +415,13 @@ impl System0ToolBroker {
                 }
 
                 let tool_output = if run_state == "failed" {
-                    ToolOutput::Error(
-                        error
+                    ToolOutput::Error(build_delegate_error_text(
+                        run.error
                             .clone()
                             .unwrap_or_else(|| "delegation failed".to_string()),
-                    )
+                        &run_id,
+                        remediation_snapshot.as_ref(),
+                    ))
                 } else {
                     ToolOutput::Success(serde_json::json!({
                         "run_id": run.run_id,
@@ -479,4 +501,55 @@ impl System0ToolBroker {
             }
         }
     }
+
+    async fn await_report_snapshot_for_run(
+        &self,
+        run_id: &str,
+        timeout: Duration,
+    ) -> Option<RunReportSnapshot> {
+        let started = Instant::now();
+        let poll_interval = Duration::from_millis(40);
+
+        loop {
+            if let Some(snapshot) = self.last_report_for_run(run_id).await {
+                return Some(snapshot);
+            }
+            if started.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+fn build_delegate_error_text(
+    base_error: String,
+    run_id: &str,
+    snapshot: Option<&RunReportSnapshot>,
+) -> String {
+    let report_type = snapshot.map(|value| value.report_type.clone());
+    let primary_reason = snapshot
+        .and_then(|value| extract_report_reason(&value.report))
+        .or_else(|| snapshot.and_then(|value| value.recommended_reason.clone()))
+        .unwrap_or_else(|| base_error.clone());
+    let recommended_action = snapshot.and_then(|value| value.recommended_action.clone());
+    let context = serde_json::json!({
+        "run_id": run_id,
+        "report_type": report_type,
+        "primary_reason": primary_reason,
+        "recommended_action": recommended_action,
+        "recommended_remediation": snapshot.and_then(|value| value.recommended_remediation.clone()),
+    });
+    format!("{base_error} | remediation_context={context}")
+}
+
+fn extract_report_reason(report: &serde_json::Value) -> Option<String> {
+    for key in ["reason", "error", "question", "description", "summary"] {
+        if let Some(value) = report.get(key).and_then(|value| value.as_str())
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }

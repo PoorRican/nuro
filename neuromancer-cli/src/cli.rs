@@ -170,6 +170,10 @@ pub enum OrchestratorCommand {
         #[command(subcommand)]
         command: OrchestratorEventsCommand,
     },
+    Reports {
+        #[command(subcommand)]
+        command: OrchestratorReportsCommand,
+    },
     Stats {
         #[command(subcommand)]
         command: OrchestratorStatsCommand,
@@ -194,6 +198,11 @@ pub enum OrchestratorRunsCommand {
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorEventsCommand {
     Query(OrchestratorEventsQueryArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorReportsCommand {
+    Query(OrchestratorReportsQueryArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -253,6 +262,30 @@ pub struct OrchestratorEventsQueryArgs {
 
     #[arg(long)]
     pub error_contains: Option<String>,
+
+    #[arg(long)]
+    pub offset: Option<usize>,
+
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorReportsQueryArgs {
+    #[arg(long)]
+    pub thread_id: Option<String>,
+
+    #[arg(long)]
+    pub run_id: Option<String>,
+
+    #[arg(long)]
+    pub agent_id: Option<String>,
+
+    #[arg(long)]
+    pub report_type: Option<String>,
+
+    #[arg(long)]
+    pub include_remediation: Option<bool>,
 
     #[arg(long)]
     pub offset: Option<usize>,
@@ -495,6 +528,36 @@ mod tests {
                     assert_eq!(args.thread_id.as_deref(), Some("thread-1"));
                     assert_eq!(args.tool_id.as_deref(), Some("delegate_to_agent"));
                     assert_eq!(args.limit, Some(50));
+                }
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_reports_query_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "reports",
+            "query",
+            "--run-id",
+            "run-123",
+            "--report-type",
+            "stuck",
+            "--include-remediation",
+            "true",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Reports { command },
+            } => match command {
+                OrchestratorReportsCommand::Query(args) => {
+                    assert_eq!(args.run_id.as_deref(), Some("run-123"));
+                    assert_eq!(args.report_type.as_deref(), Some("stuck"));
+                    assert_eq!(args.include_remediation, Some(true));
                 }
             },
             other => panic!("unexpected command parsed: {other:?}"),
