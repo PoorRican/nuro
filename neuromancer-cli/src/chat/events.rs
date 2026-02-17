@@ -202,23 +202,50 @@ pub(super) fn timeline_items_from_events(
                     .get("report_type")
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
-                let summary = event
+                let report = event
                     .payload
                     .get("report")
-                    .and_then(|value| value.get("description"))
-                    .and_then(|value| value.as_str())
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("report")
-                            .and_then(|value| value.get("summary"))
-                            .and_then(|value| value.as_str())
-                    })
-                    .unwrap_or("report available");
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 items.push(TimelineItem::text(
                     MessageRoleTag::System,
-                    format!("SUB-AGENT REPORT [{report_type}] {summary}"),
+                    format!(
+                        "SUB-AGENT REPORT [{}] {}",
+                        report_type.to_ascii_uppercase(),
+                        summarize_subagent_report(report_type, &report)
+                    ),
                 ));
+            }
+            "remediation_action" => {
+                let source_report_type = event
+                    .payload
+                    .get("source_report_type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let action = event
+                    .payload
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let action_payload = event
+                    .payload
+                    .get("action_payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let mut message = format!(
+                    "REMEDIATION [{}] {}",
+                    source_report_type.to_ascii_uppercase(),
+                    summarize_remediation_action(action, &action_payload)
+                );
+                if !reason.is_empty() {
+                    message.push_str(&format!(" | reason: {reason}"));
+                }
+                items.push(TimelineItem::text(MessageRoleTag::System, message));
             }
             "error" => {
                 let error = event
@@ -267,6 +294,104 @@ pub(super) fn timeline_items_from_events(
     }
 
     items
+}
+
+fn summarize_subagent_report(report_type: &str, report: &serde_json::Value) -> String {
+    match report_type {
+        "stuck" => report
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|reason| format!("stuck reason: {reason}"))
+            .unwrap_or_else(|| "stuck report received".to_string()),
+        "tool_failure" => {
+            let tool_id = report.get("tool_id").and_then(|value| value.as_str());
+            let error = report.get("error").and_then(|value| value.as_str());
+            let attempts = report
+                .get("attempted_count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let retry_eligible = report
+                .get("retry_eligible")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            match (tool_id, error) {
+                (Some(tool_id), Some(error)) => format!(
+                    "tool failure: {tool_id} (attempt={attempts}, retry_eligible={retry_eligible}) {error}"
+                ),
+                (_, Some(error)) => format!("tool failure: {error}"),
+                _ => "tool failure report received".to_string(),
+            }
+        }
+        "policy_denied" => {
+            let capability = report
+                .get("capability_needed")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let policy = report
+                .get("policy_code")
+                .and_then(|value| value.as_str())
+                .unwrap_or("policy_denied");
+            format!("policy denied: {capability} ({policy})")
+        }
+        "failed" => report
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(|error| format!("failure: {error}"))
+            .unwrap_or_else(|| "failed report received".to_string()),
+        "input_required" => report
+            .get("question")
+            .and_then(|value| value.as_str())
+            .map(|question| format!("input required: {question}"))
+            .unwrap_or_else(|| "input required report received".to_string()),
+        "progress" => report
+            .get("description")
+            .and_then(|value| value.as_str())
+            .map(|description| format!("progress: {description}"))
+            .unwrap_or_else(|| "progress report received".to_string()),
+        "completed" => report
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .map(|summary| format!("completed: {summary}"))
+            .unwrap_or_else(|| "completed report received".to_string()),
+        _ => "report available".to_string(),
+    }
+}
+
+fn summarize_remediation_action(action: &str, payload: &serde_json::Value) -> String {
+    match action {
+        "retry" => {
+            let max_attempts = payload
+                .get("max_attempts")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let backoff_ms = payload
+                .get("backoff_ms")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            format!("retry (max_attempts={max_attempts}, backoff_ms={backoff_ms})")
+        }
+        "clarify" => payload
+            .get("additional_context")
+            .and_then(|value| value.as_str())
+            .map(|context| format!("clarify: {context}"))
+            .unwrap_or_else(|| "clarify".to_string()),
+        "reassign" => payload
+            .get("new_agent_id")
+            .and_then(|value| value.as_str())
+            .map(|agent_id| format!("reassign to {agent_id}"))
+            .unwrap_or_else(|| "reassign".to_string()),
+        "escalate_to_user" => payload
+            .get("question")
+            .and_then(|value| value.as_str())
+            .map(|question| format!("escalate to user: {question}"))
+            .unwrap_or_else(|| "escalate to user".to_string()),
+        "abort" => payload
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(|reason| format!("abort: {reason}"))
+            .unwrap_or_else(|| "abort".to_string()),
+        other => other.to_string(),
+    }
 }
 
 fn tool_item_from_parts(

@@ -9,7 +9,7 @@ use std::time::Instant;
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
 use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::task::{
-    Artifact, ArtifactKind, Checkpoint, Task, TaskOutput, TaskState, TokenUsage,
+    Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput, TaskState, TokenUsage,
 };
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::TriggerSource;
@@ -270,7 +270,32 @@ impl AgentRuntime {
         source: TriggerSource,
         user_message: String,
     ) -> Result<TurnExecutionResult, NeuromancerError> {
-        let mut task = Task::new(source, user_message.clone(), self.config.id.clone());
+        self.execute_turn_with_task_id(
+            session_store,
+            session_id,
+            source,
+            user_message,
+            TaskId::new_v4(),
+        )
+        .await
+    }
+
+    /// Execute a single conversational turn using a caller-supplied task id.
+    /// This allows the orchestrator to correlate run_id and task_id deterministically.
+    pub async fn execute_turn_with_task_id(
+        &self,
+        session_store: &InMemorySessionStore,
+        session_id: AgentSessionId,
+        source: TriggerSource,
+        user_message: String,
+        task_id: TaskId,
+    ) -> Result<TurnExecutionResult, NeuromancerError> {
+        let mut task = Task::new_with_id(
+            task_id,
+            source,
+            user_message.clone(),
+            self.config.id.clone(),
+        );
         let start = Instant::now();
         let mut total_usage = TokenUsage::default();
 

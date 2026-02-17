@@ -17,10 +17,8 @@ use crate::orchestrator::llm_clients::{build_llm_client, resolve_tool_call_retry
 use crate::orchestrator::prompt::{load_system_prompt_file, render_system0_prompt};
 use crate::orchestrator::security::execution_guard::{ExecutionGuard, PlaceholderExecutionGuard};
 use crate::orchestrator::skills::SkillToolBroker;
-use crate::orchestrator::state::{SYSTEM0_AGENT_ID, System0ToolBroker};
-use crate::orchestrator::tracing::thread_journal::{
-    ThreadJournal, make_event, subagent_report_task_id, subagent_report_type,
-};
+use crate::orchestrator::state::System0ToolBroker;
+use crate::orchestrator::tracing::thread_journal::ThreadJournal;
 
 use super::TurnRequest;
 use super::turn_worker::System0TurnWorker;
@@ -50,34 +48,6 @@ pub(super) async fn resolve_environment(
 
     let execution_guard: Arc<dyn ExecutionGuard> = Arc::new(PlaceholderExecutionGuard);
     Ok((skill_registry, execution_guard))
-}
-
-pub(super) fn spawn_report_worker(
-    thread_journal: ThreadJournal,
-) -> (
-    mpsc::Sender<neuromancer_core::agent::SubAgentReport>,
-    tokio::task::JoinHandle<()>,
-) {
-    let (report_tx, mut report_rx) = mpsc::channel(256);
-    let worker = tokio::spawn(async move {
-        while let Some(report) = report_rx.recv().await {
-            let event = make_event(
-                SYSTEM0_AGENT_ID,
-                "system",
-                "subagent_report",
-                None,
-                Some(subagent_report_task_id(&report)),
-                serde_json::json!({
-                    "report_type": subagent_report_type(&report),
-                    "report": report,
-                }),
-            );
-            if let Err(err) = thread_journal.append_event(event).await {
-                tracing::error!(error = ?err, "thread_journal_report_write_failed");
-            }
-        }
-    });
-    (report_tx, worker)
 }
 
 pub(super) fn build_subagents(

@@ -271,6 +271,40 @@ pub struct OrchestratorEventsQueryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorReportsQueryParams {
+    pub thread_id: Option<String>,
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub report_type: Option<String>,
+    pub include_remediation: Option<bool>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorReportRecord {
+    pub event_id: String,
+    pub ts: String,
+    pub thread_id: String,
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub source_thread_id: Option<String>,
+    pub source_agent_id: Option<String>,
+    pub report_type: String,
+    pub report: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_action: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorReportsQueryResult {
+    pub reports: Vec<OrchestratorReportRecord>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrchestratorRunDiagnoseParams {
     pub run_id: String,
 }
@@ -281,6 +315,12 @@ pub struct OrchestratorRunDiagnoseResult {
     pub thread: Option<ThreadSummary>,
     pub events: Vec<ThreadEvent>,
     pub inferred_failure_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_report_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_report: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_remediation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +332,10 @@ pub struct OrchestratorStatsGetResult {
     pub event_counts: BTreeMap<String, usize>,
     pub tool_counts: BTreeMap<String, usize>,
     pub agent_counts: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subagent_report_counts: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remediation_action_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,10 +522,43 @@ mod tests {
             ]),
             tool_counts: BTreeMap::from([("delegate_to_agent".to_string(), 2)]),
             agent_counts: BTreeMap::from([("planner".to_string(), 2)]),
+            subagent_report_counts: BTreeMap::from([("stuck".to_string(), 1)]),
+            remediation_action_counts: BTreeMap::from([("clarify".to_string(), 1)]),
         };
 
         let encoded = serde_json::to_string(&result).expect("result should serialize");
         let decoded: OrchestratorStatsGetResult =
+            serde_json::from_str(&encoded).expect("result should deserialize");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn orchestrator_reports_query_result_roundtrip() {
+        let result = OrchestratorReportsQueryResult {
+            reports: vec![OrchestratorReportRecord {
+                event_id: "evt-1".to_string(),
+                ts: "2026-02-17T00:00:00Z".to_string(),
+                thread_id: "planner-abc123".to_string(),
+                run_id: Some("run-1".to_string()),
+                agent_id: Some("planner".to_string()),
+                source_thread_id: Some("planner-abc123".to_string()),
+                source_agent_id: Some("planner".to_string()),
+                report_type: "stuck".to_string(),
+                report: serde_json::json!({
+                    "reason": "max iterations exceeded",
+                }),
+                remediation_action: Some(serde_json::json!({
+                    "action": "clarify",
+                    "reason": "first stuck report for this run",
+                })),
+            }],
+            total: 1,
+            offset: 0,
+            limit: 100,
+        };
+
+        let encoded = serde_json::to_string(&result).expect("result should serialize");
+        let decoded: OrchestratorReportsQueryResult =
             serde_json::from_str(&encoded).expect("result should deserialize");
         assert_eq!(decoded, result);
     }

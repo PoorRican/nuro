@@ -10,7 +10,7 @@ use neuromancer_core::rpc::{
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
-use crate::orchestrator::state::{SubAgentThreadState, System0ToolBroker};
+use crate::orchestrator::state::{ActiveRunContext, SubAgentThreadState, System0ToolBroker};
 use crate::orchestrator::tool_id::RuntimeToolId;
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message,
@@ -131,7 +131,8 @@ impl System0ToolBroker {
                     return Err(err);
                 };
 
-                let run_id = uuid::Uuid::new_v4().to_string();
+                let run_uuid = uuid::Uuid::new_v4();
+                let run_id = run_uuid.to_string();
                 let thread_id = format!(
                     "{}-{}",
                     sanitize_thread_file_component(&agent_id),
@@ -175,6 +176,16 @@ impl System0ToolBroker {
                 if !inner.runs.runs_order.iter().any(|id| id == &run_id) {
                     inner.runs.runs_order.push(run_id.clone());
                 }
+                inner.active_runs_by_run_id.insert(
+                    run_id.clone(),
+                    ActiveRunContext {
+                        run_id: run_id.clone(),
+                        agent_id: agent_id.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: Some(turn_id.to_string()),
+                        call_id: Some(call.id.clone()),
+                    },
+                );
 
                 inner
                     .runs
@@ -226,6 +237,7 @@ impl System0ToolBroker {
                         turn_id,
                         current_trigger_type,
                         call_id,
+                        run_uuid,
                         run_id,
                         thread_id,
                         agent_id,
@@ -312,6 +324,7 @@ async fn run_delegated_task(
     turn_id: uuid::Uuid,
     current_trigger_type: TriggerType,
     call_id: String,
+    run_task_id: uuid::Uuid,
     run_id: String,
     thread_id: String,
     agent_id: String,
@@ -357,7 +370,13 @@ async fn run_delegated_task(
     // --- Execute the agent turn ---
     let initial_instruction = instruction.clone();
     let result = runtime
-        .execute_turn(&session_store, session_id, TriggerSource::Internal, instruction)
+        .execute_turn_with_task_id(
+            &session_store,
+            session_id,
+            TriggerSource::Internal,
+            instruction,
+            run_task_id,
+        )
         .await;
 
     // --- Process the result ---
@@ -389,6 +408,7 @@ async fn run_delegated_task(
         if !inner.runs.runs_order.iter().any(|id| id == &run_id) {
             inner.runs.runs_order.push(run_id.clone());
         }
+        inner.active_runs_by_run_id.remove(&run_id);
         if let Some(state) = inner.threads.thread_states.get_mut(&thread_id) {
             state.latest_run_id = Some(run_id.clone());
             state.state = run_state.clone();

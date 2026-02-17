@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::orchestrator::actions::dispatch::dispatch_tool;
 use crate::orchestrator::bootstrap::map_xdg_err;
 use crate::orchestrator::error::System0Error;
-use crate::orchestrator::state::System0ToolBroker;
+use crate::orchestrator::state::{ActiveRunContext, System0ToolBroker};
 use crate::orchestrator::tools::effective_system0_tool_allowlist;
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message,
@@ -55,9 +55,7 @@ impl System0Runtime {
         let (skill_registry, execution_guard) =
             builder::resolve_environment(&layout, config).await?;
         let known_skill_ids = skill_registry.list_names();
-
-        let (report_tx, report_worker) =
-            builder::spawn_report_worker(thread_journal.clone());
+        let (report_tx, mut report_rx) = mpsc::channel(256);
 
         let allowlisted_system0_tools =
             effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
@@ -85,6 +83,14 @@ impl System0Runtime {
             execution_guard,
         );
         let runtime_broker = system0_broker.clone();
+        let report_broker = system0_broker.clone();
+        let report_worker = tokio::spawn(async move {
+            while let Some(report) = report_rx.recv().await {
+                if let Err(err) = report_broker.ingest_subagent_report(report).await {
+                    tracing::error!(error = ?err, "subagent_report_ingest_failed");
+                }
+            }
+        });
 
         let system0_agent_runtime = builder::build_system0_agent(
             config,
@@ -176,18 +182,26 @@ impl System0Runtime {
                 System0Error::ResourceNotFound(format!("agent '{}'", state.agent_id))
             })?;
         let session_store = self.system0_broker.session_store().await;
+        let run_uuid = uuid::Uuid::new_v4();
+        let run_id = run_uuid.to_string();
+        self.system0_broker
+            .register_active_run(ActiveRunContext {
+                run_id: run_id.clone(),
+                agent_id: state.agent_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                call_id: None,
+            })
+            .await;
         let run_result = runtime
-            .execute_turn(
+            .execute_turn_with_task_id(
                 &session_store,
                 state.session_id,
                 TriggerSource::Internal,
                 message.clone(),
+                run_uuid,
             )
             .await;
-        let run_id = run_result
-            .as_ref()
-            .map(|run| run.task_id.to_string())
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let (run_state, response, error) = match run_result {
             Ok(run) => (
                 "completed".to_string(),

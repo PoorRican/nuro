@@ -8,12 +8,13 @@ use std::time::Duration;
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorRunDiagnoseParams,
-    OrchestratorRunDiagnoseResult, OrchestratorRunGetParams, OrchestratorRunGetResult,
-    OrchestratorRunsListResult, OrchestratorStatsGetResult, OrchestratorSubagentTurnParams,
-    OrchestratorSubagentTurnResult, OrchestratorThreadGetParams, OrchestratorThreadGetResult,
-    OrchestratorThreadResurrectParams, OrchestratorThreadResurrectResult,
-    OrchestratorThreadsListResult, OrchestratorTurnParams, OrchestratorTurnResult,
+    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorReportsQueryParams,
+    OrchestratorReportsQueryResult, OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult,
+    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
+    OrchestratorStatsGetResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
+    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
+    OrchestratorTurnResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -230,6 +231,20 @@ impl RpcClient {
     ) -> Result<OrchestratorEventsQueryResult, RpcClientError> {
         self.call_typed(
             "orchestrator.events.query",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_reports_query(
+        &self,
+        params: OrchestratorReportsQueryParams,
+    ) -> Result<OrchestratorReportsQueryResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.reports.query",
             Some(
                 serde_json::to_value(params)
                     .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
