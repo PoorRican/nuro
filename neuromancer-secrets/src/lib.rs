@@ -1,273 +1,269 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use sqlx::SqlitePool;
 use tracing::{info, instrument, warn};
-use zeroize::Zeroize;
 
-use neuromancer_core::error::{InfraError, NeuromancerError, PolicyError};
+use neuromancer_core::config::SecretEntryConfig;
+use neuromancer_core::error::{NeuromancerError, PolicyError};
 use neuromancer_core::secrets::{
-    ResolvedSecret, SecretAcl, SecretInjectionMode, SecretRef, SecretUsage, SecretsBroker,
+    ResolvedSecret, SecretAcl, SecretInjectionMode, SecretRef, SecretUsage,
+    SecretsBroker,
 };
 use neuromancer_core::tool::AgentContext;
 
 mod crypto;
+pub mod integrations;
+pub mod keychain;
+pub mod local;
+pub mod scanner;
 
-/// SQLite-backed secrets broker with ACL enforcement.
-pub struct SqliteSecretsBroker {
-    pool: SqlitePool,
-    master_key: SecretString,
+pub use local::LocalSecretsBroker;
+pub use scanner::{new_shared_scanner, rebuild_scanner, SecretScanner, SharedScanner};
+
+/// Composite secrets broker that dispatches between local SQLite storage
+/// and Proton Pass CLI based on per-entry config.
+pub struct CompositeSecretsBroker {
+    local: LocalSecretsBroker,
+    /// Secret entries from TOML config, keyed by secret ID.
+    entries: HashMap<String, SecretEntryConfig>,
+    /// Shared scanner instance for exfiltration detection.
+    scanner: SharedScanner,
 }
 
-impl SqliteSecretsBroker {
-    /// Create a new broker and run migrations.
-    pub async fn new(pool: SqlitePool, master_key: SecretString) -> Result<Self, NeuromancerError> {
-        let broker = Self { pool, master_key };
-        broker.migrate().await?;
+impl CompositeSecretsBroker {
+    /// Create a new composite broker, sync TOML entries to SQLite, and build initial scanner.
+    pub async fn new(
+        pool: SqlitePool,
+        master_key: SecretString,
+        entries: HashMap<String, SecretEntryConfig>,
+    ) -> Result<Self, NeuromancerError> {
+        let local = LocalSecretsBroker::new(pool, master_key).await?;
+        let scanner = new_shared_scanner();
+
+        let broker = Self {
+            local,
+            entries,
+            scanner,
+        };
+
+        // Sync TOML entries to SQLite (ACLs only)
+        broker.sync_entries_to_sqlite().await?;
+
+        // Build initial scanner
+        broker.build_scanner().await?;
+
         Ok(broker)
     }
 
-    async fn migrate(&self) -> Result<(), NeuromancerError> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS secrets (
-                id TEXT PRIMARY KEY,
-                encrypted_value BLOB NOT NULL,
-                nonce BLOB NOT NULL,
-                allowed_agents TEXT NOT NULL DEFAULT '[]',
-                allowed_skills TEXT NOT NULL DEFAULT '[]',
-                allowed_mcp_servers TEXT NOT NULL DEFAULT '[]',
-                injection_modes TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    /// Sync TOML entry configs to SQLite as ACL metadata.
+    async fn sync_entries_to_sqlite(&self) -> Result<(), NeuromancerError> {
+        for (id, entry) in &self.entries {
+            // Warn about env_var injection mode
+            for mode in &entry.injection_modes {
+                if matches!(mode, SecretInjectionMode::EnvVar { .. }) {
+                    warn!(
+                        secret.id = %id,
+                        "secret uses env_var injection — consider switching to handle_replacement"
+                    );
+                }
+            }
+
+            let expires_at = entry
+                .ttl
+                .as_ref()
+                .and_then(|ttl| ttl.parse::<humantime::Duration>().ok())
+                .map(|d| chrono::Utc::now() + chrono::Duration::from_std(*d).unwrap_or_default());
+
+            let acl = SecretAcl {
+                secret_id: id.clone(),
+                kind: entry.kind.clone(),
+                allowed_agents: entry.allowed_agents.clone(),
+                allowed_skills: vec![],
+                allowed_mcp_servers: entry.allowed_mcp_servers.clone(),
+                injection_modes: if entry.injection_modes.is_empty() {
+                    vec![SecretInjectionMode::HandleReplacement]
+                } else {
+                    entry.injection_modes.clone()
+                },
+                expires_at,
+            };
+
+            self.local.upsert_acl(&acl).await?;
+        }
 
         Ok(())
     }
 
-    fn check_acl(&self, ctx: &AgentContext, acl: &SecretAcl) -> Result<(), NeuromancerError> {
-        if acl.allowed_agents.contains(&ctx.agent_id) {
-            return Ok(());
+    /// Resolve all secret values and rebuild the scanner atomically.
+    pub async fn build_scanner(&self) -> Result<(), NeuromancerError> {
+        let mut pairs = self.local.all_plaintext_pairs().await?;
+
+        // Also resolve pass:// entries for scanner coverage
+        for (id, entry) in &self.entries {
+            if let Some(ref source) = entry.source
+                && source.starts_with("pass://")
+            {
+                match integrations::proton_pass::ProtonPassResolver::resolve(source).await {
+                    Ok(value) => pairs.push((id.clone(), value)),
+                    Err(e) => {
+                        warn!(
+                            secret.id = %id,
+                            error = %e,
+                            "failed to resolve pass:// secret for scanner — skipping"
+                        );
+                    }
+                }
+            }
         }
-        Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
-            agent_id: ctx.agent_id.clone(),
-            secret_ref: acl.secret_id.clone(),
-        }))
+
+        rebuild_scanner(&self.scanner, &pairs);
+        Ok(())
+    }
+
+    /// Return the shared scanner for other crates to use at chokepoints.
+    pub fn scanner(&self) -> SharedScanner {
+        self.scanner.clone()
+    }
+
+    /// Create a credential in Proton Pass.
+    pub async fn create_proton_credential(
+        params: integrations::proton_pass::CreateCredentialParams,
+    ) -> Result<(), NeuromancerError> {
+        integrations::proton_pass::ProtonPassResolver::create_credential(params).await
+    }
+
+    /// Check if a secret entry is configured as pass:// sourced.
+    fn is_pass_sourced(&self, id: &str) -> Option<&str> {
+        self.entries
+            .get(id)
+            .and_then(|e| e.source.as_deref())
+            .filter(|s| s.starts_with("pass://"))
+    }
+
+    /// Check ACL from TOML entries config.
+    fn check_entry_acl(&self, id: &str, agent_id: &str) -> Result<(), NeuromancerError> {
+        if let Some(entry) = self.entries.get(id)
+            && !entry.allowed_agents.is_empty()
+            && !entry.allowed_agents.contains(&agent_id.to_string())
+        {
+            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                agent_id: agent_id.to_string(),
+                secret_ref: id.to_string(),
+            }));
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
-impl SecretsBroker for SqliteSecretsBroker {
-    #[instrument(skip(self, ctx), fields(agent_id = %ctx.agent_id, secret_ref = %secret_ref))]
+impl SecretsBroker for CompositeSecretsBroker {
+    #[instrument(skip(self, ctx), fields(
+        secret.id = %secret_ref,
+        agent.id = %ctx.agent_id,
+        task.id = %ctx.task_id,
+    ))]
     async fn resolve_handle_for_tool(
         &self,
         ctx: &AgentContext,
         secret_ref: SecretRef,
         usage: SecretUsage,
     ) -> Result<ResolvedSecret, NeuromancerError> {
-        if !ctx.allowed_secrets.contains(&secret_ref) {
-            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
-                agent_id: ctx.agent_id.clone(),
-                secret_ref,
-            }));
+        // Check TOML-level ACL first
+        self.check_entry_acl(&secret_ref, &ctx.agent_id)?;
+
+        // If this is a pass:// sourced secret, resolve via Proton Pass
+        if let Some(uri) = self.is_pass_sourced(&secret_ref) {
+            // Must still be in agent context allowlist
+            if !ctx.allowed_secrets.contains(&secret_ref) {
+                return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
+                    agent_id: ctx.agent_id.clone(),
+                    secret_ref,
+                }));
+            }
+
+            let value =
+                integrations::proton_pass::ProtonPassResolver::resolve(uri).await?;
+
+            let injection_mode = self
+                .entries
+                .get(&secret_ref)
+                .and_then(|e| e.injection_modes.first().cloned())
+                .unwrap_or(SecretInjectionMode::HandleReplacement);
+
+            info!(
+                secret.outcome = "granted",
+                secret.kind = "credential",
+                tool.id = %usage.tool_id,
+                secret.reason = %usage.purpose,
+                "pass:// secret resolved"
+            );
+
+            return Ok(ResolvedSecret {
+                value,
+                injection_mode,
+            });
         }
 
-        // Fetch the secret row
-        let row = sqlx::query_as::<_, SecretRow>(
-            "SELECT id, encrypted_value, nonce, allowed_agents, allowed_skills, allowed_mcp_servers, injection_modes FROM secrets WHERE id = ?",
-        )
-        .bind(&secret_ref)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-
-        let row = row.ok_or_else(|| {
-            warn!(secret_ref = %secret_ref, "secret not found");
-            NeuromancerError::Policy(PolicyError::SecretAccessDenied {
-                agent_id: ctx.agent_id.clone(),
-                secret_ref: secret_ref.clone(),
-            })
-        })?;
-
-        let acl = row.to_acl();
-
-        // Check ACL
-        self.check_acl(ctx, &acl)?;
-
-        if !ctx.allowed_mcp_servers.is_empty() && !ctx.allowed_mcp_servers.contains(&usage.tool_id)
-        {
-            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
-                agent_id: ctx.agent_id.clone(),
-                secret_ref: acl.secret_id.clone(),
-            }));
-        }
-
-        if !acl.allowed_mcp_servers.is_empty() && !acl.allowed_mcp_servers.contains(&usage.tool_id)
-        {
-            return Err(NeuromancerError::Policy(PolicyError::SecretAccessDenied {
-                agent_id: ctx.agent_id.clone(),
-                secret_ref: acl.secret_id.clone(),
-            }));
-        }
-
-        // Decrypt value
-        let mut plaintext = crypto::decrypt(
-            &row.encrypted_value,
-            &row.nonce,
-            self.master_key.expose_secret().as_bytes(),
-        )
-        .map_err(|e| {
-            NeuromancerError::Infra(InfraError::Database(format!("decryption failed: {e}")))
-        })?;
-
-        let value = String::from_utf8(plaintext.clone()).map_err(|e| {
-            NeuromancerError::Infra(InfraError::Database(format!("invalid utf8: {e}")))
-        })?;
-
-        plaintext.zeroize();
-
-        // Determine injection mode
-        let injection_mode =
-            acl.injection_modes
-                .first()
-                .cloned()
-                .unwrap_or(SecretInjectionMode::EnvVar {
-                    name: secret_ref.clone(),
-                });
-
-        info!(
-            secret_ref = %secret_ref,
-            agent_id = %ctx.agent_id,
-            tool_id = %usage.tool_id,
-            "secret access granted"
-        );
-
-        Ok(ResolvedSecret {
-            value,
-            injection_mode,
-        })
+        // Delegate to local broker
+        self.local
+            .resolve_handle_for_tool(ctx, secret_ref, usage)
+            .await
     }
 
-    #[instrument(skip(self, ctx), fields(agent_id = %ctx.agent_id))]
+    #[instrument(skip(self, ctx), fields(agent.id = %ctx.agent_id))]
     async fn list_handles(&self, ctx: &AgentContext) -> Result<Vec<String>, NeuromancerError> {
-        let rows = sqlx::query_as::<_, SecretRow>(
-            "SELECT id, encrypted_value, nonce, allowed_agents, allowed_skills, allowed_mcp_servers, injection_modes FROM secrets",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        let mut handles = self.local.list_handles(ctx).await?;
 
-        let handles: Vec<String> = rows
-            .iter()
-            .filter(|row| {
-                let acl = row.to_acl();
-                acl.allowed_agents.contains(&ctx.agent_id)
-                    && (ctx.allowed_secrets.is_empty() || ctx.allowed_secrets.contains(&row.id))
-            })
-            .map(|row| row.id.clone())
-            .collect();
+        // Add pass:// entries that this agent can access
+        for (id, entry) in &self.entries {
+            if entry.source.as_ref().is_some_and(|s| s.starts_with("pass://"))
+                && entry.allowed_agents.contains(&ctx.agent_id)
+                && (ctx.allowed_secrets.is_empty() || ctx.allowed_secrets.contains(id))
+                && !handles.contains(id)
+            {
+                handles.push(id.clone());
+            }
+        }
 
         Ok(handles)
     }
 
-    #[instrument(skip(self, value), fields(secret_id = %id))]
     async fn store(&self, id: &str, value: &str, acl: SecretAcl) -> Result<(), NeuromancerError> {
-        let (encrypted, nonce) =
-            crypto::encrypt(value.as_bytes(), self.master_key.expose_secret().as_bytes()).map_err(
-                |e| {
-                    NeuromancerError::Infra(InfraError::Database(format!("encryption failed: {e}")))
-                },
-            )?;
-
-        let allowed_agents = serde_json::to_string(&acl.allowed_agents)
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-        let allowed_skills = serde_json::to_string(&acl.allowed_skills)
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-        let allowed_mcp = serde_json::to_string(&acl.allowed_mcp_servers)
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-        let injection_modes = serde_json::to_string(&acl.injection_modes)
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO secrets (id, encrypted_value, nonce, allowed_agents, allowed_skills, allowed_mcp_servers, injection_modes, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(id) DO UPDATE SET
-                encrypted_value = excluded.encrypted_value,
-                nonce = excluded.nonce,
-                allowed_agents = excluded.allowed_agents,
-                allowed_skills = excluded.allowed_skills,
-                allowed_mcp_servers = excluded.allowed_mcp_servers,
-                injection_modes = excluded.injection_modes,
-                updated_at = datetime('now')
-            "#,
-        )
-        .bind(id)
-        .bind(&encrypted)
-        .bind(&nonce)
-        .bind(&allowed_agents)
-        .bind(&allowed_skills)
-        .bind(&allowed_mcp)
-        .bind(&injection_modes)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
-
-        info!(secret_id = %id, "secret stored");
-        Ok(())
+        self.local.store(id, value, acl).await
     }
 
-    #[instrument(skip(self), fields(secret_id = %id))]
     async fn revoke(&self, id: &str) -> Result<(), NeuromancerError> {
-        let result = sqlx::query("DELETE FROM secrets WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        self.local.revoke(id).await
+    }
 
-        if result.rows_affected() == 0 {
-            warn!(secret_id = %id, "secret not found for revocation");
-        } else {
-            info!(secret_id = %id, "secret revoked");
+    #[instrument(skip(self, ctx, value), fields(
+        secret.id = %id,
+        agent.id = %ctx.agent_id,
+    ))]
+    async fn store_session(
+        &self,
+        ctx: &AgentContext,
+        id: &str,
+        value: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), NeuromancerError> {
+        self.local.store_session(ctx, id, value, expires_at).await?;
+
+        // Rebuild scanner to include the new session value
+        if let Err(e) = self.build_scanner().await {
+            warn!(error = %e, "failed to rebuild scanner after session store");
         }
 
         Ok(())
-    }
-}
-
-/// Internal row representation for SQLite queries.
-#[derive(Debug, sqlx::FromRow)]
-struct SecretRow {
-    id: String,
-    encrypted_value: Vec<u8>,
-    nonce: Vec<u8>,
-    allowed_agents: String,
-    allowed_skills: String,
-    allowed_mcp_servers: String,
-    injection_modes: String,
-}
-
-impl SecretRow {
-    fn to_acl(&self) -> SecretAcl {
-        SecretAcl {
-            secret_id: self.id.clone(),
-            allowed_agents: serde_json::from_str(&self.allowed_agents).unwrap_or_default(),
-            allowed_skills: serde_json::from_str(&self.allowed_skills).unwrap_or_default(),
-            allowed_mcp_servers: serde_json::from_str(&self.allowed_mcp_servers)
-                .unwrap_or_default(),
-            injection_modes: serde_json::from_str(&self.injection_modes).unwrap_or_default(),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neuromancer_core::secrets::SecretInjectionMode;
+    use neuromancer_core::secrets::SecretKind;
 
     async fn test_pool() -> SqlitePool {
         SqlitePool::connect("sqlite::memory:")
@@ -275,8 +271,8 @@ mod tests {
             .expect("in-memory sqlite")
     }
 
-    fn test_ctx(agent_id: &str) -> AgentContext {
-        test_ctx_with_caps(agent_id, vec![], vec![])
+    fn test_master_key() -> SecretString {
+        SecretString::from("test-master-key-0123456789abcdef")
     }
 
     fn test_ctx_with_caps(
@@ -297,72 +293,63 @@ mod tests {
         }
     }
 
-    fn test_master_key() -> SecretString {
-        SecretString::from("test-master-key-0123456789abcdef")
-    }
-
     #[tokio::test]
-    async fn store_and_resolve_secret() {
+    async fn composite_broker_local_secret_round_trip() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), HashMap::new())
             .await
             .unwrap();
 
         let acl = SecretAcl {
-            secret_id: "my-api-key".into(),
-            allowed_agents: vec!["browser".into()],
-            allowed_skills: vec![],
-            allowed_mcp_servers: vec![],
-            injection_modes: vec![SecretInjectionMode::EnvVar {
-                name: "API_KEY".into(),
-            }],
-        };
-
-        broker
-            .store("my-api-key", "super-secret-value", acl)
-            .await
-            .unwrap();
-
-        let ctx = test_ctx_with_caps("browser", vec!["my-api-key"], vec!["http-client"]);
-        let usage = SecretUsage {
-            tool_id: "http-client".into(),
-            purpose: "API call".into(),
-        };
-
-        let resolved = broker
-            .resolve_handle_for_tool(&ctx, "my-api-key".into(), usage)
-            .await
-            .unwrap();
-
-        assert_eq!(resolved.value, "super-secret-value");
-        assert!(
-            matches!(resolved.injection_mode, SecretInjectionMode::EnvVar { name } if name == "API_KEY")
-        );
-    }
-
-    #[tokio::test]
-    async fn acl_denies_unauthorized_agent() {
-        let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
-            .await
-            .unwrap();
-
-        let acl = SecretAcl {
-            secret_id: "restricted".into(),
+            secret_id: "test-key".into(),
+            kind: SecretKind::Credential,
             allowed_agents: vec!["browser".into()],
             allowed_skills: vec![],
             allowed_mcp_servers: vec![],
             injection_modes: vec![],
+            expires_at: None,
         };
 
-        broker.store("restricted", "secret-val", acl).await.unwrap();
+        broker.store("test-key", "secret-val", acl).await.unwrap();
 
-        let ctx = test_ctx("planner"); // not in allowed_agents
+        let ctx = test_ctx_with_caps("browser", vec!["test-key"], vec![]);
         let usage = SecretUsage {
-            tool_id: "tool".into(),
-            purpose: "test".into(),
+            tool_id: "t".into(),
+            purpose: "t".into(),
         };
+        let resolved = broker
+            .resolve_handle_for_tool(&ctx, "test-key".into(), usage)
+            .await
+            .unwrap();
+        assert_eq!(resolved.value, "secret-val");
+    }
 
+    #[tokio::test]
+    async fn composite_broker_acl_enforcement() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "restricted".into(),
+            SecretEntryConfig {
+                kind: SecretKind::Credential,
+                source: None,
+                allowed_agents: vec!["browser".into()],
+                allowed_mcp_servers: vec![],
+                injection_modes: vec![],
+                ttl: None,
+            },
+        );
+
+        let pool = test_pool().await;
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), entries)
+            .await
+            .unwrap();
+
+        // Try to resolve as unauthorized agent
+        let ctx = test_ctx_with_caps("planner", vec!["restricted"], vec![]);
+        let usage = SecretUsage {
+            tool_id: "t".into(),
+            purpose: "t".into(),
+        };
         let err = broker
             .resolve_handle_for_tool(&ctx, "restricted".into(), usage)
             .await
@@ -375,193 +362,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_requires_secret_in_agent_context_allowlist() {
+    async fn composite_broker_list_handles_filtering() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            "pass-secret".into(),
+            SecretEntryConfig {
+                kind: SecretKind::Credential,
+                source: Some("pass://Work/Test/password".into()),
+                allowed_agents: vec!["browser".into()],
+                allowed_mcp_servers: vec![],
+                injection_modes: vec![],
+                ttl: None,
+            },
+        );
+
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), entries)
             .await
             .unwrap();
 
-        broker
-            .store(
-                "context-guarded",
-                "secret-val",
-                SecretAcl {
-                    secret_id: "context-guarded".into(),
-                    allowed_agents: vec!["browser".into()],
-                    allowed_skills: vec![],
-                    allowed_mcp_servers: vec![],
-                    injection_modes: vec![],
-                },
-            )
-            .await
-            .unwrap();
-
-        // Agent identity is allowed by ACL, but runtime context did not grant this secret.
-        let ctx = test_ctx_with_caps("browser", vec![], vec!["http-client"]);
-        let usage = SecretUsage {
-            tool_id: "http-client".into(),
-            purpose: "test".into(),
+        // Store a local secret
+        let acl = SecretAcl {
+            secret_id: "local-key".into(),
+            kind: SecretKind::Credential,
+            allowed_agents: vec!["browser".into()],
+            allowed_skills: vec![],
+            allowed_mcp_servers: vec![],
+            injection_modes: vec![],
+            expires_at: None,
         };
+        broker.store("local-key", "val", acl).await.unwrap();
 
-        let err = broker
-            .resolve_handle_for_tool(&ctx, "context-guarded".into(), usage)
-            .await
-            .unwrap_err();
+        let ctx = test_ctx_with_caps("browser", vec![], vec![]);
+        let handles = broker.list_handles(&ctx).await.unwrap();
+        // Should include both local and pass:// entries for browser agent
+        assert!(handles.contains(&"local-key".to_string()));
+        assert!(handles.contains(&"pass-secret".to_string()));
 
-        assert!(matches!(
-            err,
-            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn resolve_honors_secret_acl_allowed_mcp_servers() {
-        let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
-            .await
-            .unwrap();
-
-        broker
-            .store(
-                "mcp-guarded",
-                "secret-val",
-                SecretAcl {
-                    secret_id: "mcp-guarded".into(),
-                    allowed_agents: vec!["browser".into()],
-                    allowed_skills: vec![],
-                    allowed_mcp_servers: vec!["playwright".into()],
-                    injection_modes: vec![],
-                },
-            )
-            .await
-            .unwrap();
-
-        let ctx = test_ctx_with_caps("browser", vec!["mcp-guarded"], vec!["filesystem"]);
-        let usage = SecretUsage {
-            tool_id: "filesystem".into(),
-            purpose: "test".into(),
-        };
-
-        let err = broker
-            .resolve_handle_for_tool(&ctx, "mcp-guarded".into(), usage)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            err,
-            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn list_handles_filters_by_agent() {
-        let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
-            .await
-            .unwrap();
-
-        // Secret accessible to browser
-        broker
-            .store(
-                "browser-key",
-                "val1",
-                SecretAcl {
-                    secret_id: "browser-key".into(),
-                    allowed_agents: vec!["browser".into()],
-                    allowed_skills: vec![],
-                    allowed_mcp_servers: vec![],
-                    injection_modes: vec![],
-                },
-            )
-            .await
-            .unwrap();
-
-        // Secret accessible to planner
-        broker
-            .store(
-                "planner-key",
-                "val2",
-                SecretAcl {
-                    secret_id: "planner-key".into(),
-                    allowed_agents: vec!["planner".into()],
-                    allowed_skills: vec![],
-                    allowed_mcp_servers: vec![],
-                    injection_modes: vec![],
-                },
-            )
-            .await
-            .unwrap();
-
-        let browser_ctx = test_ctx("browser");
-        let handles = broker.list_handles(&browser_ctx).await.unwrap();
-        assert_eq!(handles, vec!["browser-key"]);
-
-        let planner_ctx = test_ctx("planner");
+        // Planner should see neither
+        let planner_ctx = test_ctx_with_caps("planner", vec![], vec![]);
         let handles = broker.list_handles(&planner_ctx).await.unwrap();
-        assert_eq!(handles, vec!["planner-key"]);
+        assert!(!handles.contains(&"pass-secret".to_string()));
     }
 
     #[tokio::test]
-    async fn revoke_deletes_secret() {
+    async fn composite_broker_scanner_wiring() {
         let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), HashMap::new())
             .await
             .unwrap();
 
+        // Store a secret
         let acl = SecretAcl {
-            secret_id: "temp".into(),
+            secret_id: "scannable".into(),
+            kind: SecretKind::Credential,
             allowed_agents: vec!["browser".into()],
             allowed_skills: vec![],
             allowed_mcp_servers: vec![],
             injection_modes: vec![],
+            expires_at: None,
         };
-
-        broker.store("temp", "val", acl).await.unwrap();
-        broker.revoke("temp").await.unwrap();
-
-        let ctx = test_ctx("browser");
-        let usage = SecretUsage {
-            tool_id: "t".into(),
-            purpose: "t".into(),
-        };
-
-        let err = broker
-            .resolve_handle_for_tool(&ctx, "temp".into(), usage)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            NeuromancerError::Policy(PolicyError::SecretAccessDenied { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn store_upserts_existing_secret() {
-        let pool = test_pool().await;
-        let broker = SqliteSecretsBroker::new(pool, test_master_key())
+        broker
+            .store("scannable", "my-secret-api-token-xyz", acl)
             .await
             .unwrap();
 
+        // Rebuild scanner
+        broker.build_scanner().await.unwrap();
+
+        let scanner = broker.scanner();
+        let found = scanner.load().scan("response contained my-secret-api-token-xyz in output");
+        assert_eq!(found, vec!["scannable"]);
+    }
+
+    #[tokio::test]
+    async fn composite_broker_session_write_back() {
+        let pool = test_pool().await;
+        let broker = CompositeSecretsBroker::new(pool, test_master_key(), HashMap::new())
+            .await
+            .unwrap();
+
+        // Create browser session entry
         let acl = SecretAcl {
-            secret_id: "key".into(),
+            secret_id: "session".into(),
+            kind: SecretKind::BrowserSession,
             allowed_agents: vec!["browser".into()],
             allowed_skills: vec![],
             allowed_mcp_servers: vec![],
             injection_modes: vec![],
+            expires_at: None,
         };
+        broker.store("session", "initial", acl).await.unwrap();
 
-        broker.store("key", "old-val", acl.clone()).await.unwrap();
-        broker.store("key", "new-val", acl).await.unwrap();
+        // Write back via composite broker
+        let ctx = test_ctx_with_caps("browser", vec!["session"], vec![]);
+        broker
+            .store_session(&ctx, "session", "updated-cookies", None)
+            .await
+            .unwrap();
 
-        let ctx = test_ctx_with_caps("browser", vec!["key"], vec!["t"]);
+        // Resolve to verify
         let usage = SecretUsage {
             tool_id: "t".into(),
             purpose: "t".into(),
         };
         let resolved = broker
-            .resolve_handle_for_tool(&ctx, "key".into(), usage)
+            .resolve_handle_for_tool(&ctx, "session".into(), usage)
             .await
             .unwrap();
-        assert_eq!(resolved.value, "new-val");
+        assert_eq!(resolved.value, "updated-cookies");
     }
 }

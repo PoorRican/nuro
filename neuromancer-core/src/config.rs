@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{
     AgentCapabilities, AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig,
 };
+use crate::secrets::{SecretInjectionMode, SecretKind};
 
 /// Top-level Neuromancer configuration loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +52,8 @@ pub struct SecretsConfig {
     pub backend: String,
     pub keyring_service: Option<String>,
     pub require_acl: bool,
+    #[serde(default)]
+    pub entries: HashMap<String, SecretEntryConfig>,
 }
 
 impl Default for SecretsConfig {
@@ -59,8 +62,29 @@ impl Default for SecretsConfig {
             backend: "local_encrypted".into(),
             keyring_service: None,
             require_acl: true,
+            entries: HashMap::new(),
         }
     }
+}
+
+/// Per-secret entry configuration from TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretEntryConfig {
+    #[serde(default)]
+    pub kind: SecretKind,
+    /// If set to "pass://vault/item/field", resolved via Proton Pass CLI.
+    /// If absent, value is stored locally in encrypted SQLite.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub allowed_agents: Vec<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub injection_modes: Vec<SecretInjectionMode>,
+    /// Optional TTL for auto-expiry (e.g. "24h", "7d"), parsed via humantime.
+    #[serde(default)]
+    pub ttl: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
