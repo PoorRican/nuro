@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorOutputsPullResult, OrchestratorReportRecord,
-    OrchestratorReportsQueryParams, OrchestratorReportsQueryResult, OrchestratorRunDiagnoseResult,
-    OrchestratorStatsGetResult,
+    OrchestratorOutputsPullResult, OrchestratorReportRecord, OrchestratorReportsQueryParams,
+    OrchestratorReportsQueryResult, OrchestratorRunDiagnoseResult, OrchestratorStatsGetResult,
     OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadMessage,
     OrchestratorThreadResurrectResult, ThreadSummary,
 };
@@ -27,9 +26,7 @@ const DEFAULT_EVENTS_QUERY_LIMIT: usize = 200;
 const DEFAULT_REPORTS_QUERY_LIMIT: usize = 200;
 
 impl System0Runtime {
-    pub async fn runs_list(
-        &self,
-    ) -> Result<Vec<DelegatedRun>, System0Error> {
+    pub async fn runs_list(&self) -> Result<Vec<DelegatedRun>, System0Error> {
         Ok(self.system0_broker.list_runs().await)
     }
 
@@ -129,14 +126,21 @@ impl System0Runtime {
                 .get("source_thread_id")
                 .and_then(|value| value.as_str())
                 .map(ToString::to_string);
-            let report = event
-                .payload
-                .get("report")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let report = normalize_report_payload(
+                &report_type,
+                &event
+                    .payload
+                    .get("report")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
             let remediation_action = if include_remediation {
                 remediation_by_key
-                    .get(&(event.thread_id.clone(), event.run_id.clone(), report_type.clone()))
+                    .get(&(
+                        event.thread_id.clone(),
+                        event.run_id.clone(),
+                        report_type.clone(),
+                    ))
                     .cloned()
                     .or_else(|| {
                         remediation_by_key
@@ -176,7 +180,11 @@ impl System0Runtime {
         });
 
         let total = reports.len();
-        let reports = reports.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let reports = reports
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
 
         Ok(OrchestratorReportsQueryResult {
             reports,
@@ -186,10 +194,7 @@ impl System0Runtime {
         })
     }
 
-    pub async fn run_get(
-        &self,
-        run_id: String,
-    ) -> Result<DelegatedRun, System0Error> {
+    pub async fn run_get(&self, run_id: String) -> Result<DelegatedRun, System0Error> {
         if run_id.trim().is_empty() {
             return Err(System0Error::InvalidRequest(
                 "run_id must not be empty".to_string(),
@@ -202,16 +207,12 @@ impl System0Runtime {
             .ok_or_else(|| System0Error::ResourceNotFound(format!("run '{run_id}'")))
     }
 
-    pub async fn context_get(
-        &self,
-    ) -> Result<Vec<OrchestratorThreadMessage>, System0Error> {
+    pub async fn context_get(&self) -> Result<Vec<OrchestratorThreadMessage>, System0Error> {
         let events = self.thread_journal.read_thread_events(SYSTEM0_AGENT_ID)?;
         Ok(thread_events_to_thread_messages(&events))
     }
 
-    pub async fn threads_list(
-        &self,
-    ) -> Result<Vec<ThreadSummary>, System0Error> {
+    pub async fn threads_list(&self) -> Result<Vec<ThreadSummary>, System0Error> {
         let mut summaries = self.thread_journal.load_latest_thread_summaries()?;
         summaries
             .entry(SYSTEM0_AGENT_ID.to_string())
@@ -413,10 +414,11 @@ impl System0Runtime {
             ));
         }
 
-        let run =
-            self.system0_broker.get_run(&run_id).await.ok_or_else(|| {
-                System0Error::ResourceNotFound(format!("run '{run_id}'"))
-            })?;
+        let run = self
+            .system0_broker
+            .get_run(&run_id)
+            .await
+            .ok_or_else(|| System0Error::ResourceNotFound(format!("run '{run_id}'")))?;
 
         let all_events = self.thread_journal.read_all_thread_events()?;
         let mut events = all_events
@@ -454,20 +456,30 @@ impl System0Runtime {
                     if event.event_type != "subagent_report" {
                         return None;
                     }
-                    event.payload
+                    event
+                        .payload
                         .get("report_type")
                         .and_then(|value| value.as_str())
                         .map(ToString::to_string)
                 })
             });
-        let latest_report = snapshot.as_ref().map(|value| value.report.clone()).or_else(|| {
-            events.iter().rev().find_map(|event| {
-                if event.event_type != "subagent_report" {
-                    return None;
-                }
-                event.payload.get("report").cloned()
-            })
-        });
+        let latest_report = snapshot
+            .as_ref()
+            .map(|value| value.report.clone())
+            .or_else(|| {
+                events.iter().rev().find_map(|event| {
+                    if event.event_type != "subagent_report" {
+                        return None;
+                    }
+                    let report = event.payload.get("report").cloned()?;
+                    let report_type = event
+                        .payload
+                        .get("report_type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    Some(normalize_report_payload(report_type, &report))
+                })
+            });
         let recommended_remediation = snapshot
             .as_ref()
             .and_then(|value| value.recommended_remediation.clone())
@@ -504,9 +516,7 @@ impl System0Runtime {
         })
     }
 
-    pub async fn stats_get(
-        &self,
-    ) -> Result<OrchestratorStatsGetResult, System0Error> {
+    pub async fn stats_get(&self) -> Result<OrchestratorStatsGetResult, System0Error> {
         let events = self.thread_journal.read_all_thread_events()?;
         let runs = self.system0_broker.list_runs().await;
         let threads_total = self.threads_list().await?.len();
@@ -525,8 +535,10 @@ impl System0Runtime {
                 *agent_counts.entry(agent_id).or_default() += 1;
             }
             if event.event_type == "subagent_report"
-                && let Some(report_type) =
-                    event.payload.get("report_type").and_then(|value| value.as_str())
+                && let Some(report_type) = event
+                    .payload
+                    .get("report_type")
+                    .and_then(|value| value.as_str())
             {
                 *subagent_report_counts
                     .entry(report_type.to_ascii_lowercase())
@@ -560,7 +572,30 @@ impl System0Runtime {
     }
 }
 
-fn infer_failure_from_subagent_report(report_type: &str, report: &serde_json::Value) -> Option<String> {
+fn normalize_report_payload(report_type: &str, report: &serde_json::Value) -> serde_json::Value {
+    let legacy_variant_key = match report_type {
+        "progress" => Some("Progress"),
+        "input_required" => Some("InputRequired"),
+        "tool_failure" => Some("ToolFailure"),
+        "policy_denied" => Some("PolicyDenied"),
+        "stuck" => Some("Stuck"),
+        "completed" => Some("Completed"),
+        "failed" => Some("Failed"),
+        _ => None,
+    };
+    if let Some(key) = legacy_variant_key
+        && let Some(value) = report.get(key)
+    {
+        return value.clone();
+    }
+    report.clone()
+}
+
+fn infer_failure_from_subagent_report(
+    report_type: &str,
+    report: &serde_json::Value,
+) -> Option<String> {
+    let report = normalize_report_payload(report_type, report);
     match report_type {
         "stuck" => report
             .get("reason")

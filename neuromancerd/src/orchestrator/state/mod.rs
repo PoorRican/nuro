@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
-use neuromancer_core::agent::SubAgentReport;
+use neuromancer_core::agent::{RemediationAction, SubAgentReport};
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
-    DelegatedRun, TurnDelegation, OrchestratorOutputItem, OrchestratorToolInvocation,
+    DelegatedRun, OrchestratorOutputItem, OrchestratorToolInvocation, TurnDelegation,
 };
 use neuromancer_core::tool::{ToolSource, ToolSpec};
 use neuromancer_core::trigger::TriggerType;
@@ -24,9 +24,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::orchestrator::collaboration::remediation::{self, RemediationContext};
 use crate::orchestrator::proposals::lifecycle::{new_proposal, transition};
-use crate::orchestrator::proposals::model::{
-    ChangeProposal, ChangeProposalKind, ProposalState,
-};
+use crate::orchestrator::proposals::model::{ChangeProposal, ChangeProposalKind, ProposalState};
 use crate::orchestrator::proposals::verification::verify_proposal;
 use crate::orchestrator::security::audit::{AuditRiskLevel, audit_proposal};
 use crate::orchestrator::security::execution_guard::ExecutionGuard;
@@ -285,9 +283,7 @@ impl System0ToolBroker {
     ) -> Result<(), crate::orchestrator::error::System0Error> {
         let run_id = subagent_report_task_id(&report);
         let report_type = subagent_report_type(&report).to_string();
-        let report_value = serde_json::to_value(&report).map_err(|err| {
-            crate::orchestrator::error::System0Error::Internal(err.to_string())
-        })?;
+        let report_value = Self::serialize_subagent_report_payload(&report);
 
         let (
             run_context,
@@ -298,17 +294,21 @@ impl System0ToolBroker {
             thread_journal,
         ) = {
             let mut inner = self.inner.lock().await;
-            let context = inner.active_runs_by_run_id.get(&run_id).cloned().or_else(|| {
-                inner.runs.runs_index.get(&run_id).and_then(|run| {
-                    run.thread_id.clone().map(|thread_id| ActiveRunContext {
-                        run_id: run.run_id.clone(),
-                        agent_id: run.agent_id.clone(),
-                        thread_id,
-                        turn_id: None,
-                        call_id: None,
+            let context = inner
+                .active_runs_by_run_id
+                .get(&run_id)
+                .cloned()
+                .or_else(|| {
+                    inner.runs.runs_index.get(&run_id).and_then(|run| {
+                        run.thread_id.clone().map(|thread_id| ActiveRunContext {
+                            run_id: run.run_id.clone(),
+                            agent_id: run.agent_id.clone(),
+                            thread_id,
+                            turn_id: None,
+                            call_id: None,
+                        })
                     })
-                })
-            });
+                });
 
             let report_count = {
                 let count = inner
@@ -320,7 +320,8 @@ impl System0ToolBroker {
             };
 
             let recommendation = context.as_ref().and_then(|ctx| {
-                let mut available_agents = inner.agents.subagents.keys().cloned().collect::<Vec<_>>();
+                let mut available_agents =
+                    inner.agents.subagents.keys().cloned().collect::<Vec<_>>();
                 available_agents.sort();
                 remediation::recommend(
                     &report,
@@ -334,12 +335,15 @@ impl System0ToolBroker {
 
             let recommendation_name = recommendation.as_ref().map(|r| r.action_name.clone());
             let recommendation_reason = recommendation.as_ref().map(|r| r.reason.clone());
-            let recommendation_value = recommendation
+            let recommendation_action_payload = recommendation
                 .as_ref()
-                .and_then(|r| serde_json::to_value(&r.action).ok());
-            let recommendation_action_payload = recommendation.as_ref().map(|r| {
-                serde_json::to_value(&r.action)
-                    .unwrap_or_else(|_| serde_json::json!({ "error": "serialization_failed" }))
+                .map(|r| Self::serialize_remediation_action_payload(&r.action));
+            let recommendation_value = recommendation.as_ref().map(|r| {
+                serde_json::json!({
+                    "action": r.action_name.clone(),
+                    "action_payload": Self::serialize_remediation_action_payload(&r.action),
+                    "reason": r.reason.clone(),
+                })
             });
 
             inner.last_report_by_run.insert(
@@ -358,6 +362,7 @@ impl System0ToolBroker {
                 SubAgentReport::Completed { .. }
                     | SubAgentReport::Failed { .. }
                     | SubAgentReport::Stuck { .. }
+                    | SubAgentReport::PolicyDenied { .. }
             ) {
                 inner.active_runs_by_run_id.remove(&run_id);
             }
@@ -372,8 +377,18 @@ impl System0ToolBroker {
             )
         };
 
+        let trace_agent_id = run_context
+            .as_ref()
+            .map(|ctx| ctx.agent_id.as_str())
+            .unwrap_or("unknown");
+        let trace_thread_id = run_context
+            .as_ref()
+            .map(|ctx| ctx.thread_id.as_str())
+            .unwrap_or(SYSTEM0_AGENT_ID);
         tracing::info!(
             run_id = %run_id,
+            agent_id = %trace_agent_id,
+            thread_id = %trace_thread_id,
             report_type = %report_type,
             recommended_action = recommendation_name.as_deref().unwrap_or("none"),
             "subagent.report.received"
@@ -431,6 +446,8 @@ impl System0ToolBroker {
         ) {
             tracing::info!(
                 run_id = %run_id,
+                agent_id = %trace_agent_id,
+                thread_id = %trace_thread_id,
                 report_type = %subagent_report_type(&report),
                 recommended_action = %action,
                 "remediation.action"
@@ -473,6 +490,120 @@ impl System0ToolBroker {
         }
 
         Ok(())
+    }
+
+    /// Serialize a report as a variant payload object (without enum wrapper),
+    /// so `report_type` + `report` stay stable for query/diagnose clients.
+    fn serialize_subagent_report_payload(report: &SubAgentReport) -> serde_json::Value {
+        match report {
+            SubAgentReport::Progress {
+                task_id,
+                step,
+                description,
+                artifacts_so_far,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "step": step,
+                "description": description,
+                "artifacts_so_far": artifacts_so_far,
+            }),
+            SubAgentReport::InputRequired {
+                task_id,
+                question,
+                context,
+                suggested_options,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "question": question,
+                "context": context,
+                "suggested_options": suggested_options,
+            }),
+            SubAgentReport::ToolFailure {
+                task_id,
+                tool_id,
+                error,
+                retry_eligible,
+                attempted_count,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "tool_id": tool_id,
+                "error": error,
+                "retry_eligible": retry_eligible,
+                "attempted_count": attempted_count,
+            }),
+            SubAgentReport::PolicyDenied {
+                task_id,
+                action,
+                policy_code,
+                capability_needed,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "action": action,
+                "policy_code": policy_code,
+                "capability_needed": capability_needed,
+            }),
+            SubAgentReport::Stuck {
+                task_id,
+                reason,
+                partial_result,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "reason": reason,
+                "partial_result": partial_result,
+            }),
+            SubAgentReport::Completed {
+                task_id,
+                artifacts,
+                summary,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "artifacts": artifacts,
+                "summary": summary,
+            }),
+            SubAgentReport::Failed {
+                task_id,
+                error,
+                partial_result,
+            } => serde_json::json!({
+                "task_id": task_id.to_string(),
+                "error": error,
+                "partial_result": partial_result,
+            }),
+        }
+    }
+
+    /// Serialize remediation action payload as direct fields (without enum wrapper).
+    fn serialize_remediation_action_payload(action: &RemediationAction) -> serde_json::Value {
+        match action {
+            RemediationAction::Retry {
+                max_attempts,
+                backoff_ms,
+            } => serde_json::json!({
+                "max_attempts": max_attempts,
+                "backoff_ms": backoff_ms,
+            }),
+            RemediationAction::Clarify { additional_context } => serde_json::json!({
+                "additional_context": additional_context,
+            }),
+            RemediationAction::GrantTemporary { capability, scope } => serde_json::json!({
+                "capability": capability,
+                "scope": scope.to_string(),
+            }),
+            RemediationAction::Reassign {
+                new_agent_id,
+                reason,
+            } => serde_json::json!({
+                "new_agent_id": new_agent_id,
+                "reason": reason,
+            }),
+            RemediationAction::EscalateToUser { question, channel } => serde_json::json!({
+                "question": question,
+                "channel": channel,
+            }),
+            RemediationAction::Abort { reason } => serde_json::json!({
+                "reason": reason,
+            }),
+        }
     }
 
     fn apply_report_to_run_locked(
@@ -925,7 +1056,12 @@ impl System0ToolBroker {
     ) -> ChangeProposal {
         let mut proposal = new_proposal(kind.clone(), target_id, payload);
 
-        let subagent_ids = inner.agents.subagents.keys().cloned().collect::<HashSet<_>>();
+        let subagent_ids = inner
+            .agents
+            .subagents
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let managed_agent_ids = inner
             .improvement
             .managed_agents
@@ -997,5 +1133,40 @@ impl System0ToolBroker {
         NeuromancerError::Tool(ToolError::NotFound {
             tool_id: tool_id.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neuromancer_core::agent::{RemediationAction, SubAgentReport};
+
+    #[test]
+    fn serializes_subagent_report_payload_without_enum_wrapper() {
+        let report = SubAgentReport::Stuck {
+            task_id: uuid::Uuid::new_v4(),
+            reason: "max iterations exceeded".to_string(),
+            partial_result: None,
+        };
+
+        let payload = System0ToolBroker::serialize_subagent_report_payload(&report);
+        assert_eq!(
+            payload.get("reason").and_then(|value| value.as_str()),
+            Some("max iterations exceeded")
+        );
+        assert!(payload.get("Stuck").is_none());
+    }
+
+    #[test]
+    fn serializes_remediation_payload_without_enum_wrapper() {
+        let action = RemediationAction::Retry {
+            max_attempts: 3,
+            backoff_ms: 1000,
+        };
+
+        let payload = System0ToolBroker::serialize_remediation_action_payload(&action);
+        assert_eq!(payload.get("max_attempts"), Some(&serde_json::json!(3)));
+        assert_eq!(payload.get("backoff_ms"), Some(&serde_json::json!(1000)));
+        assert!(payload.get("Retry").is_none());
     }
 }

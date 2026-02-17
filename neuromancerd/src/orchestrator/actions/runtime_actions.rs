@@ -4,9 +4,7 @@ use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::argument_tokens::expand_user_query_tokens;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::rpc::{
-    DelegatedRun, TurnDelegation, OrchestratorOutputItem, ThreadSummary,
-};
+use neuromancer_core::rpc::{DelegatedRun, OrchestratorOutputItem, ThreadSummary, TurnDelegation};
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
@@ -213,7 +211,9 @@ impl System0ToolBroker {
                         "state": "queued",
                     })),
                 };
-                inner.runs.record_invocation(turn_id, &call, &tool_result.output);
+                inner
+                    .runs
+                    .record_invocation(turn_id, &call, &tool_result.output);
                 drop(inner);
 
                 let persisted_count_before_delta = journal_thread_created(
@@ -266,7 +266,11 @@ struct DelegationContext {
 
 impl DelegationContext {
     /// Build a subagent thread event with common fields pre-filled.
-    fn event(&self, event_type: &str, payload: serde_json::Value) -> neuromancer_core::rpc::ThreadEvent {
+    fn event(
+        &self,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> neuromancer_core::rpc::ThreadEvent {
         let mut event = make_event(
             &self.thread_id,
             "subagent",
@@ -300,14 +304,21 @@ impl DelegationContext {
         error: Option<&str>,
         duration_ms: Option<u64>,
     ) {
-        if let Err(err) = self.thread_journal.append_index_snapshot(&self.thread_snapshot(state)).await {
+        if let Err(err) = self
+            .thread_journal
+            .append_index_snapshot(&self.thread_snapshot(state))
+            .await
+        {
             tracing::error!(thread_id = %self.thread_id, run_id = %self.run_id, error = ?err, "thread_journal_index_write_failed");
         }
-        let mut event = self.event("run_state_changed", serde_json::json!({
-            "state": state,
-            "summary": summary,
-            "error": error,
-        }));
+        let mut event = self.event(
+            "run_state_changed",
+            serde_json::json!({
+                "state": state,
+                "summary": summary,
+                "error": error,
+            }),
+        );
         event.duration_ms = duration_ms;
         if let Err(err) = self.thread_journal.append_event(event).await {
             tracing::error!(thread_id = %self.thread_id, run_id = %self.run_id, error = ?err, "thread_journal_state_write_failed");
@@ -357,7 +368,8 @@ async fn run_delegated_task(
             state.latest_run_id = Some(run_id.clone());
         }
     }
-    ctx.journal_snapshot_and_state("running", Some("Task started"), None, None).await;
+    ctx.journal_snapshot_and_state("running", Some("Task started"), None, None)
+        .await;
     tracing::info!(
         turn_id = %turn_id,
         run_id = %run_id,
@@ -383,6 +395,7 @@ async fn run_delegated_task(
     let (run_state, summary, error, full_output, persisted_message_count) =
         process_delegation_result(
             &ctx,
+            &broker,
             result,
             &session_store,
             session_id,
@@ -442,7 +455,11 @@ async fn run_delegated_task(
             error: run.error.clone(),
             no_reply,
             content: if run.state == "completed" {
-                if no_reply { Some("I've finished.".to_string()) } else { full_output }
+                if no_reply {
+                    Some("I've finished.".to_string())
+                } else {
+                    full_output
+                }
             } else {
                 None
             },
@@ -460,12 +477,19 @@ async fn run_delegated_task(
 
 async fn process_delegation_result(
     ctx: &DelegationContext,
+    broker: &System0ToolBroker,
     result: Result<neuromancer_agent::runtime::TurnExecutionResult, NeuromancerError>,
     session_store: &InMemorySessionStore,
     session_id: AgentSessionId,
     persisted_count_before_delta: usize,
     started_at: &Instant,
-) -> (String, Option<String>, Option<String>, Option<String>, usize) {
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    usize,
+) {
     match result {
         Ok(turn_output) => {
             let response_text =
@@ -491,10 +515,13 @@ async fn process_delegation_result(
                         .skip(persisted_count_before_delta)
                         .cloned()
                         .collect::<Vec<_>>();
-                    if let Err(err) = ctx.thread_journal
+                    if let Err(err) = ctx
+                        .thread_journal
                         .append_messages(
-                            &ctx.thread_id, "subagent",
-                            Some(&ctx.agent_id), Some(&ctx.run_id),
+                            &ctx.thread_id,
+                            "subagent",
+                            Some(&ctx.agent_id),
+                            Some(&ctx.run_id),
                             &delta,
                         )
                         .await
@@ -504,24 +531,40 @@ async fn process_delegation_result(
                             error = ?err, "thread_journal_delta_write_failed"
                         );
                     }
-                    ("completed".to_string(), Some(summary_text), None, full_output, thread_messages.len())
+                    (
+                        "completed".to_string(),
+                        Some(summary_text),
+                        None,
+                        full_output,
+                        thread_messages.len(),
+                    )
                 }
                 None => {
                     let msg = format!(
                         "missing sub-agent conversation state for thread '{}'",
                         ctx.thread_id
                     );
-                    ("failed".to_string(), Some(msg.clone()), Some(msg), full_output, persisted_count_before_delta)
+                    (
+                        "failed".to_string(),
+                        Some(msg.clone()),
+                        Some(msg),
+                        full_output,
+                        persisted_count_before_delta,
+                    )
                 }
             }
         }
         Err(err) => {
             let normalized = normalize_error_message(err.to_string());
-            let mut event = ctx.event("error", serde_json::json!({
-                "error": normalized,
-                "tool_id": "delegate_to_agent",
-                "call_id": ctx.call_id,
-            }));
+            let enriched = enrich_delegate_error_message(broker, &ctx.run_id, normalized).await;
+            let mut event = ctx.event(
+                "error",
+                serde_json::json!({
+                    "error": enriched,
+                    "tool_id": "delegate_to_agent",
+                    "call_id": ctx.call_id,
+                }),
+            );
             event.duration_ms = Some(started_at.elapsed().as_millis() as u64);
             if let Err(journal_err) = ctx.thread_journal.append_event(event).await {
                 tracing::error!(
@@ -529,9 +572,101 @@ async fn process_delegation_result(
                     error = ?journal_err, "thread_journal_error_write_failed"
                 );
             }
-            ("failed".to_string(), Some(normalized.clone()), Some(normalized), None, persisted_count_before_delta)
+            (
+                "failed".to_string(),
+                Some(enriched.clone()),
+                Some(enriched),
+                None,
+                persisted_count_before_delta,
+            )
         }
     }
+}
+
+async fn enrich_delegate_error_message(
+    broker: &System0ToolBroker,
+    run_id: &str,
+    base_error: String,
+) -> String {
+    let Some(snapshot) = broker.last_report_for_run(run_id).await else {
+        return base_error;
+    };
+    let primary_reason = report_primary_reason(&snapshot.report_type, &snapshot.report)
+        .unwrap_or_else(|| base_error.clone());
+    let recommended_action = snapshot
+        .recommended_remediation
+        .as_ref()
+        .and_then(remediation_action_name)
+        .unwrap_or_else(|| "none".to_string());
+
+    let suffix = serde_json::to_string(&serde_json::json!({
+        "run_id": run_id,
+        "report_type": snapshot.report_type,
+        "reason": primary_reason,
+        "recommended_action": recommended_action,
+    }))
+    .unwrap_or_else(|_| "{\"run_id\":\"unknown\"}".to_string());
+
+    format!("{base_error} | remediation_context={suffix}")
+}
+
+fn report_primary_reason(report_type: &str, report: &serde_json::Value) -> Option<String> {
+    match report_type {
+        "stuck" => report
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        "tool_failure" => report
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        "policy_denied" => {
+            let code = report.get("policy_code").and_then(|value| value.as_str());
+            let capability = report
+                .get("capability_needed")
+                .and_then(|value| value.as_str());
+            match (code, capability) {
+                (Some(code), Some(capability)) => Some(format!("{code}: {capability}")),
+                (_, Some(capability)) => Some(capability.to_string()),
+                _ => None,
+            }
+        }
+        "input_required" => report
+            .get("question")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        "failed" => report
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn remediation_action_name(remediation: &serde_json::Value) -> Option<String> {
+    if let Some(action) = remediation.get("action").and_then(|value| value.as_str()) {
+        return Some(action.to_string());
+    }
+    // Backward compatibility with externally-tagged enum serialization.
+    if remediation.get("Retry").is_some() {
+        return Some("retry".to_string());
+    }
+    if remediation.get("Clarify").is_some() {
+        return Some("clarify".to_string());
+    }
+    if remediation.get("GrantTemporary").is_some() {
+        return Some("grant_temporary".to_string());
+    }
+    if remediation.get("Reassign").is_some() {
+        return Some("reassign".to_string());
+    }
+    if remediation.get("EscalateToUser").is_some() {
+        return Some("escalate_to_user".to_string());
+    }
+    if remediation.get("Abort").is_some() {
+        return Some("abort".to_string());
+    }
+    None
 }
 
 async fn journal_thread_created(
@@ -558,8 +693,11 @@ async fn journal_thread_created(
     }
 
     let mut event = make_event(
-        thread_id, "subagent", "thread_created",
-        Some(agent_id.to_string()), Some(run_id.to_string()),
+        thread_id,
+        "subagent",
+        "thread_created",
+        Some(agent_id.to_string()),
+        Some(run_id.to_string()),
         serde_json::json!({ "agent_id": agent_id, "initial_instruction": instruction }),
     );
     event.turn_id = Some(turn_id.to_string());
@@ -569,8 +707,11 @@ async fn journal_thread_created(
     }
 
     let mut event = make_event(
-        thread_id, "subagent", "message_user",
-        Some(agent_id.to_string()), Some(run_id.to_string()),
+        thread_id,
+        "subagent",
+        "message_user",
+        Some(agent_id.to_string()),
+        Some(run_id.to_string()),
         serde_json::json!({ "role": "user", "content": instruction }),
     );
     event.turn_id = Some(turn_id.to_string());
