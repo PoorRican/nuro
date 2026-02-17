@@ -4,6 +4,8 @@ pub(crate) mod agent_registry;
 pub(crate) mod proposal_store;
 pub(crate) mod run_tracker;
 pub(crate) mod self_improvement;
+pub(crate) mod task_manager;
+pub(crate) mod task_store;
 pub(crate) mod thread_registry;
 pub(crate) mod turn_context;
 
@@ -18,6 +20,7 @@ use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorOutputItem, OrchestratorToolInvocation, TurnDelegation,
 };
+use neuromancer_core::task::{Task, TaskId, TaskOutput, TaskState};
 use neuromancer_core::tool::{ToolSource, ToolSpec};
 use neuromancer_core::trigger::TriggerType;
 use tokio::sync::Mutex as AsyncMutex;
@@ -38,6 +41,8 @@ pub(crate) use agent_registry::AgentRegistry;
 pub(crate) use proposal_store::ProposalStore;
 pub(crate) use run_tracker::RunTracker;
 pub(crate) use self_improvement::SelfImprovementState;
+pub(crate) use task_manager::{TaskExecutionContext, TaskManager, WatchdogCandidate};
+pub(crate) use task_store::{PersistedCheckpoint, TaskStore};
 pub(crate) use thread_registry::ThreadRegistry;
 pub(crate) use turn_context::TurnContext;
 
@@ -82,6 +87,7 @@ pub(crate) struct System0ToolBroker {
 pub(crate) struct System0BrokerInner {
     pub(crate) turn: TurnContext,
     pub(crate) agents: AgentRegistry,
+    pub(crate) tasks: TaskManager,
     pub(crate) runs: RunTracker,
     pub(crate) threads: ThreadRegistry,
     pub(crate) proposals: ProposalStore,
@@ -101,6 +107,7 @@ impl System0ToolBroker {
         self_improvement: SelfImprovementConfig,
         known_skill_ids: &[String],
         execution_guard: Arc<dyn ExecutionGuard>,
+        task_manager: TaskManager,
     ) -> Self {
         let allowlisted_tools: HashSet<String> = if allowlisted_tools.is_empty() {
             default_system0_tools().into_iter().collect()
@@ -116,6 +123,7 @@ impl System0ToolBroker {
                     session_store,
                     execution_guard,
                 },
+                tasks: task_manager,
                 runs: RunTracker::new(),
                 threads: ThreadRegistry {
                     thread_states: HashMap::new(),
@@ -250,6 +258,136 @@ impl System0ToolBroker {
         inner.runs.push_output(item);
     }
 
+    pub(crate) async fn enqueue_direct(&self, task: Task) -> Result<TaskId, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.enqueue_direct(task).await
+    }
+
+    pub(crate) async fn await_task_result(
+        &self,
+        task_id: TaskId,
+        timeout: std::time::Duration,
+    ) -> Result<TaskOutput, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.await_task_result(task_id, timeout).await
+    }
+
+    pub(crate) async fn wait_for_next_task(&self) -> Option<Task> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.wait_for_next_task().await
+    }
+
+    pub(crate) async fn transition_task(
+        &self,
+        task_id: TaskId,
+        expected_from: Option<&str>,
+        to_state: TaskState,
+        checkpoint: Option<PersistedCheckpoint>,
+    ) -> Result<Task, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks
+            .transition(task_id, expected_from, to_state, checkpoint)
+            .await
+    }
+
+    pub(crate) async fn cancel_task(
+        &self,
+        task_id: TaskId,
+        reason: impl Into<String>,
+    ) -> Result<Task, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.cancel(task_id, reason).await
+    }
+
+    pub(crate) async fn task_queue_snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.queue_snapshot().await
+    }
+
+    pub(crate) async fn register_task_execution_context(
+        &self,
+        task_id: TaskId,
+        context: TaskExecutionContext,
+    ) {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.register_execution_context(task_id, context).await;
+    }
+
+    pub(crate) async fn task_execution_context(
+        &self,
+        task_id: TaskId,
+    ) -> Option<TaskExecutionContext> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.execution_context_for(task_id).await
+    }
+
+    pub(crate) async fn get_task(&self, task_id: TaskId) -> Result<Option<Task>, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.get_task(task_id).await
+    }
+
+    pub(crate) async fn stop_accepting_new_tasks(&self) {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.stop_accepting_new_tasks().await;
+    }
+
+    pub(crate) async fn stale_tasks_for_watchdog(&self) -> Vec<WatchdogCandidate> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.stale_tasks_for_watchdog().await
+    }
+
+    pub(crate) async fn is_agent_circuit_open(&self, agent_id: &str) -> bool {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.is_circuit_open(agent_id).await
+    }
+
+    pub(crate) async fn suspend_unfinished_tasks(
+        &self,
+        reason: &str,
+    ) -> Result<usize, NeuromancerError> {
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.suspend_non_terminal_for_shutdown(reason).await
+    }
+
     pub(crate) async fn record_subagent_turn_result(
         &self,
         thread_id: &str,
@@ -281,6 +419,21 @@ impl System0ToolBroker {
         &self,
         report: SubAgentReport,
     ) -> Result<(), crate::orchestrator::error::System0Error> {
+        let report_task_id = match &report {
+            SubAgentReport::Progress { task_id, .. }
+            | SubAgentReport::InputRequired { task_id, .. }
+            | SubAgentReport::ToolFailure { task_id, .. }
+            | SubAgentReport::PolicyDenied { task_id, .. }
+            | SubAgentReport::Stuck { task_id, .. }
+            | SubAgentReport::Completed { task_id, .. }
+            | SubAgentReport::Failed { task_id, .. } => *task_id,
+        };
+        let tasks = {
+            let inner = self.inner.lock().await;
+            inner.tasks.clone()
+        };
+        tasks.mark_heartbeat(report_task_id).await;
+
         let run_id = subagent_report_task_id(&report);
         let report_type = subagent_report_type(&report).to_string();
         let report_value = Self::serialize_subagent_report_payload(&report);

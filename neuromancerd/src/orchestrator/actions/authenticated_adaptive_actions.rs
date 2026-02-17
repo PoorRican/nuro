@@ -83,7 +83,9 @@ fn handle_authorize_proposal(
     turn_id: uuid::Uuid,
     trigger_type: neuromancer_core::trigger::TriggerType,
 ) -> Result<ToolResult, NeuromancerError> {
-    if let Err(result) = gate_self_improvement(inner, &call, turn_id, trigger_type, "authorize_proposal") {
+    if let Err(result) =
+        gate_self_improvement(inner, &call, turn_id, trigger_type, "authorize_proposal")
+    {
         return Ok(result);
     }
 
@@ -95,7 +97,11 @@ fn handle_authorize_proposal(
         inner.runs.record_invocation_err(turn_id, &call, &err);
         return Err(err);
     };
-    let force = call.arguments.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force = call
+        .arguments
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let Some(mut proposal) = inner.proposals.proposals_index.get(proposal_id).cloned() else {
         let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
@@ -113,14 +119,20 @@ fn handle_authorize_proposal(
         };
         inner.runs.record_invocation(turn_id, &call, &result.output);
         inner.proposals.record_mutation_audit(
-            "authorize_proposal", "denied_verification_failed", trigger_type,
+            "authorize_proposal",
+            "denied_verification_failed",
+            trigger_type,
             Some(&proposal),
             serde_json::json!({ "issues": proposal.verification_report.issues }),
         );
         return Ok(result);
     }
 
-    if matches!(proposal.audit_verdict.risk_level, AuditRiskLevel::High | AuditRiskLevel::Critical) && !force {
+    if matches!(
+        proposal.audit_verdict.risk_level,
+        AuditRiskLevel::High | AuditRiskLevel::Critical
+    ) && !force
+    {
         let result = ToolResult {
             call_id: call.id.clone(),
             output: ToolOutput::Error(
@@ -129,7 +141,9 @@ fn handle_authorize_proposal(
         };
         inner.runs.record_invocation(turn_id, &call, &result.output);
         inner.proposals.record_mutation_audit(
-            "authorize_proposal", "denied_high_risk_without_force", trigger_type,
+            "authorize_proposal",
+            "denied_high_risk_without_force",
+            trigger_type,
             Some(&proposal),
             serde_json::json!({ "risk_level": proposal.audit_verdict.risk_level }),
         );
@@ -141,9 +155,15 @@ fn handle_authorize_proposal(
     proposal.authorization.authorized_at = Some(Utc::now().to_rfc3339());
     proposal.authorization.authorized_trigger_type = Some(trigger_type);
     transition(&mut proposal, ProposalState::Authorized);
-    inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
+    inner
+        .proposals
+        .proposals_index
+        .insert(proposal.proposal_id.clone(), proposal.clone());
     inner.proposals.record_mutation_audit(
-        "authorize_proposal", "authorized", trigger_type, Some(&proposal),
+        "authorize_proposal",
+        "authorized",
+        trigger_type,
+        Some(&proposal),
         serde_json::json!({ "force": force }),
     );
 
@@ -166,7 +186,13 @@ fn handle_apply_authorized_proposal(
     turn_id: uuid::Uuid,
     trigger_type: neuromancer_core::trigger::TriggerType,
 ) -> Result<ToolResult, NeuromancerError> {
-    if let Err(result) = gate_self_improvement(inner, &call, turn_id, trigger_type, "apply_authorized_proposal") {
+    if let Err(result) = gate_self_improvement(
+        inner,
+        &call,
+        turn_id,
+        trigger_type,
+        "apply_authorized_proposal",
+    ) {
         return Ok(result);
     }
 
@@ -194,21 +220,32 @@ fn handle_apply_authorized_proposal(
         };
         inner.runs.record_invocation(turn_id, &call, &result.output);
         inner.proposals.record_mutation_audit(
-            "apply_authorized_proposal", "denied_not_authorized", trigger_type,
-            Some(&proposal), serde_json::json!({}),
+            "apply_authorized_proposal",
+            "denied_not_authorized",
+            trigger_type,
+            Some(&proposal),
+            serde_json::json!({}),
         );
         return Ok(result);
     }
 
     if let Err(err) = inner.agents.execution_guard.pre_apply_proposal(&proposal) {
         proposal.apply_result = Some(ProposalApplyResult {
-            promoted: false, rolled_back: true, reason: Some(err.to_string()),
+            promoted: false,
+            rolled_back: true,
+            reason: Some(err.to_string()),
         });
         transition(&mut proposal, ProposalState::RolledBack);
-        inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
+        inner
+            .proposals
+            .proposals_index
+            .insert(proposal.proposal_id.clone(), proposal.clone());
         inner.proposals.record_mutation_audit(
-            "apply_authorized_proposal", "rolled_back_guard_block", trigger_type,
-            Some(&proposal), serde_json::json!({ "reason": err.to_string() }),
+            "apply_authorized_proposal",
+            "rolled_back_guard_block",
+            trigger_type,
+            Some(&proposal),
+            serde_json::json!({ "reason": err.to_string() }),
         );
         let result = ToolResult {
             call_id: call.id.clone(),
@@ -223,17 +260,33 @@ fn handle_apply_authorized_proposal(
 
     // Snapshot improvement state for canary rollback
     let improvement_snapshot = inner.improvement.clone();
-    let metrics_before = canary_metrics(&inner.runs.runs_index, &inner.improvement.skill_quality_stats);
+    let metrics_before = canary_metrics(
+        &inner.runs.runs_index,
+        &inner.improvement.skill_quality_stats,
+    );
     transition(&mut proposal, ProposalState::AppliedCanary);
 
-    let subagent_ids = inner.agents.subagents.keys().cloned().collect::<HashSet<_>>();
+    let subagent_ids = inner
+        .agents
+        .subagents
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let apply_err = apply_proposal_mutation(&subagent_ids, &mut inner.improvement, &proposal).err();
-    let metrics_after = canary_metrics(&inner.runs.runs_index, &inner.improvement.skill_quality_stats);
+    let metrics_after = canary_metrics(
+        &inner.runs.runs_index,
+        &inner.improvement.skill_quality_stats,
+    );
 
     let rollback = if let Some(err) = apply_err {
         Some(err.to_string())
     } else if inner.improvement.config.canary_before_promote {
-        rollback_reason(&metrics_before, &metrics_after, &inner.improvement.config.thresholds, &proposal.payload)
+        rollback_reason(
+            &metrics_before,
+            &metrics_after,
+            &inner.improvement.config.thresholds,
+            &proposal.payload,
+        )
     } else {
         None
     };
@@ -241,13 +294,21 @@ fn handle_apply_authorized_proposal(
     if let Some(reason) = rollback {
         inner.improvement = improvement_snapshot;
         proposal.apply_result = Some(ProposalApplyResult {
-            promoted: false, rolled_back: true, reason: Some(reason.clone()),
+            promoted: false,
+            rolled_back: true,
+            reason: Some(reason.clone()),
         });
         transition(&mut proposal, ProposalState::RolledBack);
-        inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
+        inner
+            .proposals
+            .proposals_index
+            .insert(proposal.proposal_id.clone(), proposal.clone());
         inner.proposals.record_mutation_audit(
-            "apply_authorized_proposal", "rolled_back", trigger_type,
-            Some(&proposal), serde_json::json!({ "reason": reason }),
+            "apply_authorized_proposal",
+            "rolled_back",
+            trigger_type,
+            Some(&proposal),
+            serde_json::json!({ "reason": reason }),
         );
         let result = ToolResult {
             call_id: call.id.clone(),
@@ -261,12 +322,22 @@ fn handle_apply_authorized_proposal(
         return Ok(result);
     }
 
-    proposal.apply_result = Some(ProposalApplyResult { promoted: true, rolled_back: false, reason: None });
+    proposal.apply_result = Some(ProposalApplyResult {
+        promoted: true,
+        rolled_back: false,
+        reason: None,
+    });
     transition(&mut proposal, ProposalState::Promoted);
     inner.improvement.last_known_good_snapshot = inner.improvement.config_snapshot.clone();
-    inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
+    inner
+        .proposals
+        .proposals_index
+        .insert(proposal.proposal_id.clone(), proposal.clone());
     inner.proposals.record_mutation_audit(
-        "apply_authorized_proposal", "promoted", trigger_type, Some(&proposal),
+        "apply_authorized_proposal",
+        "promoted",
+        trigger_type,
+        Some(&proposal),
         serde_json::json!({ "metrics_before": metrics_before, "metrics_after": metrics_after }),
     );
 
@@ -286,20 +357,23 @@ fn handle_modify_skill(
     turn_id: uuid::Uuid,
     trigger_type: neuromancer_core::trigger::TriggerType,
 ) -> Result<ToolResult, NeuromancerError> {
-    if let Err(result) = gate_self_improvement(inner, &call, turn_id, trigger_type, "modify_skill") {
+    if let Err(result) = gate_self_improvement(inner, &call, turn_id, trigger_type, "modify_skill")
+    {
         return Ok(result);
     }
 
     let Some(skill_id) = call.arguments.get("skill_id").and_then(|v| v.as_str()) else {
         let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
-            tool_id: "modify_skill".to_string(), message: "missing 'skill_id'".to_string(),
+            tool_id: "modify_skill".to_string(),
+            message: "missing 'skill_id'".to_string(),
         });
         inner.runs.record_invocation_err(turn_id, &call, &err);
         return Err(err);
     };
     let Some(patch) = call.arguments.get("patch").and_then(|v| v.as_str()) else {
         let err = NeuromancerError::Tool(ToolError::ExecutionFailed {
-            tool_id: "modify_skill".to_string(), message: "missing 'patch'".to_string(),
+            tool_id: "modify_skill".to_string(),
+            message: "missing 'patch'".to_string(),
         });
         inner.runs.record_invocation_err(turn_id, &call, &err);
         return Err(err);
@@ -317,14 +391,15 @@ fn handle_modify_skill(
     } else {
         serde_json::json!({ "patch": patch })
     };
-    let mut proposal = System0ToolBroker::create_proposal(
-        inner, kind, Some(skill_id.to_string()), payload,
-    );
+    let mut proposal =
+        System0ToolBroker::create_proposal(inner, kind, Some(skill_id.to_string()), payload);
 
     if !proposal.verification_report.passed || !proposal.audit_verdict.allow {
         let result = ToolResult {
             call_id: call.id.clone(),
-            output: ToolOutput::Success(serde_json::json!({ "status": "blocked", "proposal": proposal })),
+            output: ToolOutput::Success(
+                serde_json::json!({ "status": "blocked", "proposal": proposal }),
+            ),
         };
         inner.runs.record_invocation(turn_id, &call, &result.output);
         return Ok(result);
@@ -338,11 +413,19 @@ fn handle_modify_skill(
 
     if let Err(err) = inner.agents.execution_guard.pre_apply_proposal(&proposal) {
         proposal.apply_result = Some(ProposalApplyResult {
-            promoted: false, rolled_back: true, reason: Some(err.to_string()),
+            promoted: false,
+            rolled_back: true,
+            reason: Some(err.to_string()),
         });
         transition(&mut proposal, ProposalState::RolledBack);
-        inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
-        inner.proposals.proposals_order.push(proposal.proposal_id.clone());
+        inner
+            .proposals
+            .proposals_index
+            .insert(proposal.proposal_id.clone(), proposal.clone());
+        inner
+            .proposals
+            .proposals_order
+            .push(proposal.proposal_id.clone());
         let result = ToolResult {
             call_id: call.id.clone(),
             output: ToolOutput::Success(serde_json::json!({
@@ -353,16 +436,35 @@ fn handle_modify_skill(
         return Ok(result);
     }
 
-    let subagent_ids = inner.agents.subagents.keys().cloned().collect::<HashSet<_>>();
+    let subagent_ids = inner
+        .agents
+        .subagents
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let apply_status = apply_proposal_mutation(&subagent_ids, &mut inner.improvement, &proposal);
     match apply_status {
         Ok(()) => {
-            proposal.apply_result = Some(ProposalApplyResult { promoted: true, rolled_back: false, reason: None });
+            proposal.apply_result = Some(ProposalApplyResult {
+                promoted: true,
+                rolled_back: false,
+                reason: None,
+            });
             transition(&mut proposal, ProposalState::Promoted);
-            inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
-            inner.proposals.proposals_order.push(proposal.proposal_id.clone());
+            inner
+                .proposals
+                .proposals_index
+                .insert(proposal.proposal_id.clone(), proposal.clone());
+            inner
+                .proposals
+                .proposals_order
+                .push(proposal.proposal_id.clone());
             inner.proposals.record_mutation_audit(
-                "modify_skill", "promoted", trigger_type, Some(&proposal), serde_json::json!({}),
+                "modify_skill",
+                "promoted",
+                trigger_type,
+                Some(&proposal),
+                serde_json::json!({}),
             );
             let result = ToolResult {
                 call_id: call.id.clone(),
@@ -375,11 +477,19 @@ fn handle_modify_skill(
         }
         Err(err) => {
             proposal.apply_result = Some(ProposalApplyResult {
-                promoted: false, rolled_back: true, reason: Some(err.to_string()),
+                promoted: false,
+                rolled_back: true,
+                reason: Some(err.to_string()),
             });
             transition(&mut proposal, ProposalState::RolledBack);
-            inner.proposals.proposals_index.insert(proposal.proposal_id.clone(), proposal.clone());
-            inner.proposals.proposals_order.push(proposal.proposal_id.clone());
+            inner
+                .proposals
+                .proposals_index
+                .insert(proposal.proposal_id.clone(), proposal.clone());
+            inner
+                .proposals
+                .proposals_order
+                .push(proposal.proposal_id.clone());
             let result = ToolResult {
                 call_id: call.id.clone(),
                 output: ToolOutput::Success(serde_json::json!({

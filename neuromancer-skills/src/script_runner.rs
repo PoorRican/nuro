@@ -25,9 +25,7 @@ pub async fn run_skill_script(
     );
 
     let stdin_payload = serde_json::to_vec(payload).map_err(|err| {
-        SkillError::ScriptExecution(format!(
-            "failed to encode script input payload: {err}"
-        ))
+        SkillError::ScriptExecution(format!("failed to encode script input payload: {err}"))
     })?;
 
     let mut child = TokioCommand::new("python3")

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use neuromancer_core::error::NeuromancerError;
 use neuromancer_core::rpc::{
-    DelegatedRun, TurnDelegation, OrchestratorOutputItem, OrchestratorToolInvocation,
+    DelegatedRun, OrchestratorOutputItem, OrchestratorToolInvocation, TurnDelegation,
 };
 use neuromancer_core::tool::{ToolCall, ToolOutput};
 

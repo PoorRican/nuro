@@ -10,7 +10,7 @@ use crate::orchestrator::adaptation::lessons::LESSONS_MEMORY_PARTITION;
 use crate::orchestrator::llm_clients::resolve_tool_call_retry_limit;
 use crate::orchestrator::prompt::render_system0_prompt;
 use crate::orchestrator::security::execution_guard::PlaceholderExecutionGuard;
-use crate::orchestrator::state::System0ToolBroker;
+use crate::orchestrator::state::{System0ToolBroker, TaskManager, TaskStore};
 use crate::orchestrator::tools::default_system0_tools;
 use crate::orchestrator::tracing::thread_journal::ThreadJournal;
 
@@ -33,6 +33,7 @@ fn test_system0_ctx() -> AgentContext {
         task_id: uuid::Uuid::new_v4(),
         allowed_tools: default_system0_tools(),
         allowed_mcp_servers: vec![],
+        allowed_peer_agents: vec![],
         allowed_secrets: vec![],
         allowed_memory_partitions: vec![LESSONS_MEMORY_PARTITION.to_string()],
     }
@@ -55,9 +56,11 @@ fn test_config_snapshot() -> serde_json::Value {
     })
 }
 
-fn test_system0_broker() -> System0ToolBroker {
+async fn test_system0_broker() -> System0ToolBroker {
     let thread_root = temp_dir("nm_thread_journal");
     let journal = ThreadJournal::new(thread_root).expect("thread journal");
+    let task_store = TaskStore::in_memory().await.expect("task store");
+    let task_manager = TaskManager::new(task_store).await.expect("task manager");
     System0ToolBroker::new(
         HashMap::new(),
         test_config_snapshot(),
@@ -67,6 +70,7 @@ fn test_system0_broker() -> System0ToolBroker {
         test_self_improvement_config(),
         &["manage-bills".to_string()],
         Arc::new(PlaceholderExecutionGuard),
+        task_manager,
     )
 }
 
@@ -88,7 +92,7 @@ fn error_output(result: ToolResult) -> String {
 
 #[tokio::test]
 async fn non_admin_apply_authorized_proposal_is_denied() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User, String::new())
         .await;
@@ -110,7 +114,7 @@ async fn non_admin_apply_authorized_proposal_is_denied() {
 
 #[tokio::test]
 async fn non_admin_authorize_proposal_is_denied() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::User, String::new())
         .await;
@@ -132,7 +136,7 @@ async fn non_admin_authorize_proposal_is_denied() {
 
 #[tokio::test]
 async fn admin_can_authorize_and_apply_after_verify_and_audit() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
@@ -193,7 +197,7 @@ async fn admin_can_authorize_and_apply_after_verify_and_audit() {
 
 #[tokio::test]
 async fn dangerous_skill_proposal_is_blocked_by_lint_and_audit() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
@@ -222,7 +226,7 @@ async fn dangerous_skill_proposal_is_blocked_by_lint_and_audit() {
 
 #[tokio::test]
 async fn agent_update_with_unknown_skill_is_blocked() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     {
         let mut inner = broker.inner.lock().await;
         inner
@@ -271,7 +275,7 @@ async fn agent_update_with_unknown_skill_is_blocked() {
 
 #[tokio::test]
 async fn canary_regression_rolls_back_proposal() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;
@@ -325,7 +329,7 @@ async fn canary_regression_rolls_back_proposal() {
 
 #[tokio::test]
 async fn mutation_audit_records_include_trigger_and_proposal_hash() {
-    let broker = test_system0_broker();
+    let broker = test_system0_broker().await;
     broker
         .set_turn_context(uuid::Uuid::new_v4(), TriggerType::Admin, String::new())
         .await;

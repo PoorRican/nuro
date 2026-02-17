@@ -3,17 +3,11 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::SkillError;
 
-pub fn resolve_local_data_path(
-    local_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, SkillError> {
+pub fn resolve_local_data_path(local_root: &Path, relative: &str) -> Result<PathBuf, SkillError> {
     resolve_relative_path_under_root(local_root, relative, "data file")
 }
 
-pub fn resolve_skill_script_path(
-    skill_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, SkillError> {
+pub fn resolve_skill_script_path(skill_root: &Path, relative: &str) -> Result<PathBuf, SkillError> {
     resolve_relative_path_under_root(skill_root, relative, "skill script")
 }
 

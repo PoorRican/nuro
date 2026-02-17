@@ -1,2 +1,4 @@
-//! Skill tool broker re-export. Core logic lives in `neuromancer-skills`.
+mod broker;
+
+pub(crate) use broker::OrchestratorSkillBroker;
 pub(crate) use neuromancer_skills::SkillToolBroker;

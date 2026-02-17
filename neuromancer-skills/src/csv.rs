@@ -11,10 +11,7 @@ pub struct ParsedCsv {
 }
 
 // TODO: this should be removed. This should be handled by script execution.
-pub fn parse_csv_content(
-    path: &Path,
-    content: &str,
-) -> Result<ParsedCsv, SkillError> {
+pub fn parse_csv_content(path: &Path, content: &str) -> Result<ParsedCsv, SkillError> {
     let mut lines = content
         .lines()
         .map(str::trim)

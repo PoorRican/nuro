@@ -9,8 +9,7 @@ pub fn apply_proposal_mutation(
     improvement: &mut SelfImprovementState,
     proposal: &ChangeProposal,
 ) -> Result<(), System0Error> {
-    let managed_agent_ids: HashSet<String> =
-        improvement.managed_agents.keys().cloned().collect();
+    let managed_agent_ids: HashSet<String> = improvement.managed_agents.keys().cloned().collect();
 
     match &proposal.kind {
         ChangeProposalKind::ConfigChange => {
@@ -19,9 +18,7 @@ pub fn apply_proposal_mutation(
                 .get("patch")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    System0Error::InvalidRequest(
-                        "config proposal missing patch".to_string(),
-                    )
+                    System0Error::InvalidRequest("config proposal missing patch".to_string())
                 })?
                 .to_string();
             improvement.config_patch_history.push(patch.clone());
@@ -34,28 +31,24 @@ pub fn apply_proposal_mutation(
         }
         ChangeProposalKind::SkillAdd => {
             let skill_id = proposal.target_id.as_deref().ok_or_else(|| {
-                System0Error::InvalidRequest(
-                    "skill add proposal missing skill_id".to_string(),
-                )
+                System0Error::InvalidRequest("skill add proposal missing skill_id".to_string())
             })?;
             let content = proposal
                 .payload
                 .get("content")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    System0Error::InvalidRequest(
-                        "skill add proposal missing content".to_string(),
-                    )
+                    System0Error::InvalidRequest("skill add proposal missing content".to_string())
                 })?
                 .to_string();
-            improvement.managed_skills.insert(skill_id.to_string(), content);
+            improvement
+                .managed_skills
+                .insert(skill_id.to_string(), content);
             improvement.known_skill_ids.insert(skill_id.to_string());
         }
         ChangeProposalKind::SkillUpdate => {
             let skill_id = proposal.target_id.as_deref().ok_or_else(|| {
-                System0Error::InvalidRequest(
-                    "skill update proposal missing skill_id".to_string(),
-                )
+                System0Error::InvalidRequest("skill update proposal missing skill_id".to_string())
             })?;
             if !improvement.known_skill_ids.contains(skill_id)
                 && !improvement.managed_skills.contains_key(skill_id)
@@ -70,19 +63,17 @@ pub fn apply_proposal_mutation(
                 .get("patch")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    System0Error::InvalidRequest(
-                        "skill update proposal missing patch".to_string(),
-                    )
+                    System0Error::InvalidRequest("skill update proposal missing patch".to_string())
                 })?
                 .to_string();
-            improvement.managed_skills.insert(skill_id.to_string(), patch);
+            improvement
+                .managed_skills
+                .insert(skill_id.to_string(), patch);
             improvement.known_skill_ids.insert(skill_id.to_string());
         }
         ChangeProposalKind::AgentAdd => {
             let agent_id = proposal.target_id.as_deref().ok_or_else(|| {
-                System0Error::InvalidRequest(
-                    "agent add proposal missing agent_id".to_string(),
-                )
+                System0Error::InvalidRequest("agent add proposal missing agent_id".to_string())
             })?;
             let patch = proposal
                 .payload
@@ -94,13 +85,13 @@ pub fn apply_proposal_mutation(
                     "patch": patch,
                 })
             });
-            improvement.managed_agents.insert(agent_id.to_string(), parsed);
+            improvement
+                .managed_agents
+                .insert(agent_id.to_string(), parsed);
         }
         ChangeProposalKind::AgentUpdate => {
             let agent_id = proposal.target_id.as_deref().ok_or_else(|| {
-                System0Error::InvalidRequest(
-                    "agent update proposal missing agent_id".to_string(),
-                )
+                System0Error::InvalidRequest("agent update proposal missing agent_id".to_string())
             })?;
             if !subagent_ids.contains(agent_id) && !managed_agent_ids.contains(agent_id) {
                 return Err(System0Error::InvalidRequest(format!(
@@ -118,7 +109,9 @@ pub fn apply_proposal_mutation(
                     "patch": patch,
                 })
             });
-            improvement.managed_agents.insert(agent_id.to_string(), parsed);
+            improvement
+                .managed_agents
+                .insert(agent_id.to_string(), parsed);
         }
     }
 

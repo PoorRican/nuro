@@ -384,6 +384,7 @@ mod tests {
             task_id: uuid::Uuid::new_v4(),
             allowed_tools: vec![],
             allowed_mcp_servers: vec![],
+            allowed_peer_agents: vec![],
             allowed_secrets: vec![],
             allowed_memory_partitions: partitions.into_iter().map(String::from).collect(),
         }

@@ -51,6 +51,7 @@ pub struct AgentContext {
     pub task_id: crate::task::TaskId,
     pub allowed_tools: Vec<String>,
     pub allowed_mcp_servers: Vec<String>,
+    pub allowed_peer_agents: Vec<AgentId>,
     pub allowed_secrets: Vec<String>,
     pub allowed_memory_partitions: Vec<String>,
 }

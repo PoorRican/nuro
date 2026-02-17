@@ -101,10 +101,7 @@ impl ThreadJournal {
         }
     }
 
-    pub(crate) async fn append_event(
-        &self,
-        mut event: ThreadEvent,
-    ) -> Result<(), System0Error> {
+    pub(crate) async fn append_event(&self, mut event: ThreadEvent) -> Result<(), System0Error> {
         let _guard = self.lock.lock().await;
         let path = self.thread_file_for_event(&event);
         let current_seq = self.current_seq_for_locked(&event.thread_id, &path)?;
@@ -215,9 +212,7 @@ impl ThreadJournal {
         read_thread_events_from_path(&path)
     }
 
-    pub(crate) fn read_all_thread_events(
-        &self,
-    ) -> Result<Vec<ThreadEvent>, System0Error> {
+    pub(crate) fn read_all_thread_events(&self) -> Result<Vec<ThreadEvent>, System0Error> {
         let mut events = Vec::new();
 
         let system_file = self.system_thread_file();
@@ -306,11 +301,7 @@ impl ThreadJournal {
         Ok(())
     }
 
-    fn current_seq_for_locked(
-        &self,
-        thread_id: &str,
-        path: &Path,
-    ) -> Result<u64, System0Error> {
+    fn current_seq_for_locked(&self, thread_id: &str, path: &Path) -> Result<u64, System0Error> {
         if let Some(seq) = self
             .seq_cache
             .try_lock()

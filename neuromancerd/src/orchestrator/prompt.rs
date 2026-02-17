@@ -6,8 +6,7 @@ use neuromancer_core::xdg::validate_markdown_prompt_file;
 use crate::orchestrator::error::System0Error;
 
 pub fn load_system_prompt_file(path: &Path) -> Result<String, System0Error> {
-    validate_markdown_prompt_file(path)
-        .map_err(|err| System0Error::Config(err.to_string()))?;
+    validate_markdown_prompt_file(path).map_err(|err| System0Error::Config(err.to_string()))?;
     fs::read_to_string(path).map_err(|err| {
         System0Error::Config(format!(
             "failed to read system prompt '{}': {err}",

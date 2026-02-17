@@ -10,8 +10,9 @@ use neuromancer_core::error::{InfraError, NeuromancerError};
 /// generates 32 random bytes, base64-encodes them, stores in keychain,
 /// and returns the encoded key.
 pub fn get_or_create_master_key(service: &str) -> Result<SecretString, NeuromancerError> {
-    let entry = Entry::new(service, "neuromancer-master-key")
-        .map_err(|e| NeuromancerError::Infra(InfraError::Database(format!("keyring entry: {e}"))))?;
+    let entry = Entry::new(service, "neuromancer-master-key").map_err(|e| {
+        NeuromancerError::Infra(InfraError::Database(format!("keyring entry: {e}")))
+    })?;
 
     match entry.get_password() {
         Ok(password) => Ok(SecretString::from(password)),

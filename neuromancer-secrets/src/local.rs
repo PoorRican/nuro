@@ -541,6 +541,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            allowed_peer_agents: vec![],
             allowed_secrets: allowed_secrets.into_iter().map(str::to_string).collect(),
             allowed_memory_partitions: vec![],
         }

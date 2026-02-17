@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::agent::AgentId;
+use crate::agent::TaskExecutionState;
 use crate::trigger::TriggerSource;
 
 pub type TaskId = uuid::Uuid;
@@ -76,24 +77,26 @@ impl Task {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskState {
     Queued,
     Dispatched,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    Suspended,
+    Running { execution_state: TaskExecutionState },
+    Completed { output: TaskOutput },
+    Failed { error: AgentErrorLike },
+    Cancelled { reason: String },
 }
 
 impl TaskState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled { .. }
+        )
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Queued | Self::Dispatched | Self::Running)
+        matches!(self, Self::Queued | Self::Dispatched | Self::Running { .. })
     }
 }
 
@@ -144,4 +147,104 @@ pub struct Checkpoint {
     pub task_id: TaskId,
     pub state_data: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+/// Serializable task failure payload for task terminal state persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentErrorLike {
+    pub code: String,
+    pub message: String,
+}
+
+impl AgentErrorLike {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_state_serde_roundtrip_and_helpers() {
+        let task_id = uuid::Uuid::new_v4();
+        let checkpoint = Checkpoint {
+            task_id,
+            state_data: serde_json::json!({ "step": "waiting" }),
+            created_at: Utc::now(),
+        };
+        let output = TaskOutput {
+            artifacts: vec![Artifact {
+                kind: ArtifactKind::Text,
+                name: "answer".to_string(),
+                content: "done".to_string(),
+                mime_type: Some("text/plain".to_string()),
+            }],
+            summary: "done".to_string(),
+            token_usage: TokenUsage::default(),
+            duration: Duration::from_millis(25),
+        };
+
+        let states = vec![
+            TaskState::Queued,
+            TaskState::Dispatched,
+            TaskState::Running {
+                execution_state: TaskExecutionState::Initializing { task_id },
+            },
+            TaskState::Running {
+                execution_state: TaskExecutionState::Suspended {
+                    checkpoint: checkpoint.clone(),
+                    reason: "daemon shutdown".to_string(),
+                },
+            },
+            TaskState::Completed {
+                output: output.clone(),
+            },
+            TaskState::Failed {
+                error: AgentErrorLike::new("failed", "boom"),
+            },
+            TaskState::Cancelled {
+                reason: "user".to_string(),
+            },
+        ];
+
+        for state in states {
+            let encoded = serde_json::to_string(&state).expect("serialize");
+            let decoded: TaskState = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(
+                serde_json::to_value(&state).expect("to value"),
+                serde_json::to_value(decoded).expect("to value")
+            );
+        }
+
+        assert!(TaskState::Completed { output }.is_terminal());
+        assert!(
+            TaskState::Failed {
+                error: AgentErrorLike::new("x", "y")
+            }
+            .is_terminal()
+        );
+        assert!(
+            TaskState::Cancelled {
+                reason: "cancelled".to_string()
+            }
+            .is_terminal()
+        );
+        assert!(
+            TaskState::Running {
+                execution_state: TaskExecutionState::Initializing { task_id }
+            }
+            .is_active()
+        );
+        assert!(
+            !TaskState::Cancelled {
+                reason: "cancelled".to_string()
+            }
+            .is_active()
+        );
+    }
 }

@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::orchestrator::{System0Runtime, System0Error};
+use crate::orchestrator::{System0Error, System0Runtime};
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
@@ -88,10 +88,7 @@ async fn op_orchestrator_runs_list(
         ));
     };
 
-    let runs = runtime
-        .runs_list()
-        .await
-        .map_err(map_system0_error)?;
+    let runs = runtime.runs_list().await.map_err(map_system0_error)?;
     Ok(OrchestratorRunsListResult { runs })
 }
 
@@ -137,10 +134,7 @@ async fn op_orchestrator_context_get(
         ));
     };
 
-    let messages = runtime
-        .context_get()
-        .await
-        .map_err(map_system0_error)?;
+    let messages = runtime.context_get().await.map_err(map_system0_error)?;
     Ok(OrchestratorContextGetResult { messages })
 }
 
@@ -153,10 +147,7 @@ async fn op_orchestrator_threads_list(
         ));
     };
 
-    let threads = runtime
-        .threads_list()
-        .await
-        .map_err(map_system0_error)?;
+    let threads = runtime.threads_list().await.map_err(map_system0_error)?;
     Ok(OrchestratorThreadsListResult { threads })
 }
 
@@ -170,10 +161,7 @@ async fn op_orchestrator_thread_get(
         ));
     };
 
-    runtime
-        .thread_get(params)
-        .await
-        .map_err(map_system0_error)
+    runtime.thread_get(params).await.map_err(map_system0_error)
 }
 
 async fn op_orchestrator_thread_resurrect(
@@ -265,10 +253,7 @@ async fn op_orchestrator_stats_get(
         ));
     };
 
-    runtime
-        .stats_get()
-        .await
-        .map_err(map_system0_error)
+    runtime.stats_get().await.map_err(map_system0_error)
 }
 
 #[derive(Debug)]

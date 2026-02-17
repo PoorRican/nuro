@@ -74,8 +74,7 @@ impl SecretScanner {
 
     /// Redact all matched secrets, replacing with `[REDACTED:<secret_id>]`.
     pub fn redact(&self, text: &str) -> String {
-        self.automaton
-            .replace_all(text, &self.replacement_strings)
+        self.automaton.replace_all(text, &self.replacement_strings)
     }
 
     /// Empty scanner that matches nothing.
@@ -107,7 +106,10 @@ mod tests {
 
     #[test]
     fn scan_detects_raw_secret() {
-        let secrets = vec![("api_key".to_string(), "my-super-secret-token-12345".to_string())];
+        let secrets = vec![(
+            "api_key".to_string(),
+            "my-super-secret-token-12345".to_string(),
+        )];
         let scanner = SecretScanner::build(&secrets);
 
         let found = scanner.scan("The token is my-super-secret-token-12345 in the response");
@@ -156,7 +158,10 @@ mod tests {
 
     #[test]
     fn redact_replaces_with_marker() {
-        let secrets = vec![("db_pass".to_string(), "super-secret-password-123".to_string())];
+        let secrets = vec![(
+            "db_pass".to_string(),
+            "super-secret-password-123".to_string(),
+        )];
         let scanner = SecretScanner::build(&secrets);
 
         let redacted = scanner.redact("connection: user:super-secret-password-123@host");
@@ -189,7 +194,10 @@ mod tests {
 
     #[test]
     fn scan_deduplicates_matches() {
-        let secrets = vec![("api_key".to_string(), "repeated-secret-value-xyz".to_string())];
+        let secrets = vec![(
+            "api_key".to_string(),
+            "repeated-secret-value-xyz".to_string(),
+        )];
         let scanner = SecretScanner::build(&secrets);
 
         let found = scanner.scan("repeated-secret-value-xyz and repeated-secret-value-xyz again");

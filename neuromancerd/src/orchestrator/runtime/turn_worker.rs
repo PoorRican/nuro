@@ -39,9 +39,13 @@ impl System0TurnWorker {
             .set_turn_context(turn_id, trigger_type, message.clone())
             .await;
 
-        let mut event = system0_event("message_user", turn_id, serde_json::json!({
-            "role": "user", "content": message.clone()
-        }));
+        let mut event = system0_event(
+            "message_user",
+            turn_id,
+            serde_json::json!({
+                "role": "user", "content": message.clone()
+            }),
+        );
         event.turn_id = Some(turn_id.to_string());
         let _ = self.thread_journal.append_event(event).await;
 
@@ -58,10 +62,14 @@ impl System0TurnWorker {
             Ok(output) => output,
             Err(err) => {
                 let normalized = normalize_error_message(err.to_string());
-                let mut event = system0_event("error", turn_id, serde_json::json!({
-                    "error": normalized,
-                    "message": "orchestrator turn failed",
-                }));
+                let mut event = system0_event(
+                    "error",
+                    turn_id,
+                    serde_json::json!({
+                        "error": normalized,
+                        "message": "orchestrator turn failed",
+                    }),
+                );
                 event.turn_id = Some(turn_id.to_string());
                 let _ = self.thread_journal.append_event(event).await;
                 tracing::error!(
@@ -105,29 +113,41 @@ impl System0TurnWorker {
         turn_started_at: &Instant,
     ) {
         for invocation in invocations {
-            let mut call_event = system0_event("tool_call", turn_id, serde_json::json!({
-                "call_id": invocation.call_id,
-                "tool_id": invocation.tool_id,
-                "arguments": invocation.arguments,
-            }));
+            let mut call_event = system0_event(
+                "tool_call",
+                turn_id,
+                serde_json::json!({
+                    "call_id": invocation.call_id,
+                    "tool_id": invocation.tool_id,
+                    "arguments": invocation.arguments,
+                }),
+            );
             call_event.turn_id = Some(turn_id.to_string());
             call_event.call_id = Some(invocation.call_id.clone());
             let _ = self.thread_journal.append_event(call_event).await;
 
-            let mut result_event = system0_event("tool_result", turn_id, serde_json::json!({
-                "call_id": invocation.call_id,
-                "tool_id": invocation.tool_id,
-                "status": invocation.status,
-                "output": invocation.output,
-            }));
+            let mut result_event = system0_event(
+                "tool_result",
+                turn_id,
+                serde_json::json!({
+                    "call_id": invocation.call_id,
+                    "tool_id": invocation.tool_id,
+                    "status": invocation.status,
+                    "output": invocation.output,
+                }),
+            );
             result_event.turn_id = Some(turn_id.to_string());
             result_event.call_id = Some(invocation.call_id.clone());
             let _ = self.thread_journal.append_event(result_event).await;
         }
 
-        let mut event = system0_event("message_assistant", turn_id, serde_json::json!({
-            "role": "assistant", "content": response
-        }));
+        let mut event = system0_event(
+            "message_assistant",
+            turn_id,
+            serde_json::json!({
+                "role": "assistant", "content": response
+            }),
+        );
         event.turn_id = Some(turn_id.to_string());
         event.duration_ms = Some(turn_started_at.elapsed().as_millis() as u64);
         let _ = self.thread_journal.append_event(event).await;
@@ -135,11 +155,7 @@ impl System0TurnWorker {
 }
 
 /// Build a `ThreadEvent` for the System0 thread with common fields pre-filled.
-fn system0_event(
-    event_type: &str,
-    run_id: uuid::Uuid,
-    payload: serde_json::Value,
-) -> ThreadEvent {
+fn system0_event(event_type: &str, run_id: uuid::Uuid, payload: serde_json::Value) -> ThreadEvent {
     make_event(
         SYSTEM0_AGENT_ID,
         "system",

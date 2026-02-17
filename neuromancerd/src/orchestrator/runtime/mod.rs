@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use neuromancer_agent::session::InMemorySessionStore;
 use neuromancer_core::config::NeuromancerConfig;
@@ -6,6 +7,7 @@ use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorTurnResult, ThreadSummary,
 };
+use neuromancer_core::task::{Task, TaskId, TaskOutput};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_core::xdg::XdgLayout;
@@ -14,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::orchestrator::actions::dispatch::dispatch_tool;
 use crate::orchestrator::bootstrap::map_xdg_err;
 use crate::orchestrator::error::System0Error;
-use crate::orchestrator::state::{ActiveRunContext, System0ToolBroker};
+use crate::orchestrator::state::{ActiveRunContext, System0ToolBroker, TaskManager, TaskStore};
 use crate::orchestrator::tools::effective_system0_tool_allowlist;
 use crate::orchestrator::tracing::conversation_projection::{
     conversation_to_thread_messages, normalize_error_message,
@@ -29,6 +31,8 @@ pub struct System0Runtime {
     turn_tx: mpsc::Sender<TurnRequest>,
     system0_broker: System0ToolBroker,
     thread_journal: ThreadJournal,
+    _task_worker: tokio::task::JoinHandle<()>,
+    _watchdog_worker: tokio::task::JoinHandle<()>,
     _turn_worker: tokio::task::JoinHandle<()>,
     _report_worker: tokio::task::JoinHandle<()>,
 }
@@ -40,10 +44,7 @@ struct TurnRequest {
 }
 
 impl System0Runtime {
-    pub async fn new(
-        config: &NeuromancerConfig,
-        config_path: &Path,
-    ) -> Result<Self, System0Error> {
+    pub async fn new(config: &NeuromancerConfig, config_path: &Path) -> Result<Self, System0Error> {
         let layout = XdgLayout::from_env().map_err(map_xdg_err)?;
         let local_root = layout.runtime_root();
         let config_dir = config_path
@@ -55,6 +56,18 @@ impl System0Runtime {
         let (skill_registry, execution_guard) =
             builder::resolve_environment(&layout, config).await?;
         let known_skill_ids = skill_registry.list_names();
+
+        let task_store = TaskStore::open(&layout.runtime_root().join("orchestrator.sqlite"))
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let task_manager = TaskManager::new(task_store)
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        for (agent_id, agent_cfg) in &config.agents {
+            task_manager
+                .register_agent_health(agent_id.clone(), agent_cfg.health.clone())
+                .await;
+        }
         let (report_tx, mut report_rx) = mpsc::channel(256);
 
         let allowlisted_system0_tools =
@@ -67,9 +80,10 @@ impl System0Runtime {
             &local_root,
             &execution_guard,
             &report_tx,
+            &task_manager,
         )?;
-        let config_snapshot = serde_json::to_value(config)
-            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let config_snapshot =
+            serde_json::to_value(config).map_err(|err| System0Error::Config(err.to_string()))?;
 
         let session_store = InMemorySessionStore::new();
         let system0_broker = System0ToolBroker::new(
@@ -81,6 +95,7 @@ impl System0Runtime {
             config.orchestrator.self_improvement.clone(),
             &known_skill_ids,
             execution_guard,
+            task_manager,
         );
         let runtime_broker = system0_broker.clone();
         let report_broker = system0_broker.clone();
@@ -107,20 +122,64 @@ impl System0Runtime {
             system0_broker,
             thread_journal.clone(),
         );
+        let task_worker = builder::spawn_task_worker(runtime_broker.clone());
+        let watchdog_worker = builder::spawn_watchdog_worker(runtime_broker.clone());
 
         Ok(Self {
             turn_tx,
             system0_broker: runtime_broker,
             thread_journal,
+            _task_worker: task_worker,
+            _watchdog_worker: watchdog_worker,
             _turn_worker: turn_worker,
             _report_worker: report_worker,
         })
     }
 
-    pub async fn turn(
+    pub async fn enqueue_direct(&self, task: Task) -> Result<TaskId, System0Error> {
+        self.system0_broker
+            .enqueue_direct(task)
+            .await
+            .map_err(|err| System0Error::Internal(err.to_string()))
+    }
+
+    pub async fn await_task_result(
         &self,
-        message: String,
-    ) -> Result<OrchestratorTurnResult, System0Error> {
+        task_id: TaskId,
+        timeout: Duration,
+    ) -> Result<TaskOutput, System0Error> {
+        self.system0_broker
+            .await_task_result(task_id, timeout)
+            .await
+            .map_err(|err| System0Error::Internal(err.to_string()))
+    }
+
+    pub async fn graceful_shutdown(&self, timeout: Duration) -> Result<(), System0Error> {
+        self.system0_broker.stop_accepting_new_tasks().await;
+
+        let started = Instant::now();
+        loop {
+            let (queued, running, _completed, _failed, _total) =
+                self.system0_broker.task_queue_snapshot().await;
+            if queued + running == 0 {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let suspended = self
+            .system0_broker
+            .suspend_unfinished_tasks("daemon shutdown")
+            .await
+            .map_err(|err| System0Error::Internal(err.to_string()))?;
+        tracing::info!(suspended, "runtime_shutdown_suspended_tasks");
+        Ok(())
+    }
+
+    pub async fn turn(&self, message: String) -> Result<OrchestratorTurnResult, System0Error> {
         if message.trim().is_empty() {
             return Err(System0Error::InvalidRequest(
                 "message must not be empty".to_string(),
@@ -141,13 +200,10 @@ impl System0Runtime {
         let received = tokio::time::timeout(builder::TURN_TIMEOUT, response_rx)
             .await
             .map_err(|_| {
-                System0Error::Timeout(
-                    humantime::format_duration(builder::TURN_TIMEOUT).to_string(),
-                )
+                System0Error::Timeout(humantime::format_duration(builder::TURN_TIMEOUT).to_string())
             })?;
 
-        received
-            .map_err(|_| System0Error::Unavailable("turn worker stopped".to_string()))?
+        received.map_err(|_| System0Error::Unavailable("turn worker stopped".to_string()))?
     }
 
     pub async fn subagent_turn(
@@ -170,17 +226,13 @@ impl System0Runtime {
             .system0_broker
             .get_thread_state(&thread_id)
             .await
-            .ok_or_else(|| {
-                System0Error::ResourceNotFound(format!("thread '{thread_id}'"))
-            })?;
+            .ok_or_else(|| System0Error::ResourceNotFound(format!("thread '{thread_id}'")))?;
 
         let runtime = self
             .system0_broker
             .runtime_for_agent(&state.agent_id)
             .await
-            .ok_or_else(|| {
-                System0Error::ResourceNotFound(format!("agent '{}'", state.agent_id))
-            })?;
+            .ok_or_else(|| System0Error::ResourceNotFound(format!("agent '{}'", state.agent_id)))?;
         let session_store = self.system0_broker.session_store().await;
         let run_uuid = uuid::Uuid::new_v4();
         let run_id = run_uuid.to_string();
@@ -215,9 +267,7 @@ impl System0Runtime {
         };
 
         let conversation = session_store.get(state.session_id).await.ok_or_else(|| {
-            System0Error::Internal(format!(
-                "missing conversation for thread '{thread_id}'"
-            ))
+            System0Error::Internal(format!("missing conversation for thread '{thread_id}'"))
         })?;
         let thread_messages = conversation_to_thread_messages(&conversation.conversation.messages);
         let delta = thread_messages

@@ -177,10 +177,7 @@ impl System0ToolId {
     }
 
     pub(crate) fn is_self_improvement(self) -> bool {
-        matches!(
-            self,
-            Self::Adaptive(_) | Self::AuthenticatedAdaptive(_)
-        )
+        matches!(self, Self::Adaptive(_) | Self::AuthenticatedAdaptive(_))
     }
 }
 

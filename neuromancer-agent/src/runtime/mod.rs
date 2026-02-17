@@ -9,7 +9,8 @@ use std::time::Instant;
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
 use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::task::{
-    Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput, TaskState, TokenUsage,
+    AgentErrorLike, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput, TaskState,
+    TokenUsage,
 };
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::TriggerSource;
@@ -61,7 +62,9 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
 
         // Transition: Initializing
-        task.state = TaskState::Running;
+        task.state = TaskState::Running {
+            execution_state: TaskExecutionState::Initializing { task_id: task.id },
+        };
         tracing::info!(
             task_id = %task.id,
             agent_id = %self.config.id,
@@ -74,6 +77,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
+            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -118,6 +122,15 @@ impl AgentRuntime {
                     partial_result: None,
                 })
                 .await;
+                self.send_report(SubAgentReport::Failed {
+                    task_id: task.id,
+                    error: err.to_string(),
+                    partial_result: None,
+                })
+                .await;
+                task.state = TaskState::Failed {
+                    error: AgentErrorLike::new("max_iterations_exceeded", err.to_string()),
+                };
                 return Err(NeuromancerError::Agent(err));
             }
 
@@ -257,6 +270,9 @@ impl AgentRuntime {
                 summary: output.summary.clone(),
             })
             .await;
+            task.state = TaskState::Completed {
+                output: output.clone(),
+            };
 
             return Ok(output);
         }
@@ -299,7 +315,9 @@ impl AgentRuntime {
         let start = Instant::now();
         let mut total_usage = TokenUsage::default();
 
-        task.state = TaskState::Running;
+        task.state = TaskState::Running {
+            execution_state: TaskExecutionState::Initializing { task_id: task.id },
+        };
         tracing::info!(
             task_id = %task.id,
             agent_id = %self.config.id,
@@ -311,6 +329,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
+            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -453,6 +472,9 @@ impl AgentRuntime {
                 summary: output.summary.clone(),
             })
             .await;
+            task.state = TaskState::Completed {
+                output: output.clone(),
+            };
 
             break Ok(output);
         };
@@ -461,10 +483,24 @@ impl AgentRuntime {
             .save_conversation(session_id, conversation)
             .await;
 
-        run_result.map(|output| TurnExecutionResult {
-            task_id: task.id,
-            output,
-        })
+        match run_result {
+            Ok(output) => Ok(TurnExecutionResult {
+                task_id: task.id,
+                output,
+            }),
+            Err(err) => {
+                self.send_report(SubAgentReport::Failed {
+                    task_id: task.id,
+                    error: err.to_string(),
+                    partial_result: None,
+                })
+                .await;
+                task.state = TaskState::Failed {
+                    error: AgentErrorLike::new("execution_failed", err.to_string()),
+                };
+                Err(err)
+            }
+        }
     }
 
     async fn execute_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> ToolResult {

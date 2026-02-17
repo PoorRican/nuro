@@ -1,6 +1,6 @@
-mod rpc;
 mod config;
 mod orchestrator;
+mod rpc;
 mod shutdown;
 mod telemetry;
 
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     let rpc_state = rpc::AppState {
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        system0_runtime: Some(system0_runtime),
+        system0_runtime: Some(system0_runtime.clone()),
     };
 
     let rpc_router = rpc::rpc_router(rpc_state);
@@ -144,12 +144,18 @@ async fn main() -> Result<()> {
     info!("graceful shutdown: stopping trigger sources (stub)");
 
     // Drain in-flight tasks with timeout
-    info!("graceful shutdown: draining in-flight tasks (stub, 30s timeout)");
+    info!("graceful shutdown: draining in-flight tasks (30s timeout)");
     let drain_timeout = Duration::from_secs(30);
-    let _ = tokio::time::timeout(drain_timeout, async {
-        // Stub: would wait for task queue to drain
-    })
-    .await;
+    match tokio::time::timeout(
+        drain_timeout,
+        system0_runtime.graceful_shutdown(drain_timeout),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("runtime shutdown failed: {err}"),
+        Err(timeout_err) => error!("runtime shutdown timed out: {timeout_err}"),
+    }
 
     // Wait for admin server to finish
     info!("graceful shutdown: stopping admin API");

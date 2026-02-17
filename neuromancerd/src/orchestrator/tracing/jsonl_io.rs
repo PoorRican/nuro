@@ -28,15 +28,12 @@ pub(crate) fn append_jsonl_line<T: serde::Serialize>(
                 path.display()
             ))
         })?;
-    serde_json::to_writer(&mut file, value).map_err(|err| {
-        System0Error::Internal(format!("failed to encode jsonl event: {err}"))
-    })?;
-    file.write_all(b"\n").map_err(|err| {
-        System0Error::Internal(format!("failed to write jsonl newline: {err}"))
-    })?;
-    file.flush().map_err(|err| {
-        System0Error::Internal(format!("failed to flush jsonl file: {err}"))
-    })?;
+    serde_json::to_writer(&mut file, value)
+        .map_err(|err| System0Error::Internal(format!("failed to encode jsonl event: {err}")))?;
+    file.write_all(b"\n")
+        .map_err(|err| System0Error::Internal(format!("failed to write jsonl newline: {err}")))?;
+    file.flush()
+        .map_err(|err| System0Error::Internal(format!("failed to flush jsonl file: {err}")))?;
     Ok(())
 }
 
@@ -63,9 +60,7 @@ pub(crate) fn read_jsonl_lines(path: &Path) -> Result<Vec<String>, System0Error>
     Ok(lines)
 }
 
-pub(crate) fn read_thread_events_from_path(
-    path: &Path,
-) -> Result<Vec<ThreadEvent>, System0Error> {
+pub(crate) fn read_thread_events_from_path(path: &Path) -> Result<Vec<ThreadEvent>, System0Error> {
     let mut events = Vec::<ThreadEvent>::new();
     for line in read_jsonl_lines(path)? {
         match serde_json::from_str::<ThreadEvent>(&line) {

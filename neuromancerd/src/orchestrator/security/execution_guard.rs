@@ -7,17 +7,11 @@ pub use neuromancer_core::security::ExecutionGuard;
 pub struct PlaceholderExecutionGuard;
 
 impl ExecutionGuard for PlaceholderExecutionGuard {
-    fn pre_verify_proposal(
-        &self,
-        proposal: &ChangeProposal,
-    ) -> Result<(), NeuromancerError> {
+    fn pre_verify_proposal(&self, proposal: &ChangeProposal) -> Result<(), NeuromancerError> {
         guard_sandbox(proposal.required_safeguards())
     }
 
-    fn pre_apply_proposal(
-        &self,
-        proposal: &ChangeProposal,
-    ) -> Result<(), NeuromancerError> {
+    fn pre_apply_proposal(&self, proposal: &ChangeProposal) -> Result<(), NeuromancerError> {
         guard_sandbox(proposal.required_safeguards())
     }
 

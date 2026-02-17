@@ -42,8 +42,8 @@ fn derive_key(raw: &[u8]) -> [u8; 32] {
 /// Encrypt plaintext with a master key. Returns (ciphertext_with_tag, nonce).
 pub fn encrypt(plaintext: &[u8], master_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
     let key = derive_key(master_key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| CryptoError(format!("cipher init: {e}")))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| CryptoError(format!("cipher init: {e}")))?;
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -59,8 +59,8 @@ pub fn encrypt(plaintext: &[u8], master_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>)
 /// Decrypt ciphertext with a master key and nonce.
 pub fn decrypt(ciphertext: &[u8], nonce: &[u8], master_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let key = derive_key(master_key);
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| CryptoError(format!("cipher init: {e}")))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&key).map_err(|e| CryptoError(format!("cipher init: {e}")))?;
 
     let nonce = Nonce::from_slice(nonce);
 
