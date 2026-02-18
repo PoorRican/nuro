@@ -8,6 +8,7 @@ members = [
     "neuromancer-a2a",
     "neuromancer-mcp",
     "neuromancer-skills",
+    "neuromancer-threads",
     "neuromancer-triggers",
     "neuromancer-memory-simple",
     "neuromancer-secrets",
@@ -28,6 +29,7 @@ neuromancer-skills = { path = "neuromancer-skills" }
 neuromancer-triggers = { path = "neuromancer-triggers" }
 neuromancer-memory-simple = { path = "neuromancer-memory-simple" }
 neuromancer-secrets = { path = "neuromancer-secrets" }
+neuromancer-threads = { path = "neuromancer-threads" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

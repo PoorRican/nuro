@@ -13,12 +13,12 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 #[derive(Clone)]
-pub(crate) struct SqliteThreadStore {
+pub struct SqliteThreadStore {
     pool: Arc<SqlitePool>,
 }
 
 impl SqliteThreadStore {
-    pub(crate) async fn open(path: &Path) -> Result<Self, NeuromancerError> {
+    pub async fn open(path: &Path) -> Result<Self, NeuromancerError> {
         let parent = path.parent().ok_or_else(|| {
             NeuromancerError::Infra(InfraError::Config(format!(
                 "invalid thread db path '{}'",
@@ -50,8 +50,7 @@ impl SqliteThreadStore {
         Ok(store)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn in_memory() -> Result<Self, NeuromancerError> {
+    pub async fn in_memory() -> Result<Self, NeuromancerError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -64,7 +63,7 @@ impl SqliteThreadStore {
         Ok(store)
     }
 
-    async fn migrate(&self) -> Result<(), NeuromancerError> {
+    pub async fn migrate(&self) -> Result<(), NeuromancerError> {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS threads (
@@ -166,7 +165,7 @@ impl SqliteThreadStore {
     }
 }
 
-// ── ThreadScope serialization helpers ────────────────────────────────────────
+// -- ThreadScope serialization helpers ----------------------------------------
 
 fn scope_to_columns(
     scope: &ThreadScope,
@@ -213,7 +212,7 @@ fn columns_to_scope(
     }
 }
 
-// ── Row parsing helpers ──────────────────────────────────────────────────────
+// -- Row parsing helpers ------------------------------------------------------
 
 fn parse_thread_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentThread, NeuromancerError> {
     let id: String = row
@@ -408,7 +407,7 @@ fn content_preview(content: &MessageContent, max_len: usize) -> String {
     }
 }
 
-// ── ThreadStore trait implementation ─────────────────────────────────────────
+// -- ThreadStore trait implementation -----------------------------------------
 
 #[async_trait::async_trait]
 impl neuromancer_core::thread::ThreadStore for SqliteThreadStore {

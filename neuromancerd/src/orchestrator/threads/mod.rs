@@ -1,3 +1,2 @@
-pub(crate) mod compaction;
-pub(crate) mod store;
-pub(crate) use store::SqliteThreadStore;
+pub(crate) use neuromancer_threads::compaction;
+pub(crate) use neuromancer_threads::SqliteThreadStore;

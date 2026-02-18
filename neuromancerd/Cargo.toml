@@ -14,6 +14,7 @@ neuromancer-skills = { workspace = true }
 neuromancer-triggers = { workspace = true }
 neuromancer-memory-simple = { workspace = true }
 neuromancer-secrets = { workspace = true }
+neuromancer-threads = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

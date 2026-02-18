@@ -1957,6 +1957,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "neuromancer-threads"
+version = "0.2.0-alpha"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "neuromancer-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "neuromancer-triggers"
 version = "0.2.0-alpha"
 dependencies = [
@@ -1990,6 +2005,7 @@ dependencies = [
  "neuromancer-memory-simple",
  "neuromancer-secrets",
  "neuromancer-skills",
+ "neuromancer-threads",
  "neuromancer-triggers",
  "notify",
  "opentelemetry",
