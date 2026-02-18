@@ -23,9 +23,10 @@ use daemon::{
 use e2e::{SmokeOptions, run_smoke};
 use install::{resolve_config_path, run_install};
 use neuromancer_core::rpc::{
-    OrchestratorEventsQueryParams, OrchestratorOutputsPullParams, OrchestratorReportsQueryParams,
-    OrchestratorRunDiagnoseParams, OrchestratorRunGetParams, OrchestratorSubagentTurnParams,
-    OrchestratorThreadGetParams, OrchestratorThreadResurrectParams, OrchestratorTurnParams,
+    OrchestratorChatTurnParams, OrchestratorEventsQueryParams, OrchestratorOutputsPullParams,
+    OrchestratorReportsQueryParams, OrchestratorRunDiagnoseParams, OrchestratorRunGetParams,
+    OrchestratorSubagentTurnParams, OrchestratorThreadGetParams,
+    OrchestratorThreadResurrectParams, OrchestratorTurnParams,
 };
 use rpc_client::RpcClient;
 
@@ -197,6 +198,29 @@ async fn run(cli: Cli) -> Result<RunOutcome, CliError> {
                 Ok(RunOutcome::Payload(serde_json::json!(result)))
             }
         },
+        Command::Chat(args) => {
+            let rpc = RpcClient::new(&cli.addr, cli.timeout)?;
+            if args.list {
+                let response = rpc.orchestrator_chat_list().await?;
+                return Ok(RunOutcome::Payload(serde_json::json!(response)));
+            }
+            let Some(agent_id) = args.agent_id else {
+                return Err(CliError::Usage(
+                    "agent_id is required (usage: neuroctl chat <agent_id> -m \"message\")"
+                        .to_string(),
+                ));
+            };
+            let Some(message) = args.message else {
+                return Err(CliError::Usage(
+                    "message is required (usage: neuroctl chat <agent_id> -m \"message\")"
+                        .to_string(),
+                ));
+            };
+            let response = rpc
+                .orchestrator_chat_turn(OrchestratorChatTurnParams { agent_id, message })
+                .await?;
+            Ok(RunOutcome::Payload(serde_json::json!(response)))
+        }
         Command::Orchestrator { command } => {
             if let OrchestratorCommand::Chat(ref args) = command
                 && args.demo

@@ -255,6 +255,20 @@ pub struct AgentThread {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A persistent UserConversation session record.
+///
+/// Tracks a user's ongoing chat with a specific agent. The conversation is
+/// backed by an `AgentThread` with `ThreadScope::UserConversation`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConversation {
+    pub conversation_id: ConversationId,
+    pub agent_id: String,
+    pub thread_id: ThreadId,
+    pub status: ThreadStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A cross-reference from one thread's message to another.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossReference {
@@ -322,4 +336,21 @@ pub trait ThreadStore: Send + Sync {
         &self,
         thread_id: &ThreadId,
     ) -> Result<u32, NeuromancerError>;
+
+    /// Find an active UserConversation for the given agent.
+    async fn find_user_conversation(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<UserConversation>, NeuromancerError>;
+
+    /// Save or update a UserConversation record.
+    async fn save_user_conversation(
+        &self,
+        conversation: &UserConversation,
+    ) -> Result<(), NeuromancerError>;
+
+    /// List all UserConversation records.
+    async fn list_user_conversations(
+        &self,
+    ) -> Result<Vec<UserConversation>, NeuromancerError>;
 }

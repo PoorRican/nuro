@@ -18,14 +18,15 @@ use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
     JSON_RPC_PARSE_ERROR, JSON_RPC_RESOURCE_NOT_FOUND, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorReportsQueryParams,
-    OrchestratorReportsQueryResult, OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult,
-    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
-    OrchestratorStatsGetResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
-    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorChatListResult, OrchestratorChatTurnParams, OrchestratorContextGetResult,
+    OrchestratorEventsQueryParams, OrchestratorEventsQueryResult, OrchestratorOutputsPullParams,
+    OrchestratorOutputsPullResult, OrchestratorReportsQueryParams, OrchestratorReportsQueryResult,
+    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
+    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
+    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
     OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
-    OrchestratorTurnResult,
+    OrchestratorTurnResult, UserConversationSummary,
 };
 
 #[derive(Clone)]
@@ -242,6 +243,51 @@ async fn op_orchestrator_run_diagnose(
         .run_diagnose(params.run_id)
         .await
         .map_err(map_system0_error)
+}
+
+async fn op_orchestrator_chat_turn(
+    state: &AppState,
+    params: OrchestratorChatTurnParams,
+) -> Result<OrchestratorSubagentTurnResult, RpcMethodError> {
+    let Some(runtime) = &state.system0_runtime else {
+        return Err(RpcMethodError::internal(
+            "orchestrator runtime is not initialized".to_string(),
+        ));
+    };
+
+    runtime
+        .user_conversation_turn(params.agent_id, params.message)
+        .await
+        .map_err(map_system0_error)
+}
+
+async fn op_orchestrator_chat_list(
+    state: &AppState,
+) -> Result<OrchestratorChatListResult, RpcMethodError> {
+    let Some(runtime) = &state.system0_runtime else {
+        return Err(RpcMethodError::internal(
+            "orchestrator runtime is not initialized".to_string(),
+        ));
+    };
+
+    let conversations = runtime
+        .list_user_conversations()
+        .await
+        .map_err(map_system0_error)?;
+
+    Ok(OrchestratorChatListResult {
+        conversations: conversations
+            .into_iter()
+            .map(|c| UserConversationSummary {
+                conversation_id: c.conversation_id.to_string(),
+                agent_id: c.agent_id,
+                thread_id: c.thread_id,
+                status: c.status.to_string(),
+                created_at: c.created_at.to_rfc3339(),
+                updated_at: c.updated_at.to_rfc3339(),
+            })
+            .collect(),
+    })
 }
 
 async fn op_orchestrator_stats_get(
@@ -497,6 +543,23 @@ async fn dispatch_rpc(
                 }
             }
         }
+        "orchestrator.chat.turn" => match parse_params::<OrchestratorChatTurnParams>(params) {
+            Ok(req) => match op_orchestrator_chat_turn(state, req).await {
+                Ok(result) => to_value(&result),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
+        "orchestrator.chat.list" => {
+            if let Err(err) = require_no_params_or_empty_object(params.as_ref()) {
+                Err(err)
+            } else {
+                match op_orchestrator_chat_list(state).await {
+                    Ok(result) => to_value(&result),
+                    Err(err) => Err(err),
+                }
+            }
+        }
         _ => Err(RpcMethodError::method_not_found(format!(
             "Method '{}' not found",
             method
@@ -734,6 +797,59 @@ mod tests {
         assert_eq!(
             message_response.error.expect("error").code,
             JSON_RPC_METHOD_NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_orchestrator_chat_turn_requires_runtime() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "orchestrator.chat.turn",
+                "params": {"agent_id": "finance-manager", "message": "hello"}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn rpc_orchestrator_chat_list_requires_runtime() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "orchestrator.chat.list"
+            }),
+        )
+        .await;
+
+        assert_eq!(response.error.expect("error").code, JSON_RPC_INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn rpc_orchestrator_chat_turn_requires_params() {
+        let state = test_state();
+        let (_status, response) = rpc_json(
+            &state,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "orchestrator.chat.turn",
+                "params": {}
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.error.expect("error").code,
+            JSON_RPC_INVALID_PARAMS
         );
     }
 }

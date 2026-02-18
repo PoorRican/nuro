@@ -8,7 +8,9 @@ use neuromancer_core::memory::MemoryStore;
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorTurnResult, ThreadSummary,
 };
-use neuromancer_core::thread::{AgentThread, CompactionPolicy, ThreadScope, ThreadStatus};
+use neuromancer_core::thread::{
+    AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, UserConversation,
+};
 use neuromancer_core::task::{Task, TaskId, TaskOutput};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
@@ -388,6 +390,102 @@ impl System0Runtime {
             response,
             tool_invocations: Vec::new(),
         })
+    }
+
+    /// Start or continue a UserConversation with a specific agent.
+    ///
+    /// If an active conversation exists for the agent, it is reused.
+    /// Otherwise a new conversation and backing AgentThread are created.
+    /// Returns the agent's response.
+    pub async fn user_conversation_turn(
+        &self,
+        agent_id: String,
+        message: String,
+    ) -> Result<OrchestratorSubagentTurnResult, System0Error> {
+        if agent_id.trim().is_empty() {
+            return Err(System0Error::InvalidRequest(
+                "agent_id must not be empty".to_string(),
+            ));
+        }
+        if message.trim().is_empty() {
+            return Err(System0Error::InvalidRequest(
+                "message must not be empty".to_string(),
+            ));
+        }
+
+        // Verify the agent exists.
+        self.system0_broker
+            .runtime_for_agent(&agent_id)
+            .await
+            .ok_or_else(|| System0Error::ResourceNotFound(format!("agent '{agent_id}'")))?;
+
+        let thread_store = self.system0_broker.thread_store().await;
+
+        // Find or create a UserConversation.
+        let conversation = match thread_store.find_user_conversation(&agent_id).await {
+            Ok(Some(conv)) => conv,
+            Ok(None) => {
+                // Create new conversation + thread.
+                let conv_id = uuid::Uuid::new_v4();
+                let thread_id = format!("uc-{agent_id}-{}", &conv_id.to_string()[..8]);
+                let now = chrono::Utc::now();
+                let thread = AgentThread {
+                    id: thread_id.clone(),
+                    agent_id: agent_id.clone(),
+                    scope: ThreadScope::UserConversation {
+                        conversation_id: conv_id,
+                    },
+                    compaction_policy: CompactionPolicy::InPlace {
+                        strategy: neuromancer_core::thread::TruncationStrategy::default(),
+                    },
+                    context_window_budget: 128_000,
+                    status: ThreadStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                };
+                thread_store
+                    .create_thread(&thread)
+                    .await
+                    .map_err(|err| System0Error::Internal(err.to_string()))?;
+
+                let conv = UserConversation {
+                    conversation_id: conv_id,
+                    agent_id: agent_id.clone(),
+                    thread_id,
+                    status: ThreadStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                };
+                thread_store
+                    .save_user_conversation(&conv)
+                    .await
+                    .map_err(|err| System0Error::Internal(err.to_string()))?;
+
+                tracing::info!(
+                    conversation_id = %conv_id,
+                    agent_id = %agent_id,
+                    thread_id = %conv.thread_id,
+                    "user_conversation_created"
+                );
+                conv
+            }
+            Err(err) => return Err(System0Error::Internal(err.to_string())),
+        };
+
+        // Execute the turn via `subagent_turn` (bypasses System0 turn queue).
+        self.subagent_turn(conversation.thread_id.clone(), message)
+            .await
+    }
+
+    /// List all UserConversation sessions.
+    pub async fn list_user_conversations(
+        &self,
+    ) -> Result<Vec<UserConversation>, System0Error> {
+        let thread_store = self.system0_broker.thread_store().await;
+        thread_store
+            .list_user_conversations()
+            .await
+            .map_err(|err| System0Error::Internal(err.to_string()))
     }
 }
 

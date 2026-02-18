@@ -4,8 +4,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use neuromancer_core::error::{InfraError, NeuromancerError};
 use neuromancer_core::thread::{
-    AgentThread, ChatMessage, CompactionPolicy, CrossReference, MessageContent, MessageId,
-    MessageMetadata, MessageRole, ThreadId, ThreadScope, ThreadStatus,
+    AgentThread, ChatMessage, CompactionPolicy, ConversationId, CrossReference, MessageContent,
+    MessageId, MessageMetadata, MessageRole, ThreadId, ThreadScope, ThreadStatus,
+    UserConversation,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -128,6 +129,33 @@ impl SqliteThreadStore {
             r#"
             CREATE INDEX IF NOT EXISTS idx_threads_scope
             ON threads(scope_type, scope_ref)
+            "#,
+        )
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|err| NeuromancerError::Infra(InfraError::Database(err.to_string())))?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS user_conversations (
+                conversation_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (thread_id) REFERENCES threads(id)
+            )
+            "#,
+        )
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|err| NeuromancerError::Infra(InfraError::Database(err.to_string())))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_user_conversations_agent
+            ON user_conversations(agent_id, status)
             "#,
         )
         .execute(self.pool.as_ref())
@@ -319,6 +347,49 @@ fn role_to_str(role: &MessageRole) -> &'static str {
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "tool",
     }
+}
+
+fn parse_user_conversation_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<UserConversation, NeuromancerError> {
+    let conv_id_str: String = row
+        .try_get("conversation_id")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let agent_id: String = row
+        .try_get("agent_id")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let thread_id: String = row
+        .try_get("thread_id")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let status_str: String = row
+        .try_get("status")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let created_at_str: String = row
+        .try_get("created_at")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let updated_at_str: String = row
+        .try_get("updated_at")
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+
+    let conversation_id: ConversationId = conv_id_str
+        .parse()
+        .map_err(|e: uuid::Error| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let status = parse_thread_status(&status_str);
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+
+    Ok(UserConversation {
+        conversation_id,
+        agent_id,
+        thread_id,
+        status,
+        created_at,
+        updated_at,
+    })
 }
 
 fn content_preview(content: &MessageContent, max_len: usize) -> String {
@@ -578,6 +649,60 @@ impl neuromancer_core::thread::ThreadStore for SqliteThreadStore {
         .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
         Ok(total as u32)
     }
+
+    async fn find_user_conversation(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<UserConversation>, NeuromancerError> {
+        let row = sqlx::query(
+            "SELECT * FROM user_conversations WHERE agent_id = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+
+        match row {
+            Some(row) => Ok(Some(parse_user_conversation_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn save_user_conversation(
+        &self,
+        conversation: &UserConversation,
+    ) -> Result<(), NeuromancerError> {
+        sqlx::query(
+            r#"
+            INSERT INTO user_conversations (conversation_id, agent_id, thread_id, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(conversation.conversation_id.to_string())
+        .bind(&conversation.agent_id)
+        .bind(&conversation.thread_id)
+        .bind(conversation.status.to_string())
+        .bind(conversation.created_at.to_rfc3339())
+        .bind(conversation.updated_at.to_rfc3339())
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        Ok(())
+    }
+
+    async fn list_user_conversations(
+        &self,
+    ) -> Result<Vec<UserConversation>, NeuromancerError> {
+        let rows = sqlx::query("SELECT * FROM user_conversations ORDER BY updated_at DESC")
+            .fetch_all(self.pool.as_ref())
+            .await
+            .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+
+        rows.iter().map(parse_user_conversation_row).collect()
+    }
 }
 
 #[cfg(test)]
@@ -772,5 +897,54 @@ mod tests {
         let agent_y_threads = store.list_threads_for_agent("agent-y").await.unwrap();
         assert_eq!(agent_y_threads.len(), 1);
         assert_eq!(agent_y_threads[0].id, "a2-t1");
+    }
+
+    #[tokio::test]
+    async fn test_user_conversation_lifecycle() {
+        let store = SqliteThreadStore::in_memory().await.unwrap();
+
+        // Create a backing thread first
+        let conv_id = uuid::Uuid::new_v4();
+        let thread = sample_thread(
+            "uc-thread-1",
+            "finance-manager",
+            ThreadScope::UserConversation {
+                conversation_id: conv_id,
+            },
+        );
+        store.create_thread(&thread).await.unwrap();
+
+        // Save user conversation
+        let now = Utc::now();
+        let conversation = UserConversation {
+            conversation_id: conv_id,
+            agent_id: "finance-manager".to_string(),
+            thread_id: "uc-thread-1".to_string(),
+            status: ThreadStatus::Active,
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_user_conversation(&conversation).await.unwrap();
+
+        // Find it
+        let found = store
+            .find_user_conversation("finance-manager")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.conversation_id, conv_id);
+        assert_eq!(found.thread_id, "uc-thread-1");
+
+        // List all
+        let all = store.list_user_conversations().await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        // Different agent not found
+        let not_found = store
+            .find_user_conversation("browser")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
     }
 }

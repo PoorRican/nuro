@@ -359,6 +359,27 @@ pub struct OrchestratorContextGetResult {
     pub messages: Vec<OrchestratorThreadMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorChatTurnParams {
+    pub agent_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserConversationSummary {
+    pub conversation_id: String,
+    pub agent_id: String,
+    pub thread_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorChatListResult {
+    pub conversations: Vec<UserConversationSummary>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

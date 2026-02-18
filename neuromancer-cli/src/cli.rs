@@ -50,6 +50,8 @@ pub enum Command {
         #[command(subcommand)]
         command: OrchestratorCommand,
     },
+    /// Direct user conversation with a specific agent (bypasses System0).
+    Chat(UserChatArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,6 +337,24 @@ pub struct OrchestratorSubagentTurnArgs {
 pub struct OrchestratorOutputsPullArgs {
     #[arg(long)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+pub struct UserChatArgs {
+    /// Agent ID to chat with.
+    pub agent_id: Option<String>,
+
+    /// Message to send to the agent.
+    #[arg(long, short)]
+    pub message: Option<String>,
+
+    /// List active user conversations.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Start a new conversation (even if one already exists).
+    #[arg(long)]
+    pub new: bool,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -685,6 +705,64 @@ mod tests {
                     assert_eq!(args.limit, Some(25));
                 }
             },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_chat_list_command() {
+        let cli =
+            Cli::try_parse_from(["neuroctl", "chat", "--list"]).expect("cli should parse");
+
+        match cli.command {
+            Command::Chat(args) => {
+                assert!(args.list);
+                assert!(args.agent_id.is_none());
+                assert!(args.message.is_none());
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_chat_turn_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "chat",
+            "finance-manager",
+            "-m",
+            "what is my balance?",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Chat(args) => {
+                assert_eq!(args.agent_id.as_deref(), Some("finance-manager"));
+                assert_eq!(args.message.as_deref(), Some("what is my balance?"));
+                assert!(!args.list);
+                assert!(!args.new);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_chat_new_flag() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "chat",
+            "finance-manager",
+            "--new",
+            "-m",
+            "hello",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Chat(args) => {
+                assert!(args.new);
+                assert_eq!(args.agent_id.as_deref(), Some("finance-manager"));
+            }
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }

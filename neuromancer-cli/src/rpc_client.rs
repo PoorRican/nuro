@@ -7,12 +7,13 @@ use std::time::Duration;
 //  Rename `orchestrator chat` to `ui` or similar to simplify.
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    OrchestratorContextGetResult, OrchestratorEventsQueryParams, OrchestratorEventsQueryResult,
-    OrchestratorOutputsPullParams, OrchestratorOutputsPullResult, OrchestratorReportsQueryParams,
-    OrchestratorReportsQueryResult, OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult,
-    OrchestratorRunGetParams, OrchestratorRunGetResult, OrchestratorRunsListResult,
-    OrchestratorStatsGetResult, OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult,
-    OrchestratorThreadGetParams, OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
+    OrchestratorChatListResult, OrchestratorChatTurnParams, OrchestratorContextGetResult,
+    OrchestratorEventsQueryParams, OrchestratorEventsQueryResult, OrchestratorOutputsPullParams,
+    OrchestratorOutputsPullResult, OrchestratorReportsQueryParams, OrchestratorReportsQueryResult,
+    OrchestratorRunDiagnoseParams, OrchestratorRunDiagnoseResult, OrchestratorRunGetParams,
+    OrchestratorRunGetResult, OrchestratorRunsListResult, OrchestratorStatsGetResult,
+    OrchestratorSubagentTurnParams, OrchestratorSubagentTurnResult, OrchestratorThreadGetParams,
+    OrchestratorThreadGetResult, OrchestratorThreadResurrectParams,
     OrchestratorThreadResurrectResult, OrchestratorThreadsListResult, OrchestratorTurnParams,
     OrchestratorTurnResult,
 };
@@ -285,6 +286,26 @@ impl RpcClient {
             ),
         )
         .await
+    }
+
+    pub async fn orchestrator_chat_turn(
+        &self,
+        params: OrchestratorChatTurnParams,
+    ) -> Result<OrchestratorSubagentTurnResult, RpcClientError> {
+        self.call_typed(
+            "orchestrator.chat.turn",
+            Some(
+                serde_json::to_value(params)
+                    .map_err(|err| RpcClientError::InvalidRequest(err.to_string()))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn orchestrator_chat_list(
+        &self,
+    ) -> Result<OrchestratorChatListResult, RpcClientError> {
+        self.call_typed("orchestrator.chat.list", None).await
     }
 }
 

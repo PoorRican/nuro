@@ -1012,6 +1012,23 @@ mod tests {
                 let msgs = self.messages.lock().unwrap();
                 Ok(msgs.iter().map(|m| m.token_estimate).sum())
             }
+            async fn find_user_conversation(
+                &self,
+                _agent_id: &str,
+            ) -> Result<Option<neuromancer_core::thread::UserConversation>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn save_user_conversation(
+                &self,
+                _conversation: &neuromancer_core::thread::UserConversation,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn list_user_conversations(
+                &self,
+            ) -> Result<Vec<neuromancer_core::thread::UserConversation>, NeuromancerError> {
+                Ok(vec![])
+            }
         }
 
         let llm = Arc::new(SequenceLlmClient::new(vec![
