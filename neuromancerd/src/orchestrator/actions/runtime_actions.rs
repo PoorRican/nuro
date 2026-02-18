@@ -501,6 +501,7 @@ async fn run_delegated_task(
             TriggerSource::Internal,
             instruction,
             task_id,
+            vec![],
         )
         .await;
 

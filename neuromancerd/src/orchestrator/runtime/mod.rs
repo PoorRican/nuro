@@ -311,6 +311,7 @@ impl System0Runtime {
                 TriggerSource::Internal,
                 message.clone(),
                 run_uuid,
+                vec![],
             )
             .await;
         let (run_state, response, error) = match run_result {

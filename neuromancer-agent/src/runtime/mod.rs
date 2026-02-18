@@ -282,6 +282,10 @@ impl AgentRuntime {
     ///
     /// Loads existing conversation history from the thread, runs the thinking-acting loop,
     /// then flushes only the new messages (delta) back to the thread store.
+    ///
+    /// `injected_context` is an optional set of messages (e.g. memory summaries, task status)
+    /// that are prepended to the conversation after the system prompt and persisted history.
+    /// These are ephemeral context — they are NOT persisted to the thread store.
     pub async fn execute_turn_with_thread_store(
         &self,
         thread_store: &dyn ThreadStore,
@@ -289,6 +293,7 @@ impl AgentRuntime {
         source: TriggerSource,
         user_message: String,
         task_id: TaskId,
+        injected_context: Vec<ChatMessage>,
     ) -> Result<TurnExecutionResult, NeuromancerError> {
         let mut task = Task::new_with_id(
             task_id,
@@ -336,7 +341,13 @@ impl AgentRuntime {
             conversation.add_message(msg);
         }
 
-        // Record where this turn's new messages begin
+        // Inject ephemeral context (memory summaries, task status, etc.)
+        // These are NOT persisted — they sit between history and the new user message.
+        for msg in injected_context {
+            conversation.add_message(msg);
+        }
+
+        // Record where this turn's new messages begin (after history + injected context)
         let pre_turn_count = conversation.messages.len();
 
         // Add the new user message
@@ -887,6 +898,7 @@ mod tests {
                 TriggerSource::Internal,
                 "What happened?".into(),
                 uuid::Uuid::new_v4(),
+                vec![],
             )
             .await
             .expect("turn recovery should succeed");

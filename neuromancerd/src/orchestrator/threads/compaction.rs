@@ -157,7 +157,6 @@ fn truncate_for_summary(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neuromancer_core::thread::MessageRole;
 
     #[test]
     fn build_summary_produces_readable_output() {

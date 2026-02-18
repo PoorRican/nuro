@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_core::memory::MemoryStore;
+use neuromancer_core::memory::{MemoryKind, MemoryQuery, MemoryStore};
 use neuromancer_core::rpc::{OrchestratorTurnResult, ThreadEvent};
-use neuromancer_core::thread::{ThreadId, ThreadStore};
+use neuromancer_core::thread::{ChatMessage, ThreadId, ThreadStore};
 use neuromancer_core::tool::AgentContext;
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
@@ -54,6 +54,9 @@ impl System0TurnWorker {
         event.turn_id = Some(turn_id.to_string());
         let _ = self.thread_journal.append_event(event).await;
 
+        // Load memory summaries for injection into context
+        let injected_context = self.load_memory_context(turn_id).await;
+
         let output = match self
             .agent_runtime
             .execute_turn_with_thread_store(
@@ -62,6 +65,7 @@ impl System0TurnWorker {
                 TriggerSource::Cli,
                 message.clone(),
                 turn_id,
+                injected_context,
             )
             .await
         {
@@ -140,6 +144,56 @@ impl System0TurnWorker {
             delegated_tasks,
             tool_invocations,
         })
+    }
+
+    /// Load memory summaries from the System0 partition and format them as
+    /// system-role `ChatMessage`s for ephemeral injection into the conversation context.
+    async fn load_memory_context(&self, turn_id: uuid::Uuid) -> Vec<ChatMessage> {
+        let ctx = AgentContext {
+            agent_id: SYSTEM0_AGENT_ID.to_string(),
+            task_id: turn_id,
+            allowed_tools: vec![],
+            allowed_mcp_servers: vec![],
+            allowed_peer_agents: vec![],
+            allowed_secrets: vec![],
+            allowed_memory_partitions: vec![
+                "system0".to_string(),
+                "workspace:default".to_string(),
+            ],
+        };
+
+        let query = MemoryQuery {
+            partition: Some("system0".to_string()),
+            kind: Some(MemoryKind::Summary),
+            limit: 20,
+            ..Default::default()
+        };
+        let page = match self.memory_store.query(&ctx, query).await {
+            Ok(page) => page,
+            Err(err) => {
+                tracing::warn!(error = ?err, "memory_context_load_failed");
+                return vec![];
+            }
+        };
+
+        if page.items.is_empty() {
+            return vec![];
+        }
+
+        let mut parts = Vec::with_capacity(page.items.len() + 1);
+        parts.push("[Prior conversation summaries]".to_string());
+        for item in &page.items {
+            parts.push(item.content.clone());
+        }
+        let combined = parts.join("\n\n");
+
+        tracing::debug!(
+            summaries = page.items.len(),
+            chars = combined.len(),
+            "memory_context_injected"
+        );
+
+        vec![ChatMessage::system(&combined)]
     }
 
     async fn journal_turn_events(
