@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod security;
 pub mod skills;
 pub mod state;
+pub(crate) mod threads;
 pub(crate) mod tool_id;
 pub mod tools;
 pub mod tracing;
