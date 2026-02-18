@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
+use neuromancer_core::argument_tokens;
 use neuromancer_core::error::{AgentError, NeuromancerError};
+use neuromancer_core::secrets::{SecretRef, SecretUsage, SecretsBroker};
 use neuromancer_core::task::{
     AgentErrorLike, AgentOutput, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput,
     TaskState, TokenUsage,
@@ -32,6 +34,7 @@ pub struct AgentRuntime {
     config: AgentConfig,
     llm_client: Arc<dyn LlmClient>,
     tool_broker: Arc<dyn ToolBroker>,
+    secrets_broker: Option<Arc<dyn SecretsBroker>>,
     report_tx: tokio::sync::mpsc::Sender<SubAgentReport>,
     tool_call_retry_limit: u32,
 }
@@ -48,9 +51,15 @@ impl AgentRuntime {
             config,
             llm_client,
             tool_broker,
+            secrets_broker: None,
             report_tx,
             tool_call_retry_limit,
         }
+    }
+
+    pub fn with_secrets_broker(mut self, broker: Arc<dyn SecretsBroker>) -> Self {
+        self.secrets_broker = Some(broker);
+        self
     }
 
     // TODO: there seems to be significant code duplication between `execute` and `execute_turn`
@@ -515,13 +524,90 @@ impl AgentRuntime {
     }
 
     async fn execute_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> ToolResult {
-        match self.tool_broker.call_tool(ctx, call.clone()).await {
+        // Resolve secret handles in tool call arguments before dispatching.
+        let resolved_call = match self.resolve_secret_handles(ctx, call).await {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    output: ToolOutput::Error(e.to_string()),
+                };
+            }
+        };
+
+        match self.tool_broker.call_tool(ctx, resolved_call).await {
             Ok(result) => result,
             Err(e) => ToolResult {
                 call_id: call.id.clone(),
                 output: ToolOutput::Error(e.to_string()),
             },
         }
+    }
+
+    /// Scan tool call arguments for `{{HANDLE}}` tokens and resolve them via
+    /// the SecretsBroker. Returns a new ToolCall with expanded arguments.
+    /// If no SecretsBroker is configured or no handles are found, returns
+    /// the original call unchanged.
+    async fn resolve_secret_handles(
+        &self,
+        ctx: &AgentContext,
+        call: &ToolCall,
+    ) -> Result<ToolCall, NeuromancerError> {
+        let broker = match &self.secrets_broker {
+            Some(b) => b,
+            None => return Ok(call.clone()),
+        };
+
+        let handle_refs = argument_tokens::extract_handle_refs(&call.arguments);
+        if handle_refs.is_empty() {
+            return Ok(call.clone());
+        }
+
+        let mut resolved = std::collections::HashMap::new();
+        for handle in &handle_refs {
+            if !ctx.allowed_secrets.contains(handle) {
+                tracing::warn!(
+                    agent_id = %ctx.agent_id,
+                    handle = %handle,
+                    tool_id = %call.tool_id,
+                    "secret_handle_not_in_allowlist"
+                );
+                continue;
+            }
+            match broker
+                .resolve_handle_for_tool(
+                    ctx,
+                    SecretRef::from(handle.as_str()),
+                    SecretUsage {
+                        tool_id: call.tool_id.clone(),
+                        purpose: format!("tool_call:{}", call.id),
+                    },
+                )
+                .await
+            {
+                Ok(secret) => {
+                    resolved.insert(handle.clone(), secret.value);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %ctx.agent_id,
+                        handle = %handle,
+                        error = ?e,
+                        "secret_handle_resolution_failed"
+                    );
+                }
+            }
+        }
+
+        if resolved.is_empty() {
+            return Ok(call.clone());
+        }
+
+        Ok(ToolCall {
+            id: call.id.clone(),
+            tool_id: call.tool_id.clone(),
+            arguments: argument_tokens::expand_secret_handles(&call.arguments, &resolved),
+        })
     }
 
     async fn send_report(&self, report: SubAgentReport) {

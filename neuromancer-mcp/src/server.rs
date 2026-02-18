@@ -56,6 +56,14 @@ impl StdioMcpServer {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // Clear inherited environment to prevent secret leakage, then inject
+        // only essential system variables and explicitly configured env vars.
+        cmd.env_clear();
+        for key in &["PATH", "HOME", "USER", "LANG", "TERM"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
