@@ -286,16 +286,32 @@ impl ToolBroker for OrchestratorSkillBroker {
 
         let output = result?;
 
+        // Context-aware terminal behavior: wrap collaboration results with
+        // thread cross-reference so the caller can trace the collaboration lineage.
+        let result_json = if let Some(ref thread_id) = collab_thread_id {
+            serde_json::json!({
+                "collaboration": true,
+                "thread_id": thread_id,
+                "summary": output.summary,
+                "artifacts": serde_json::to_value(&output.artifacts).unwrap_or_default(),
+                "token_usage": {
+                    "prompt_tokens": output.token_usage.prompt_tokens,
+                    "completion_tokens": output.token_usage.completion_tokens,
+                    "total_tokens": output.token_usage.total_tokens,
+                },
+            })
+        } else {
+            serde_json::to_value(&output).map_err(|err| {
+                NeuromancerError::Tool(ToolError::ExecutionFailed {
+                    tool_id: "request_agent_assistance".to_string(),
+                    message: err.to_string(),
+                })
+            })?
+        };
+
         Ok(ToolResult {
             call_id: call.id,
-            output: neuromancer_core::tool::ToolOutput::Success(
-                serde_json::to_value(output).map_err(|err| {
-                    NeuromancerError::Tool(ToolError::ExecutionFailed {
-                        tool_id: "request_agent_assistance".to_string(),
-                        message: err.to_string(),
-                    })
-                })?,
-            ),
+            output: neuromancer_core::tool::ToolOutput::Success(result_json),
         })
     }
 }
