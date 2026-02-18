@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use neuromancer_agent::session::AgentSessionId;
 use neuromancer_core::agent::{AgentHealthConfig, CircuitBreakerState, TaskExecutionState};
 use neuromancer_core::error::{AgentError, InfraError, NeuromancerError, ToolError};
 use neuromancer_core::task::{AgentErrorLike, Checkpoint, Task, TaskId, TaskOutput, TaskState};
@@ -39,8 +38,6 @@ pub(crate) struct TaskExecutionContext {
     pub call_id: Option<String>,
     pub thread_id: Option<String>,
     pub trigger_type: TriggerType,
-    pub session_id: Option<AgentSessionId>,
-    pub persisted_message_count: usize,
     pub publish_output: bool,
 }
 

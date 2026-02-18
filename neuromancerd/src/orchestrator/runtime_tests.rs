@@ -61,11 +61,15 @@ async fn test_system0_broker() -> System0ToolBroker {
     let journal = ThreadJournal::new(thread_root).expect("thread journal");
     let task_store = TaskStore::in_memory().await.expect("task store");
     let task_manager = TaskManager::new(task_store).await.expect("task manager");
+    let thread_store = crate::orchestrator::threads::SqliteThreadStore::in_memory()
+        .await
+        .expect("thread store");
+    let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> = Arc::new(thread_store);
     System0ToolBroker::new(
         HashMap::new(),
         test_config_snapshot(),
         &default_system0_tools(),
-        neuromancer_agent::session::InMemorySessionStore::new(),
+        thread_store,
         journal,
         test_self_improvement_config(),
         &["manage-bills".to_string()],

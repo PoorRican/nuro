@@ -8,12 +8,11 @@ use neuromancer_core::rpc::{
     OrchestratorThreadResurrectResult, ThreadSummary,
 };
 
+use neuromancer_core::thread::ThreadStatus;
+
 use crate::orchestrator::error::System0Error;
 use crate::orchestrator::state::{SYSTEM0_AGENT_ID, SubAgentThreadState};
-use crate::orchestrator::tracing::conversation_projection::{
-    conversation_to_thread_messages, reconstruct_subagent_conversation,
-    thread_events_to_thread_messages,
-};
+use crate::orchestrator::tracing::conversation_projection::thread_events_to_thread_messages;
 use crate::orchestrator::tracing::event_query::{
     event_error_text, event_matches_query, event_tool_id,
 };
@@ -327,19 +326,18 @@ impl System0Runtime {
                 ))
             })?;
 
-        let events = self.thread_journal.read_thread_events(&thread_id)?;
-        let session_id = uuid::Uuid::new_v4();
-        let reconstructed = reconstruct_subagent_conversation(&events);
-        self.system0_broker
-            .session_store()
+        // Update thread status to Active in the ThreadStore.
+        let thread_store = self.system0_broker.thread_store().await;
+        if let Err(err) = thread_store
+            .update_status(&thread_id, ThreadStatus::Active)
             .await
-            .save_conversation(session_id, reconstructed.clone())
-            .await;
+        {
+            tracing::warn!(thread_id = %thread_id, error = ?err, "thread_store_resurrect_status_update_failed");
+        }
 
         let thread_state = SubAgentThreadState {
             thread_id: thread_id.clone(),
             agent_id: agent_id.clone(),
-            session_id,
             latest_run_id: summary.latest_run_id.clone(),
             state: "active".to_string(),
             summary: None,
@@ -347,7 +345,6 @@ impl System0Runtime {
             resurrected: true,
             active: true,
             updated_at: now_rfc3339(),
-            persisted_message_count: conversation_to_thread_messages(&reconstructed.messages).len(),
         };
         self.system0_broker.upsert_thread_state(thread_state).await;
 

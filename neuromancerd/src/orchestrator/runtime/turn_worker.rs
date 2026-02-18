@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::rpc::{OrchestratorTurnResult, ThreadEvent};
+use neuromancer_core::thread::{ThreadId, ThreadStore};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
 use crate::orchestrator::error::System0Error;
@@ -15,13 +15,14 @@ use super::extract_response_text;
 
 pub(super) struct System0TurnWorker {
     pub(super) agent_runtime: Arc<AgentRuntime>,
-    pub(super) session_store: InMemorySessionStore,
-    pub(super) session_id: AgentSessionId,
+    pub(super) thread_store: Arc<dyn ThreadStore>,
+    pub(super) system0_thread_id: ThreadId,
     pub(super) system0_broker: System0ToolBroker,
     pub(super) thread_journal: ThreadJournal,
 }
 
 impl System0TurnWorker {
+    #[allow(deprecated)]
     pub(super) async fn process_turn(
         &mut self,
         message: String,
@@ -51,11 +52,12 @@ impl System0TurnWorker {
 
         let output = match self
             .agent_runtime
-            .execute_turn(
-                &self.session_store,
-                self.session_id,
+            .execute_turn_with_thread_store(
+                &*self.thread_store,
+                &self.system0_thread_id,
                 TriggerSource::Cli,
                 message.clone(),
+                turn_id,
             )
             .await
         {

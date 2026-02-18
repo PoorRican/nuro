@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::agent::{RemediationAction, SubAgentReport};
+use neuromancer_core::thread::ThreadStore;
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
@@ -48,11 +48,12 @@ pub(crate) use turn_context::TurnContext;
 
 pub(crate) const SYSTEM0_AGENT_ID: &str = "system0";
 
+/// Lightweight in-memory thread metadata for tracking active threads.
+/// Conversation messages are in ThreadStore (SQLite), not here.
 #[derive(Debug, Clone)]
 pub(crate) struct SubAgentThreadState {
     pub(crate) thread_id: String,
     pub(crate) agent_id: String,
-    pub(crate) session_id: AgentSessionId,
     pub(crate) latest_run_id: Option<String>,
     pub(crate) state: String,
     pub(crate) summary: Option<String>,
@@ -60,7 +61,6 @@ pub(crate) struct SubAgentThreadState {
     pub(crate) resurrected: bool,
     pub(crate) active: bool,
     pub(crate) updated_at: String,
-    pub(crate) persisted_message_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ impl System0ToolBroker {
         subagents: HashMap<String, Arc<AgentRuntime>>,
         config_snapshot: serde_json::Value,
         allowlisted_tools: &[String],
-        session_store: InMemorySessionStore,
+        thread_store: Arc<dyn ThreadStore>,
         thread_journal: ThreadJournal,
         self_improvement: SelfImprovementConfig,
         known_skill_ids: &[String],
@@ -120,7 +120,7 @@ impl System0ToolBroker {
                 turn: TurnContext::new(),
                 agents: AgentRegistry {
                     subagents,
-                    session_store,
+                    thread_store,
                     execution_guard,
                 },
                 tasks: task_manager,
@@ -205,9 +205,9 @@ impl System0ToolBroker {
         inner.last_report_by_run.get(run_id).cloned()
     }
 
-    pub(crate) async fn session_store(&self) -> InMemorySessionStore {
+    pub(crate) async fn thread_store(&self) -> Arc<dyn ThreadStore> {
         let inner = self.inner.lock().await;
-        inner.agents.session_store.clone()
+        inner.agents.thread_store.clone()
     }
 
     pub(crate) async fn runtime_for_agent(&self, agent_id: &str) -> Option<Arc<AgentRuntime>> {
@@ -392,7 +392,6 @@ impl System0ToolBroker {
         &self,
         thread_id: &str,
         run: DelegatedRun,
-        persisted_message_count: usize,
     ) {
         let mut inner = self.inner.lock().await;
         inner
@@ -411,7 +410,6 @@ impl System0ToolBroker {
             }
             state.active = true;
             state.updated_at = now_rfc3339();
-            state.persisted_message_count = persisted_message_count;
         }
     }
 

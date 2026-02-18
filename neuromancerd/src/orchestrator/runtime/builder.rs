@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_agent::session::InMemorySessionStore;
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::AgentError;
 use neuromancer_core::task::TaskState;
+use neuromancer_core::thread::{ThreadId, ThreadStore};
 use neuromancer_core::tool::ToolBroker;
 use neuromancer_core::xdg::{XdgLayout, resolve_path};
 use neuromancer_skills::SkillRegistry;
@@ -143,15 +143,15 @@ pub(super) fn build_system0_agent(
 
 pub(super) fn spawn_turn_worker(
     system0_agent_runtime: Arc<AgentRuntime>,
-    session_store: InMemorySessionStore,
+    thread_store: Arc<dyn ThreadStore>,
+    system0_thread_id: ThreadId,
     system0_broker: System0ToolBroker,
     thread_journal: ThreadJournal,
 ) -> (mpsc::Sender<TurnRequest>, tokio::task::JoinHandle<()>) {
-    let session_id = uuid::Uuid::new_v4();
     let core = Arc::new(AsyncMutex::new(System0TurnWorker {
         agent_runtime: system0_agent_runtime,
-        session_store: session_store.clone(),
-        session_id,
+        thread_store,
+        system0_thread_id,
         system0_broker,
         thread_journal,
     }));

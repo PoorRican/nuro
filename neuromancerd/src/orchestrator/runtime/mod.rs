@@ -1,12 +1,12 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use neuromancer_agent::session::InMemorySessionStore;
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorTurnResult, ThreadSummary,
 };
+use neuromancer_core::thread::{AgentThread, CompactionPolicy, ThreadScope, ThreadStatus};
 use neuromancer_core::task::{Task, TaskId, TaskOutput};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
@@ -17,10 +17,9 @@ use crate::orchestrator::actions::dispatch::dispatch_tool;
 use crate::orchestrator::bootstrap::map_xdg_err;
 use crate::orchestrator::error::System0Error;
 use crate::orchestrator::state::{ActiveRunContext, System0ToolBroker, TaskManager, TaskStore};
+use crate::orchestrator::threads::SqliteThreadStore;
 use crate::orchestrator::tools::effective_system0_tool_allowlist;
-use crate::orchestrator::tracing::conversation_projection::{
-    conversation_to_thread_messages, normalize_error_message,
-};
+use crate::orchestrator::tracing::conversation_projection::normalize_error_message;
 use crate::orchestrator::tracing::thread_journal::{ThreadJournal, make_event, now_rfc3339};
 
 mod builder;
@@ -85,12 +84,46 @@ impl System0Runtime {
         let config_snapshot =
             serde_json::to_value(config).map_err(|err| System0Error::Config(err.to_string()))?;
 
-        let session_store = InMemorySessionStore::new();
+        let thread_store = SqliteThreadStore::open(&layout.runtime_root().join("threads.sqlite"))
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let thread_store: std::sync::Arc<dyn neuromancer_core::thread::ThreadStore> =
+            std::sync::Arc::new(thread_store);
+
+        // Ensure System0's AgentThread exists.
+        let system0_thread_id = crate::orchestrator::state::SYSTEM0_AGENT_ID.to_string();
+        if thread_store
+            .get_thread(&system0_thread_id)
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?
+            .is_none()
+        {
+            let now = chrono::Utc::now();
+            let system0_thread = AgentThread {
+                id: system0_thread_id.clone(),
+                agent_id: crate::orchestrator::state::SYSTEM0_AGENT_ID.to_string(),
+                scope: ThreadScope::System0,
+                compaction_policy: CompactionPolicy::SummarizeToMemory {
+                    target_partition: "system0".to_string(),
+                    summarizer_model: "default".to_string(),
+                    threshold_pct: 0.8,
+                },
+                context_window_budget: 128_000,
+                status: ThreadStatus::Active,
+                created_at: now,
+                updated_at: now,
+            };
+            thread_store
+                .create_thread(&system0_thread)
+                .await
+                .map_err(|err| System0Error::Config(err.to_string()))?;
+        }
+
         let system0_broker = System0ToolBroker::new(
             subagents,
             config_snapshot,
             &allowlisted_system0_tools,
-            session_store.clone(),
+            thread_store.clone(),
             thread_journal.clone(),
             config.orchestrator.self_improvement.clone(),
             &known_skill_ids,
@@ -118,7 +151,8 @@ impl System0Runtime {
 
         let (turn_tx, turn_worker) = builder::spawn_turn_worker(
             system0_agent_runtime,
-            session_store,
+            thread_store,
+            system0_thread_id,
             system0_broker,
             thread_journal.clone(),
         );
@@ -233,7 +267,7 @@ impl System0Runtime {
             .runtime_for_agent(&state.agent_id)
             .await
             .ok_or_else(|| System0Error::ResourceNotFound(format!("agent '{}'", state.agent_id)))?;
-        let session_store = self.system0_broker.session_store().await;
+        let thread_store = self.system0_broker.thread_store().await;
         let run_uuid = uuid::Uuid::new_v4();
         let run_id = run_uuid.to_string();
         self.system0_broker
@@ -245,10 +279,11 @@ impl System0Runtime {
                 call_id: None,
             })
             .await;
+        #[allow(deprecated)]
         let run_result = runtime
-            .execute_turn_with_task_id(
-                &session_store,
-                state.session_id,
+            .execute_turn_with_thread_store(
+                &*thread_store,
+                &thread_id,
                 TriggerSource::Internal,
                 message.clone(),
                 run_uuid,
@@ -266,25 +301,6 @@ impl System0Runtime {
             }
         };
 
-        let conversation = session_store.get(state.session_id).await.ok_or_else(|| {
-            System0Error::Internal(format!("missing conversation for thread '{thread_id}'"))
-        })?;
-        let thread_messages = conversation_to_thread_messages(&conversation.conversation.messages);
-        let delta = thread_messages
-            .iter()
-            .skip(state.persisted_message_count)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        self.thread_journal
-            .append_messages(
-                &thread_id,
-                "subagent",
-                Some(&state.agent_id),
-                Some(&run_id),
-                &delta,
-            )
-            .await?;
         if let Some(err) = &error {
             self.thread_journal
                 .append_event(make_event(
@@ -311,7 +327,7 @@ impl System0Runtime {
             error: error.clone(),
         };
         self.system0_broker
-            .record_subagent_turn_result(&thread_id, delegated_run.clone(), thread_messages.len())
+            .record_subagent_turn_result(&thread_id, delegated_run.clone())
             .await;
 
         let snapshot = ThreadSummary {

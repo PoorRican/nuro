@@ -1,11 +1,11 @@
 use std::time::Instant;
 
 use neuromancer_agent::runtime::AgentRuntime;
-use neuromancer_agent::session::{AgentSessionId, InMemorySessionStore};
 use neuromancer_core::argument_tokens::expand_user_query_tokens;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{DelegatedRun, OrchestratorOutputItem, ThreadSummary, TurnDelegation};
 use neuromancer_core::task::{Artifact, ArtifactKind, Task, TaskOutput, TaskState, TokenUsage};
+use neuromancer_core::thread::{AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, ThreadStore, TruncationStrategy};
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
@@ -14,9 +14,7 @@ use crate::orchestrator::state::{
     task_manager::running_state, task_manager::task_failure_payload,
 };
 use crate::orchestrator::tool_id::RuntimeToolId;
-use crate::orchestrator::tracing::conversation_projection::{
-    conversation_to_thread_messages, normalize_error_message,
-};
+use crate::orchestrator::tracing::conversation_projection::normalize_error_message;
 use crate::orchestrator::tracing::thread_journal::{
     ThreadJournal, make_event, now_rfc3339, sanitize_thread_file_component,
 };
@@ -144,14 +142,34 @@ impl System0ToolBroker {
                         .collect::<String>()
                 );
                 let now = now_rfc3339();
-                let session_id = uuid::Uuid::new_v4();
                 let current_trigger_type = inner.turn.current_trigger_type;
                 let thread_journal = inner.threads.thread_journal.clone();
+                let thread_store = inner.agents.thread_store.clone();
                 let call_id = call.id.clone();
                 let tasks = inner.tasks.clone();
                 drop(inner);
 
-                let persisted_count_before_delta = journal_thread_created(
+                // Create AgentThread in the thread store for this delegation.
+                let chrono_now = chrono::Utc::now();
+                let agent_thread = AgentThread {
+                    id: thread_id.clone(),
+                    agent_id: agent_id.clone(),
+                    scope: ThreadScope::Task {
+                        task_id: task_id.to_string(),
+                    },
+                    compaction_policy: CompactionPolicy::InPlace {
+                        strategy: TruncationStrategy::default(),
+                    },
+                    context_window_budget: 128_000,
+                    status: ThreadStatus::Active,
+                    created_at: chrono_now,
+                    updated_at: chrono_now,
+                };
+                if let Err(err) = thread_store.create_thread(&agent_thread).await {
+                    tracing::error!(thread_id = %thread_id, error = ?err, "thread_store_create_failed");
+                }
+
+                journal_thread_created(
                     &thread_journal,
                     &thread_id,
                     &agent_id,
@@ -170,8 +188,6 @@ impl System0ToolBroker {
                             call_id: Some(call_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             trigger_type: current_trigger_type,
-                            session_id: Some(session_id),
-                            persisted_message_count: persisted_count_before_delta,
                             publish_output: true,
                         },
                     )
@@ -187,7 +203,6 @@ impl System0ToolBroker {
                 let thread_state = SubAgentThreadState {
                     thread_id: thread_id.clone(),
                     agent_id: agent_id.clone(),
-                    session_id,
                     latest_run_id: Some(run_id.clone()),
                     state: "queued".to_string(),
                     summary: None,
@@ -195,7 +210,6 @@ impl System0ToolBroker {
                     resurrected: false,
                     active: true,
                     updated_at: now.clone(),
-                    persisted_message_count: 0,
                 };
                 inner
                     .threads
@@ -269,8 +283,6 @@ pub(crate) async fn execute_queued_task(
             call_id: None,
             thread_id: None,
             trigger_type: TriggerType::Internal,
-            session_id: None,
-            persisted_message_count: 0,
             publish_output: false,
         });
     let run_id = task.id.to_string();
@@ -313,16 +325,18 @@ pub(crate) async fn execute_queued_task(
         return Ok(());
     };
 
-    let thread_journal = {
+    let (thread_journal, thread_store) = {
         let inner = broker.inner.lock().await;
-        inner.threads.thread_journal.clone()
+        (
+            inner.threads.thread_journal.clone(),
+            inner.agents.thread_store.clone(),
+        )
     };
-    let session_store = broker.session_store().await;
 
     run_delegated_task(
         broker,
         runtime,
-        session_store,
+        thread_store,
         thread_journal,
         context.turn_id.unwrap_or_else(uuid::Uuid::new_v4),
         context.trigger_type,
@@ -331,8 +345,6 @@ pub(crate) async fn execute_queued_task(
         thread_id,
         task.assigned_agent,
         task.instruction,
-        context.session_id.unwrap_or_else(uuid::Uuid::new_v4),
-        context.persisted_message_count,
         context.publish_output,
         task.id,
     )
@@ -417,7 +429,7 @@ impl DelegationContext {
 async fn run_delegated_task(
     broker: System0ToolBroker,
     runtime: std::sync::Arc<AgentRuntime>,
-    session_store: InMemorySessionStore,
+    thread_store: std::sync::Arc<dyn ThreadStore>,
     thread_journal: ThreadJournal,
     turn_id: uuid::Uuid,
     current_trigger_type: TriggerType,
@@ -426,8 +438,6 @@ async fn run_delegated_task(
     thread_id: String,
     agent_id: String,
     instruction: String,
-    session_id: AgentSessionId,
-    persisted_count_before_delta: usize,
     publish_output: bool,
     task_id: neuromancer_core::task::TaskId,
 ) {
@@ -483,10 +493,11 @@ async fn run_delegated_task(
 
     // --- Execute the agent turn ---
     let initial_instruction = instruction.clone();
+    #[allow(deprecated)]
     let result = runtime
-        .execute_turn_with_task_id(
-            &session_store,
-            session_id,
+        .execute_turn_with_thread_store(
+            &*thread_store,
+            &thread_id,
             TriggerSource::Internal,
             instruction,
             task_id,
@@ -494,14 +505,11 @@ async fn run_delegated_task(
         .await;
 
     // --- Process the result ---
-    let (run_state, summary, error, full_output, persisted_message_count, task_output) =
+    let (run_state, summary, error, full_output, task_output) =
         process_delegation_result(
             &ctx,
             &broker,
             result,
-            &session_store,
-            session_id,
-            persisted_count_before_delta,
             &delegation_started_at,
         )
         .await;
@@ -529,7 +537,6 @@ async fn run_delegated_task(
             state.state = run_state.clone();
             state.summary = summary.clone();
             state.updated_at = now_rfc3339();
-            state.persisted_message_count = persisted_message_count;
             state.active = true;
         }
     }
@@ -612,16 +619,12 @@ async fn process_delegation_result(
     ctx: &DelegationContext,
     broker: &System0ToolBroker,
     result: Result<neuromancer_agent::runtime::TurnExecutionResult, NeuromancerError>,
-    session_store: &InMemorySessionStore,
-    session_id: AgentSessionId,
-    persisted_count_before_delta: usize,
     started_at: &Instant,
 ) -> (
     String,
     Option<String>,
     Option<String>,
     Option<String>,
-    usize,
     Option<TaskOutput>,
 ) {
     match result {
@@ -641,55 +644,14 @@ async fn process_delegation_result(
                 summary_text = "Task completed with NO_REPLY".to_string();
             }
 
-            match session_store.get(session_id).await {
-                Some(conversation) => {
-                    let thread_messages =
-                        conversation_to_thread_messages(&conversation.conversation.messages);
-                    let delta = thread_messages
-                        .iter()
-                        .skip(persisted_count_before_delta)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if let Err(err) = ctx
-                        .thread_journal
-                        .append_messages(
-                            &ctx.thread_id,
-                            "subagent",
-                            Some(&ctx.agent_id),
-                            Some(&ctx.run_id),
-                            &delta,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            thread_id = %ctx.thread_id, run_id = %ctx.run_id,
-                            error = ?err, "thread_journal_delta_write_failed"
-                        );
-                    }
-                    (
-                        "completed".to_string(),
-                        Some(summary_text),
-                        None,
-                        full_output,
-                        thread_messages.len(),
-                        Some(output),
-                    )
-                }
-                None => {
-                    let msg = format!(
-                        "missing sub-agent conversation state for thread '{}'",
-                        ctx.thread_id
-                    );
-                    (
-                        "failed".to_string(),
-                        Some(msg.clone()),
-                        Some(msg),
-                        full_output,
-                        persisted_count_before_delta,
-                        Some(output),
-                    )
-                }
-            }
+            // Messages are already persisted by execute_turn_with_thread_store.
+            (
+                "completed".to_string(),
+                Some(summary_text),
+                None,
+                full_output,
+                Some(output),
+            )
         }
         Err(err) => {
             let normalized = normalize_error_message(err.to_string());
@@ -714,7 +676,6 @@ async fn process_delegation_result(
                 Some(enriched.clone()),
                 Some(enriched),
                 None,
-                persisted_count_before_delta,
                 None,
             )
         }
@@ -833,7 +794,7 @@ async fn journal_thread_created(
     instruction: &str,
     turn_id: uuid::Uuid,
     call_id: &str,
-) -> usize {
+) {
     let created = ThreadSummary {
         thread_id: thread_id.to_string(),
         kind: "subagent".to_string(),
@@ -872,11 +833,7 @@ async fn journal_thread_created(
     );
     event.turn_id = Some(turn_id.to_string());
     event.call_id = Some(call_id.to_string());
-    match thread_journal.append_event(event).await {
-        Ok(()) => 1,
-        Err(err) => {
-            tracing::error!(thread_id = %thread_id, error = ?err, "thread_journal_write_failed");
-            0
-        }
+    if let Err(err) = thread_journal.append_event(event).await {
+        tracing::error!(thread_id = %thread_id, error = ?err, "thread_journal_write_failed");
     }
 }
