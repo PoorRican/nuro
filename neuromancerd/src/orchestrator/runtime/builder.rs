@@ -158,6 +158,7 @@ pub(super) fn spawn_turn_worker(
         system0_thread_id,
         system0_broker,
         thread_journal,
+        text_redactor: None,
     }));
 
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnRequest>(128);

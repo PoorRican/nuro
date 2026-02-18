@@ -108,6 +108,19 @@ pub struct SecretAcl {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Lightweight text redaction interface for scanning outbound text.
+///
+/// Implementors (e.g., Aho-Corasick-based `SecretScanner`) detect raw,
+/// base64-encoded, and URL-encoded secret values and replace them with
+/// `[REDACTED:<id>]` markers.
+pub trait TextRedactor: Send + Sync {
+    /// Replace all detected secret values in `text` with redaction markers.
+    fn redact(&self, text: &str) -> String;
+
+    /// Return the secret IDs detected in `text` (for logging/audit).
+    fn scan(&self, text: &str) -> Vec<String>;
+}
+
 /// Handle-based secret resolution. Secrets never enter LLM context.
 #[async_trait]
 pub trait SecretsBroker: Send + Sync {

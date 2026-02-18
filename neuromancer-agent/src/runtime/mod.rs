@@ -9,7 +9,7 @@ use std::time::Instant;
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
 use neuromancer_core::argument_tokens;
 use neuromancer_core::error::{AgentError, NeuromancerError};
-use neuromancer_core::secrets::{SecretRef, SecretUsage, SecretsBroker};
+use neuromancer_core::secrets::{SecretRef, SecretUsage, SecretsBroker, TextRedactor};
 use neuromancer_core::task::{
     AgentErrorLike, AgentOutput, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput,
     TaskState, TokenUsage,
@@ -35,6 +35,7 @@ pub struct AgentRuntime {
     llm_client: Arc<dyn LlmClient>,
     tool_broker: Arc<dyn ToolBroker>,
     secrets_broker: Option<Arc<dyn SecretsBroker>>,
+    text_redactor: Option<Arc<dyn TextRedactor>>,
     report_tx: tokio::sync::mpsc::Sender<SubAgentReport>,
     tool_call_retry_limit: u32,
 }
@@ -52,6 +53,7 @@ impl AgentRuntime {
             llm_client,
             tool_broker,
             secrets_broker: None,
+            text_redactor: None,
             report_tx,
             tool_call_retry_limit,
         }
@@ -59,6 +61,11 @@ impl AgentRuntime {
 
     pub fn with_secrets_broker(mut self, broker: Arc<dyn SecretsBroker>) -> Self {
         self.secrets_broker = Some(broker);
+        self
+    }
+
+    pub fn with_text_redactor(mut self, redactor: Arc<dyn TextRedactor>) -> Self {
+        self.text_redactor = Some(redactor);
         self
     }
 
@@ -535,13 +542,31 @@ impl AgentRuntime {
             }
         };
 
-        match self.tool_broker.call_tool(ctx, resolved_call).await {
+        let result = match self.tool_broker.call_tool(ctx, resolved_call).await {
             Ok(result) => result,
             Err(e) => ToolResult {
                 call_id: call.id.clone(),
                 output: ToolOutput::Error(e.to_string()),
             },
-        }
+        };
+
+        // Chokepoint: scan tool result for leaked secrets before it enters
+        // conversation context (which feeds back into LLM completions).
+        self.redact_tool_result(result)
+    }
+
+    fn redact_tool_result(&self, mut result: ToolResult) -> ToolResult {
+        let redactor = match &self.text_redactor {
+            Some(r) => r,
+            None => return result,
+        };
+        result.output = match result.output {
+            ToolOutput::Success(value) => {
+                ToolOutput::Success(redact_json_value(&**redactor, value))
+            }
+            ToolOutput::Error(text) => ToolOutput::Error(redactor.redact(&text)),
+        };
+        result
     }
 
     /// Scan tool call arguments for `{{HANDLE}}` tokens and resolve them via
@@ -614,6 +639,26 @@ impl AgentRuntime {
         if let Err(e) = self.report_tx.send(report).await {
             tracing::error!("failed to send agent report: {e}");
         }
+    }
+}
+
+/// Recursively redact secret values in a JSON tree.
+fn redact_json_value(redactor: &dyn TextRedactor, value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redactor.redact(&s)),
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|v| redact_json_value(redactor, v))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let redacted = map
+                .into_iter()
+                .map(|(k, v)| (k, redact_json_value(redactor, v)))
+                .collect();
+            serde_json::Value::Object(redacted)
+        }
+        other => other,
     }
 }
 

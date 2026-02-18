@@ -2,5 +2,6 @@
 
 pub mod audit;
 pub mod execution_guard;
+pub mod redacting_memory;
 pub mod redaction;
 pub mod trigger_gate;

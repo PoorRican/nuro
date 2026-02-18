@@ -5,6 +5,7 @@ use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_core::memory::{MemoryKind, MemoryQuery, MemoryStore};
 use neuromancer_core::rpc::{OrchestratorTurnResult, ThreadEvent};
 use neuromancer_core::thread::{ChatMessage, ThreadId, ThreadStore};
+use neuromancer_core::secrets::TextRedactor;
 use neuromancer_core::tool::AgentContext;
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
@@ -22,6 +23,7 @@ pub(super) struct System0TurnWorker {
     pub(super) system0_thread_id: ThreadId,
     pub(super) system0_broker: System0ToolBroker,
     pub(super) thread_journal: ThreadJournal,
+    pub(super) text_redactor: Option<Arc<dyn TextRedactor>>,
 }
 
 impl System0TurnWorker {
@@ -94,7 +96,11 @@ impl System0TurnWorker {
             }
         };
 
-        let response = output.output.message.clone();
+        // Chokepoint: scan outbound response for leaked secrets before CLI delivery.
+        let response = match &self.text_redactor {
+            Some(redactor) => redactor.redact(&output.output.message),
+            None => output.output.message.clone(),
+        };
         let delegated_tasks = self.system0_broker.take_delegations(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
 

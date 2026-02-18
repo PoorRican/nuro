@@ -8,6 +8,8 @@ use neuromancer_core::agent::SubAgentReport;
 use neuromancer_core::rpc::{ThreadEvent, ThreadSummary};
 use tokio::sync::Mutex as AsyncMutex;
 
+use neuromancer_core::secrets::TextRedactor;
+
 use crate::orchestrator::error::System0Error;
 use crate::orchestrator::security::redaction::{collect_secret_values, sanitize_event_payload};
 use crate::orchestrator::tracing::conversation_projection::infer_thread_state_from_events;
@@ -25,6 +27,8 @@ pub(crate) struct ThreadJournal {
     seq_cache: Arc<AsyncMutex<HashMap<String, u64>>>,
     /// Cached secret values used for redaction when writing events.
     secret_values: Arc<Vec<String>>,
+    /// Optional Aho-Corasick scanner for deeper secret detection (base64, URL-encoded).
+    text_redactor: Option<Arc<dyn TextRedactor>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,7 +75,12 @@ impl ThreadJournal {
             lock: Arc::new(AsyncMutex::new(())),
             seq_cache: Arc::new(AsyncMutex::new(HashMap::new())),
             secret_values: Arc::new(collect_secret_values()),
+            text_redactor: None,
         })
+    }
+
+    pub(crate) fn set_text_redactor(&mut self, redactor: Arc<dyn TextRedactor>) {
+        self.text_redactor = Some(redactor);
     }
 
     fn system_thread_file(&self) -> PathBuf {
@@ -122,6 +131,19 @@ impl ThreadJournal {
         } else {
             event.payload = serde_json::json!({ "omitted": "sensitive_payload" });
             event.redaction_applied = true;
+        }
+
+        // Second pass: Aho-Corasick scanner catches base64/URL-encoded variants
+        // that the basic string-matching redaction above may miss.
+        if let Some(redactor) = &self.text_redactor {
+            let payload_str = serde_json::to_string(&event.payload).unwrap_or_default();
+            if !redactor.scan(&payload_str).is_empty() {
+                let redacted_str = redactor.redact(&payload_str);
+                if let Ok(v) = serde_json::from_str(&redacted_str) {
+                    event.payload = v;
+                    event.redaction_applied = true;
+                }
+            }
         }
 
         append_jsonl_line(&path, &event)?;

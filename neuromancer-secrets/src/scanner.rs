@@ -87,6 +87,16 @@ impl SecretScanner {
     }
 }
 
+impl neuromancer_core::secrets::TextRedactor for SecretScanner {
+    fn redact(&self, text: &str) -> String {
+        self.redact(text)
+    }
+
+    fn scan(&self, text: &str) -> Vec<String> {
+        self.scan(text)
+    }
+}
+
 /// Thread-safe, atomically swappable scanner handle.
 pub type SharedScanner = Arc<ArcSwap<SecretScanner>>;
 
