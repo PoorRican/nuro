@@ -14,7 +14,6 @@ use crate::orchestrator::threads::compaction;
 use crate::orchestrator::tracing::conversation_projection::normalize_error_message;
 use crate::orchestrator::tracing::thread_journal::{ThreadJournal, make_event};
 
-use super::extract_response_text;
 
 pub(super) struct System0TurnWorker {
     pub(super) agent_runtime: Arc<AgentRuntime>,
@@ -95,8 +94,7 @@ impl System0TurnWorker {
             }
         };
 
-        let response =
-            extract_response_text(&output.output).unwrap_or_else(|| output.output.summary.clone());
+        let response = output.output.message.clone();
         let delegated_tasks = self.system0_broker.take_delegations(turn_id).await;
         let tool_invocations = self.system0_broker.take_tool_invocations(turn_id).await;
 

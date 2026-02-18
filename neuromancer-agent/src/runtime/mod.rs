@@ -9,8 +9,8 @@ use std::time::Instant;
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
 use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::task::{
-    AgentErrorLike, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput, TaskState,
-    TokenUsage,
+    AgentErrorLike, AgentOutput, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput,
+    TaskState, TokenUsage,
 };
 use neuromancer_core::thread::{ThreadId, ThreadStore};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult};
@@ -24,7 +24,7 @@ use helpers::{available_tool_names, specs_to_rig_definitions, truncate_summary};
 #[derive(Debug, Clone)]
 pub struct TurnExecutionResult {
     pub task_id: uuid::Uuid,
-    pub output: TaskOutput,
+    pub output: AgentOutput,
 }
 
 /// Agent runtime that manages a single task execution through the state machine.
@@ -456,22 +456,19 @@ impl AgentRuntime {
             let output_text = response.text.unwrap_or_default();
             conversation.add_message(ChatMessage::assistant_text(output_text.clone()));
 
-            let output = TaskOutput {
-                artifacts: vec![Artifact {
-                    kind: ArtifactKind::Text,
-                    name: "response".into(),
-                    content: output_text.clone(),
-                    mime_type: Some("text/plain".into()),
-                }],
-                summary: truncate_summary(&output_text, 200),
+            let agent_output = AgentOutput {
+                message: output_text,
                 token_usage: total_usage,
                 duration: start.elapsed(),
             };
 
+            // Convert to TaskOutput for state machine bookkeeping (checkpoint, task state).
+            let task_output = agent_output.clone().into_task_output();
+
             let checkpoint = Checkpoint {
                 task_id: task.id,
                 state_data: serde_json::to_value(&TaskExecutionState::Completed {
-                    output: output.clone(),
+                    output: task_output.clone(),
                 })
                 .unwrap_or_default(),
                 created_at: chrono::Utc::now(),
@@ -481,15 +478,15 @@ impl AgentRuntime {
             self.send_report(SubAgentReport::Completed {
                 task_id: task.id,
                 thread_id: None,
-                artifacts: output.artifacts.clone(),
-                summary: output.summary.clone(),
+                artifacts: task_output.artifacts.clone(),
+                summary: task_output.summary.clone(),
             })
             .await;
             task.state = TaskState::Completed {
-                output: output.clone(),
+                output: task_output,
             };
 
-            break Ok(output);
+            break Ok(agent_output);
         };
 
         // Flush new messages (delta) to thread store — always, even on failure
@@ -912,10 +909,6 @@ mod tests {
             )
             .await
             .expect("turn recovery should succeed");
-        assert!(
-            output.output.artifacts[0]
-                .content
-                .contains("Recovered turn response")
-        );
+        assert!(output.output.message.contains("Recovered turn response"));
     }
 }

@@ -630,14 +630,11 @@ async fn process_delegation_result(
 ) {
     match result {
         Ok(turn_output) => {
-            let output = turn_output.output.clone();
-            let response_text =
-                crate::orchestrator::runtime::extract_response_text(&turn_output.output)
-                    .unwrap_or_else(|| turn_output.output.summary.clone());
+            let response_text = turn_output.output.message.clone();
             let is_no_reply = response_text.trim() == "NO_REPLY";
-            let full_output = Some(response_text.clone());
+            let task_output = turn_output.output.into_task_output();
 
-            let mut summary_text = turn_output.output.summary.clone();
+            let mut summary_text = task_output.summary.clone();
             if summary_text.trim().is_empty() {
                 summary_text = response_text.clone();
             }
@@ -650,8 +647,8 @@ async fn process_delegation_result(
                 "completed".to_string(),
                 Some(summary_text),
                 None,
-                full_output,
-                Some(output),
+                Some(response_text),
+                Some(task_output),
             )
         }
         Err(err) => {

@@ -174,6 +174,36 @@ pub struct AgentOutput {
     pub duration: Duration,
 }
 
+impl AgentOutput {
+    /// Convert to a TaskOutput by wrapping the message as a text artifact.
+    /// This is the fallback when no structured extraction step is performed.
+    pub fn into_task_output(self) -> TaskOutput {
+        let summary_len = 200;
+        let summary = if self.message.len() <= summary_len {
+            self.message.clone()
+        } else {
+            let end = self
+                .message
+                .char_indices()
+                .nth(summary_len)
+                .map(|(i, _)| i)
+                .unwrap_or(self.message.len());
+            format!("{}...", &self.message[..end])
+        };
+        TaskOutput {
+            artifacts: vec![Artifact {
+                kind: ArtifactKind::Text,
+                name: "response".to_string(),
+                content: self.message,
+                mime_type: Some("text/plain".to_string()),
+            }],
+            summary,
+            token_usage: self.token_usage,
+            duration: self.duration,
+        }
+    }
+}
+
 /// Result of a collaboration between agents, wrapping the raw output with a
 /// cross-reference back to the collaboration thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]

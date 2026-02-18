@@ -318,7 +318,7 @@ impl System0Runtime {
         let (run_state, response, error) = match run_result {
             Ok(run) => (
                 "completed".to_string(),
-                extract_response_text(&run.output).unwrap_or_else(|| run.output.summary.clone()),
+                run.output.message.clone(),
                 None,
             ),
             Err(err) => {
@@ -417,13 +417,6 @@ impl ToolBroker for System0ToolBroker {
 
         dispatch_tool(self, call).await
     }
-}
-
-pub(crate) fn extract_response_text(output: &neuromancer_core::task::TaskOutput) -> Option<String> {
-    output
-        .artifacts
-        .first()
-        .map(|artifact| artifact.content.clone())
 }
 
 #[cfg(test)]
