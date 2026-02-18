@@ -65,6 +65,7 @@ pub(super) fn build_subagents(
     execution_guard: &Arc<dyn ExecutionGuard>,
     report_tx: &mpsc::Sender<neuromancer_core::agent::SubAgentReport>,
     task_manager: &TaskManager,
+    thread_store: &Arc<dyn neuromancer_core::thread::ThreadStore>,
 ) -> Result<HashMap<String, Arc<AgentRuntime>>, System0Error> {
     let mut subagents = HashMap::new();
     for (agent_id, agent_toml) in &config.agents {
@@ -91,6 +92,7 @@ pub(super) fn build_subagents(
         let broker: Arc<dyn ToolBroker> = Arc::new(OrchestratorSkillBroker::new(
             skill_broker,
             task_manager.clone(),
+            thread_store.clone(),
         ));
 
         let runtime = Arc::new(AgentRuntime::new(

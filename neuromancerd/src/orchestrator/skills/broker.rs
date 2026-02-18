@@ -1,29 +1,39 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use neuromancer_core::agent::TaskExecutionState;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::task::{Checkpoint, Task, TaskPriority, TaskState};
+use neuromancer_core::thread::{
+    AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, ThreadStore, TruncationStrategy,
+};
 use neuromancer_core::tool::{
     AgentContext, ToolBroker, ToolCall, ToolResult, ToolSource, ToolSpec,
 };
-use neuromancer_core::trigger::TriggerSource;
+use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_skills::SkillToolBroker;
 
 use crate::orchestrator::state::task_manager::running_state;
-use crate::orchestrator::state::{PersistedCheckpoint, TaskManager};
+use crate::orchestrator::state::{PersistedCheckpoint, TaskExecutionContext, TaskManager};
 
 #[derive(Clone)]
 pub(crate) struct OrchestratorSkillBroker {
     skill_broker: SkillToolBroker,
     task_manager: TaskManager,
+    thread_store: Arc<dyn ThreadStore>,
 }
 
 impl OrchestratorSkillBroker {
-    pub(crate) fn new(skill_broker: SkillToolBroker, task_manager: TaskManager) -> Self {
+    pub(crate) fn new(
+        skill_broker: SkillToolBroker,
+        task_manager: TaskManager,
+        thread_store: Arc<dyn ThreadStore>,
+    ) -> Self {
         Self {
             skill_broker,
             task_manager,
+            thread_store,
         }
     }
 
@@ -45,6 +55,68 @@ impl OrchestratorSkillBroker {
             }),
             source: ToolSource::Builtin,
         }
+    }
+
+    /// Find an existing collaboration thread or create a new one.
+    /// The collaboration thread is keyed by (target_agent, parent_thread_id).
+    async fn find_or_create_collaboration_thread(
+        &self,
+        target_agent: &str,
+        parent_thread_id: &str,
+    ) -> Result<AgentThread, NeuromancerError> {
+        let parent_id = parent_thread_id.to_string();
+        if let Some(existing) = self
+            .thread_store
+            .find_collaboration_thread(target_agent, &parent_id)
+            .await?
+        {
+            tracing::debug!(
+                thread_id = %existing.id,
+                target_agent = %target_agent,
+                parent_thread_id = %parent_thread_id,
+                "collaboration_thread_reused"
+            );
+            return Ok(existing);
+        }
+
+        let thread_id = format!(
+            "collab-{}-{}",
+            target_agent,
+            uuid::Uuid::new_v4()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>()
+        );
+        let now = Utc::now();
+        let thread = AgentThread {
+            id: thread_id.clone(),
+            agent_id: target_agent.to_string(),
+            scope: ThreadScope::Collaboration {
+                parent_thread_id: parent_thread_id.to_string(),
+                root_scope: Box::new(ThreadScope::Task {
+                    task_id: parent_thread_id.to_string(),
+                }),
+            },
+            compaction_policy: CompactionPolicy::InPlace {
+                strategy: TruncationStrategy::default(),
+            },
+            context_window_budget: 128_000,
+            status: ThreadStatus::Active,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.thread_store.create_thread(&thread).await?;
+
+        tracing::info!(
+            thread_id = %thread_id,
+            target_agent = %target_agent,
+            parent_thread_id = %parent_thread_id,
+            "collaboration_thread_created"
+        );
+
+        Ok(thread)
     }
 }
 
@@ -116,8 +188,33 @@ impl ToolBroker for OrchestratorSkillBroker {
             None => instruction,
         };
 
-        // Caller enters WaitingForInput while the child task runs.
-        let wait_checkpoint = assistance_wait_checkpoint(ctx.task_id, &target_agent);
+        // Resolve the caller's thread_id from execution context for collaboration thread linkage.
+        let caller_thread_id = self
+            .task_manager
+            .execution_context_for(ctx.task_id)
+            .await
+            .and_then(|exec_ctx| exec_ctx.thread_id);
+
+        // Find or create a collaboration thread for the target agent.
+        let collaboration_thread = if let Some(parent_thread_id) = &caller_thread_id {
+            Some(
+                self.find_or_create_collaboration_thread(&target_agent, parent_thread_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let collab_thread_id = collaboration_thread
+            .as_ref()
+            .map(|thread| thread.id.clone());
+
+        // Caller enters WaitingForCollaboration while the child task runs.
+        let wait_checkpoint = collaboration_wait_checkpoint(
+            ctx.task_id,
+            &target_agent,
+            collab_thread_id.as_deref().unwrap_or("unknown"),
+            &call.id,
+        );
         if let Err(err) = self
             .task_manager
             .transition(
@@ -135,10 +232,30 @@ impl ToolBroker for OrchestratorSkillBroker {
             );
         }
 
-        let mut task = Task::new(TriggerSource::Internal, child_instruction, target_agent);
+        let mut task = Task::new(
+            TriggerSource::Internal,
+            child_instruction,
+            target_agent.clone(),
+        );
         task.parent_id = Some(ctx.task_id);
         task.priority = TaskPriority::Normal;
         task.state = TaskState::Queued;
+
+        // Register execution context so the task worker uses the collaboration thread.
+        if let Some(thread_id) = &collab_thread_id {
+            self.task_manager
+                .register_execution_context(
+                    task.id,
+                    TaskExecutionContext {
+                        turn_id: None,
+                        call_id: Some(call.id.clone()),
+                        thread_id: Some(thread_id.clone()),
+                        trigger_type: TriggerType::Internal,
+                        publish_output: false,
+                    },
+                )
+                .await;
+        }
 
         let task_id = self.task_manager.enqueue_direct(task).await?;
         let result = self
@@ -183,18 +300,26 @@ impl ToolBroker for OrchestratorSkillBroker {
     }
 }
 
-fn assistance_wait_checkpoint(task_id: uuid::Uuid, target_agent: &str) -> PersistedCheckpoint {
+fn collaboration_wait_checkpoint(
+    task_id: uuid::Uuid,
+    target_agent: &str,
+    collaboration_thread_id: &str,
+    call_id: &str,
+) -> PersistedCheckpoint {
     let created_at = Utc::now();
     let marker = Checkpoint {
         task_id,
         state_data: serde_json::json!({
             "event": "request_agent_assistance_wait",
             "target_agent": target_agent,
+            "collaboration_thread_id": collaboration_thread_id,
         }),
         created_at,
     };
-    let execution_state = TaskExecutionState::WaitingForInput {
-        question: format!("Awaiting assistance from '{target_agent}'"),
+    let execution_state = TaskExecutionState::WaitingForCollaboration {
+        thread_id: collaboration_thread_id.to_string(),
+        target_agent: target_agent.to_string(),
+        collaboration_call_id: call_id.to_string(),
         checkpoint: marker,
     };
 
@@ -220,10 +345,19 @@ mod tests {
 
     use crate::orchestrator::security::execution_guard::PlaceholderExecutionGuard;
     use crate::orchestrator::state::{TaskManager, TaskStore};
+    use crate::orchestrator::threads::SqliteThreadStore;
 
     async fn test_manager() -> TaskManager {
         let store = TaskStore::in_memory().await.expect("store");
         TaskManager::new(store).await.expect("task manager")
+    }
+
+    async fn test_thread_store() -> Arc<dyn ThreadStore> {
+        Arc::new(
+            SqliteThreadStore::in_memory()
+                .await
+                .expect("thread store"),
+        )
     }
 
     fn test_skill_broker() -> SkillToolBroker {
@@ -267,7 +401,8 @@ mod tests {
     #[tokio::test]
     async fn denied_target_returns_capability_denied() {
         let manager = test_manager().await;
-        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let thread_store = test_thread_store().await;
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager, thread_store);
         let ctx = test_ctx(vec!["browser".to_string()]);
 
         let err = broker
@@ -294,7 +429,8 @@ mod tests {
     #[tokio::test]
     async fn assistance_timeout_is_propagated() {
         let manager = test_manager().await;
-        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let thread_store = test_thread_store().await;
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager, thread_store);
         let ctx = test_ctx(vec!["browser".to_string()]);
 
         let err = broker
@@ -340,7 +476,8 @@ mod tests {
                 .expect("complete child");
         });
 
-        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let thread_store = test_thread_store().await;
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager, thread_store);
         let ctx = AgentContext {
             task_id: uuid::Uuid::new_v4(),
             ..test_ctx(vec!["browser".to_string()])
@@ -365,5 +502,132 @@ mod tests {
             panic!("expected success payload");
         };
         assert_eq!(payload["summary"], serde_json::json!("from helper"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_thread_is_created_when_caller_has_context() {
+        let manager = test_manager().await;
+        let thread_store = test_thread_store().await;
+        let caller_task_id = uuid::Uuid::new_v4();
+        let caller_thread_id = format!("planner-{}", &caller_task_id.to_string()[..8]);
+
+        // Create the caller's thread in the store.
+        let now = Utc::now();
+        thread_store
+            .create_thread(&AgentThread {
+                id: caller_thread_id.clone(),
+                agent_id: "planner".to_string(),
+                scope: ThreadScope::Task {
+                    task_id: caller_task_id.to_string(),
+                },
+                compaction_policy: CompactionPolicy::InPlace {
+                    strategy: TruncationStrategy::default(),
+                },
+                context_window_budget: 128_000,
+                status: ThreadStatus::Active,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("create caller thread");
+
+        // Register execution context so the broker can resolve the caller's thread_id.
+        manager
+            .register_execution_context(
+                caller_task_id,
+                TaskExecutionContext {
+                    turn_id: None,
+                    call_id: None,
+                    thread_id: Some(caller_thread_id.clone()),
+                    trigger_type: TriggerType::Internal,
+                    publish_output: false,
+                },
+            )
+            .await;
+
+        // Spawn a worker to complete the child task.
+        let manager_for_worker = manager.clone();
+        let thread_store_for_check = thread_store.clone();
+        let check_handle = tokio::spawn(async move {
+            let child = manager_for_worker
+                .wait_for_next_task()
+                .await
+                .expect("child task");
+
+            // Verify that the child task's execution context has a collaboration thread_id.
+            let child_ctx = manager_for_worker
+                .execution_context_for(child.id)
+                .await
+                .expect("child execution context");
+            let collab_thread_id = child_ctx.thread_id.expect("collaboration thread_id");
+            assert!(
+                collab_thread_id.starts_with("collab-browser-"),
+                "expected collaboration thread prefix, got: {collab_thread_id}"
+            );
+
+            // Verify the collaboration thread exists in ThreadStore.
+            let collab_thread = thread_store_for_check
+                .get_thread(&collab_thread_id)
+                .await
+                .expect("thread lookup")
+                .expect("collaboration thread should exist");
+            assert_eq!(collab_thread.agent_id, "browser");
+            assert!(matches!(
+                collab_thread.scope,
+                ThreadScope::Collaboration { .. }
+            ));
+
+            manager_for_worker
+                .transition(
+                    child.id,
+                    Some("queued"),
+                    TaskState::Completed {
+                        output: completed_output("collaborated"),
+                    },
+                    None,
+                )
+                .await
+                .expect("complete child");
+
+            collab_thread_id
+        });
+
+        let broker =
+            OrchestratorSkillBroker::new(test_skill_broker(), manager, thread_store.clone());
+        let ctx = AgentContext {
+            task_id: caller_task_id,
+            ..test_ctx(vec!["browser".to_string()])
+        };
+        let result = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "fetch data",
+                        "timeout_secs": 5,
+                    }),
+                },
+            )
+            .await
+            .expect("assistance should succeed");
+
+        let ToolOutput::Success(payload) = result.output else {
+            panic!("expected success payload");
+        };
+        assert_eq!(payload["summary"], serde_json::json!("collaborated"));
+
+        // Verify collaboration thread was created with correct properties.
+        let collab_thread_id = check_handle.await.expect("worker handle");
+
+        // Verify that find_collaboration_thread returns the same thread.
+        let found = thread_store
+            .find_collaboration_thread("browser", &caller_thread_id)
+            .await
+            .expect("find_collaboration_thread")
+            .expect("should find existing collaboration thread");
+        assert_eq!(found.id, collab_thread_id);
     }
 }

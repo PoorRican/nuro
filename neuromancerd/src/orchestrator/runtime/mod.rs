@@ -73,6 +73,12 @@ impl System0Runtime {
         }
         let (report_tx, mut report_rx) = mpsc::channel(256);
 
+        let thread_store = SqliteThreadStore::open(&layout.runtime_root().join("threads.sqlite"))
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> =
+            Arc::new(thread_store);
+
         let allowlisted_system0_tools =
             effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
         let subagents = builder::build_subagents(
@@ -84,15 +90,10 @@ impl System0Runtime {
             &execution_guard,
             &report_tx,
             &task_manager,
+            &thread_store,
         )?;
         let config_snapshot =
             serde_json::to_value(config).map_err(|err| System0Error::Config(err.to_string()))?;
-
-        let thread_store = SqliteThreadStore::open(&layout.runtime_root().join("threads.sqlite"))
-            .await
-            .map_err(|err| System0Error::Config(err.to_string()))?;
-        let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> =
-            Arc::new(thread_store);
 
         let memory_pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(5)
