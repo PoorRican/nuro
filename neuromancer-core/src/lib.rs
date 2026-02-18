@@ -10,6 +10,7 @@ pub mod rpc;
 pub mod secrets;
 pub mod security;
 pub mod task;
+pub mod thread;
 pub mod tool;
 pub mod trigger;
 pub mod xdg;
