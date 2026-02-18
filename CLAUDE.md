@@ -107,7 +107,8 @@ High/critical risk defaults to blocked for authorization unless explicitly force
 - **`ThreadScope`** — `System0`, `Task { task_id }`, `UserConversation { conversation_id }`, `Collaboration { parent_thread_id, root_scope }`
 - **`ThreadStatus`** — `Active`, `Completed`, `Failed`, `Suspended`
 - **`CompactionPolicy`** — `SummarizeToMemory { target_partition, summarizer_model, threshold_pct }`, `InPlace { strategy }`, `None`
-- **`ThreadStore`** trait — CRUD for threads + `append_messages` / `load_messages` for conversation persistence, `find_collaboration_thread`, `mark_compacted`
+- **`UserConversation`** — persistent user-agent chat session record: `conversation_id`, `agent_id`, `thread_id`, `status`, timestamps
+- **`ThreadStore`** trait — CRUD for threads + `append_messages` / `load_messages` for conversation persistence, `find_collaboration_thread`, `mark_compacted`, `find_user_conversation` / `save_user_conversation` / `list_user_conversations`
 - **`ChatMessage`** — message types (`MessageRole`, `MessageContent`, `MessageMetadata`) used by both agent runtime and thread store
 
 Message types (`ChatMessage`, `MessageRole`, `MessageContent`, `TruncationStrategy`, etc.) are defined in `neuromancer-core/src/thread.rs` and re-exported by `neuromancer-agent/src/conversation.rs`.
@@ -126,6 +127,8 @@ JSON-RPC methods:
 - `orchestrator.threads.get`
 - `orchestrator.threads.resurrect`
 - `orchestrator.subagent.turn`
+- `orchestrator.chat.turn`
+- `orchestrator.chat.list`
 - `orchestrator.events.query`
 - `orchestrator.stats.get`
 - `admin.health`
@@ -146,6 +149,8 @@ CLI commands (`neuroctl`):
 - `orchestrator stats get`
 - `orchestrator threads {list, get <thread_id>, resurrect <thread_id>}`
 - `orchestrator subagent turn --thread-id <id> "<message>"`
+- `chat <agent_id> -m "<message>"` (UserConversation: direct agent chat, bypasses System0)
+- `chat --list` (list active UserConversation sessions)
 
 Removed methods should return JSON-RPC method-not-found (`message.send`, `task.submit`, `task.list`, `task.get`).
 
