@@ -16,6 +16,9 @@ pub struct AgentCapabilities {
     pub skills: Vec<String>,
     pub mcp_servers: Vec<String>,
     pub a2a_peers: Vec<AgentId>,
+    /// Agents this agent may request collaboration from (spoke-to-spoke).
+    #[serde(default)]
+    pub can_request: Vec<AgentId>,
     pub secrets: Vec<SecretRef>,
     pub memory_partitions: Vec<String>,
     pub filesystem_roots: Vec<String>,
@@ -28,6 +31,7 @@ impl Default for AgentCapabilities {
             skills: Vec::new(),
             mcp_servers: Vec::new(),
             a2a_peers: Vec::new(),
+            can_request: Vec::new(),
             secrets: Vec::new(),
             memory_partitions: Vec::new(),
             filesystem_roots: Vec::new(),
@@ -167,6 +171,14 @@ pub enum TaskExecutionState {
         checkpoint: Checkpoint,
     },
 
+    /// Agent is waiting for a collaboration request to complete.
+    WaitingForCollaboration {
+        thread_id: String,
+        target_agent: String,
+        collaboration_call_id: String,
+        checkpoint: Checkpoint,
+    },
+
     /// Agent produced a candidate output — self-assessment or verifier check.
     Evaluating { candidate_output: Artifact },
 
@@ -191,18 +203,24 @@ pub enum TaskExecutionState {
 pub enum SubAgentReport {
     Progress {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         step: u32,
         description: String,
         artifacts_so_far: Vec<Artifact>,
     },
     InputRequired {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         question: String,
         context: String,
         suggested_options: Vec<String>,
     },
     ToolFailure {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         tool_id: String,
         error: String,
         retry_eligible: bool,
@@ -210,22 +228,30 @@ pub enum SubAgentReport {
     },
     PolicyDenied {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         action: String,
         policy_code: String,
         capability_needed: CapabilityRef,
     },
     Stuck {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         reason: String,
         partial_result: Option<Artifact>,
     },
     Completed {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         artifacts: Vec<Artifact>,
         summary: String,
     },
     Failed {
         task_id: TaskId,
+        #[serde(default)]
+        thread_id: Option<String>,
         error: String,
         partial_result: Option<Artifact>,
     },

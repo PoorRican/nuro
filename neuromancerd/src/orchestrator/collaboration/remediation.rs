@@ -205,6 +205,7 @@ mod tests {
     fn recommends_retry_for_retryable_tool_failure() {
         let report = SubAgentReport::ToolFailure {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             tool_id: "search".to_string(),
             error: "timeout".to_string(),
             retry_eligible: true,
@@ -225,6 +226,7 @@ mod tests {
     fn recommends_clarify_for_first_stuck() {
         let report = SubAgentReport::Stuck {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             reason: "looping".to_string(),
             partial_result: None,
         };
@@ -236,6 +238,7 @@ mod tests {
     fn recommends_reassign_for_repeated_stuck() {
         let report = SubAgentReport::Stuck {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             reason: "looping".to_string(),
             partial_result: None,
         };
@@ -251,6 +254,7 @@ mod tests {
     fn recommends_reassign_for_resolvable_policy_denial() {
         let report = SubAgentReport::PolicyDenied {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             action: "delegate".to_string(),
             policy_code: "capability_denied".to_string(),
             capability_needed: "can_request:browser".to_string(),
@@ -263,6 +267,7 @@ mod tests {
     fn recommends_escalation_for_input_required() {
         let report = SubAgentReport::InputRequired {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             question: "Need approval".to_string(),
             context: "file write".to_string(),
             suggested_options: vec![],
@@ -275,6 +280,7 @@ mod tests {
     fn recommends_abort_for_failed() {
         let report = SubAgentReport::Failed {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             error: "fatal".to_string(),
             partial_result: None,
         };

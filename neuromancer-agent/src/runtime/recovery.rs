@@ -75,6 +75,7 @@ impl AgentRuntime {
 
         self.send_report(SubAgentReport::ToolFailure {
             task_id,
+            thread_id: None,
             tool_id: attempted_tool_id.clone(),
             error: recovery_error,
             retry_eligible: *recovery_attempts < self.tool_call_retry_limit,

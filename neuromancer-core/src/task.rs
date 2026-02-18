@@ -165,6 +165,30 @@ impl AgentErrorLike {
     }
 }
 
+/// Mode-agnostic terminal output from an agent — the raw final message before any
+/// extraction or context-specific post-processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentOutput {
+    pub message: String,
+    pub token_usage: TokenUsage,
+    pub duration: Duration,
+}
+
+/// Result of a collaboration between agents, wrapping the raw output with a
+/// cross-reference back to the collaboration thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborationResult {
+    pub agent_output: AgentOutput,
+    pub thread_ref: ThreadMessageRef,
+}
+
+/// Cross-reference to a specific message within a thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMessageRef {
+    pub thread_id: String,
+    pub message_id: uuid::Uuid,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

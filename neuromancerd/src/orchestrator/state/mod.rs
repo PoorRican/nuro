@@ -660,6 +660,7 @@ impl System0ToolBroker {
                 step,
                 description,
                 artifacts_so_far,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "step": step,
@@ -671,6 +672,7 @@ impl System0ToolBroker {
                 question,
                 context,
                 suggested_options,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "question": question,
@@ -683,6 +685,7 @@ impl System0ToolBroker {
                 error,
                 retry_eligible,
                 attempted_count,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "tool_id": tool_id,
@@ -695,6 +698,7 @@ impl System0ToolBroker {
                 action,
                 policy_code,
                 capability_needed,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "action": action,
@@ -705,6 +709,7 @@ impl System0ToolBroker {
                 task_id,
                 reason,
                 partial_result,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "reason": reason,
@@ -714,6 +719,7 @@ impl System0ToolBroker {
                 task_id,
                 artifacts,
                 summary,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "artifacts": artifacts,
@@ -723,6 +729,7 @@ impl System0ToolBroker {
                 task_id,
                 error,
                 partial_result,
+                ..
             } => serde_json::json!({
                 "task_id": task_id.to_string(),
                 "error": error,
@@ -1304,6 +1311,7 @@ mod tests {
     fn serializes_subagent_report_payload_without_enum_wrapper() {
         let report = SubAgentReport::Stuck {
             task_id: uuid::Uuid::new_v4(),
+            thread_id: None,
             reason: "max iterations exceeded".to_string(),
             partial_result: None,
         };

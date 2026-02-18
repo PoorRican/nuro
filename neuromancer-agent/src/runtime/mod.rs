@@ -118,12 +118,14 @@ impl AgentRuntime {
                 };
                 self.send_report(SubAgentReport::Stuck {
                     task_id: task.id,
+                    thread_id: None,
                     reason: format!("max iterations ({max_iterations}) exceeded"),
                     partial_result: None,
                 })
                 .await;
                 self.send_report(SubAgentReport::Failed {
                     task_id: task.id,
+                    thread_id: None,
                     error: err.to_string(),
                     partial_result: None,
                 })
@@ -174,6 +176,7 @@ impl AgentRuntime {
             if iteration % 5 == 0 {
                 self.send_report(SubAgentReport::Progress {
                     task_id: task.id,
+                    thread_id: None,
                     step: iteration,
                     description: format!("iteration {iteration}/{max_iterations}"),
                     artifacts_so_far: vec![],
@@ -207,6 +210,7 @@ impl AgentRuntime {
                             );
                             self.send_report(SubAgentReport::ToolFailure {
                                 task_id: task.id,
+                                thread_id: None,
                                 tool_id: call.tool_id.clone(),
                                 error: err.clone(),
                                 retry_eligible: true,
@@ -266,6 +270,7 @@ impl AgentRuntime {
 
             self.send_report(SubAgentReport::Completed {
                 task_id: task.id,
+                thread_id: None,
                 artifacts: output.artifacts.clone(),
                 summary: output.summary.clone(),
             })
@@ -370,6 +375,7 @@ impl AgentRuntime {
                 };
                 self.send_report(SubAgentReport::Stuck {
                     task_id: task.id,
+                    thread_id: None,
                     reason: format!("max iterations ({max_iterations}) exceeded"),
                     partial_result: None,
                 })
@@ -413,6 +419,7 @@ impl AgentRuntime {
             if iteration % 5 == 0 {
                 self.send_report(SubAgentReport::Progress {
                     task_id: task.id,
+                    thread_id: None,
                     step: iteration,
                     description: format!("iteration {iteration}/{max_iterations}"),
                     artifacts_so_far: vec![],
@@ -431,6 +438,7 @@ impl AgentRuntime {
                     if let ToolOutput::Error(err) = &result.output {
                         self.send_report(SubAgentReport::ToolFailure {
                             task_id: task.id,
+                            thread_id: None,
                             tool_id: call.tool_id.clone(),
                             error: err.clone(),
                             retry_eligible: true,
@@ -472,6 +480,7 @@ impl AgentRuntime {
 
             self.send_report(SubAgentReport::Completed {
                 task_id: task.id,
+                thread_id: None,
                 artifacts: output.artifacts.clone(),
                 summary: output.summary.clone(),
             })
@@ -495,6 +504,7 @@ impl AgentRuntime {
             Err(err) => {
                 self.send_report(SubAgentReport::Failed {
                     task_id: task.id,
+                    thread_id: None,
                     error: err.to_string(),
                     partial_result: None,
                 })
