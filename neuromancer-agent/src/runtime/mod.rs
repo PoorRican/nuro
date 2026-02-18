@@ -18,7 +18,6 @@ use neuromancer_core::trigger::TriggerSource;
 
 use crate::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use crate::llm::LlmClient;
-use crate::session::{AgentSessionId, InMemorySessionStore};
 
 use helpers::{available_tool_names, specs_to_rig_definitions, truncate_summary};
 
@@ -276,233 +275,6 @@ impl AgentRuntime {
             };
 
             return Ok(output);
-        }
-    }
-
-    /// Execute a single conversational turn using persistent agent-owned session history.
-    #[deprecated(note = "use execute_turn_with_thread_store instead")]
-    pub async fn execute_turn(
-        &self,
-        session_store: &InMemorySessionStore,
-        session_id: AgentSessionId,
-        source: TriggerSource,
-        user_message: String,
-    ) -> Result<TurnExecutionResult, NeuromancerError> {
-        self.execute_turn_with_task_id(
-            session_store,
-            session_id,
-            source,
-            user_message,
-            TaskId::new_v4(),
-        )
-        .await
-    }
-
-    /// Execute a single conversational turn using a caller-supplied task id.
-    /// This allows the orchestrator to correlate run_id and task_id deterministically.
-    #[deprecated(note = "use execute_turn_with_thread_store instead")]
-    pub async fn execute_turn_with_task_id(
-        &self,
-        session_store: &InMemorySessionStore,
-        session_id: AgentSessionId,
-        source: TriggerSource,
-        user_message: String,
-        task_id: TaskId,
-    ) -> Result<TurnExecutionResult, NeuromancerError> {
-        let mut task = Task::new_with_id(
-            task_id,
-            source,
-            user_message.clone(),
-            self.config.id.clone(),
-        );
-        let start = Instant::now();
-        let mut total_usage = TokenUsage::default();
-
-        task.state = TaskState::Running {
-            execution_state: TaskExecutionState::Initializing { task_id: task.id },
-        };
-        tracing::info!(
-            task_id = %task.id,
-            agent_id = %self.config.id,
-            "agent runtime turn execution starting"
-        );
-
-        let agent_ctx = AgentContext {
-            agent_id: self.config.id.clone(),
-            task_id: task.id,
-            allowed_tools: self.config.capabilities.skills.clone(),
-            allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
-            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
-            allowed_secrets: self.config.capabilities.secrets.clone(),
-            allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
-        };
-
-        let system_prompt = self.config.system_prompt.clone();
-        let default_conversation = {
-            let mut conversation = ConversationContext::new(
-                u32::MAX,
-                TruncationStrategy::SlidingWindow { keep_last: 50 },
-            );
-            conversation.add_message(ChatMessage::system(&system_prompt));
-            conversation
-        };
-
-        let session = session_store
-            .load_or_create(session_id, default_conversation)
-            .await;
-        let mut conversation = session.conversation.clone();
-        conversation.add_message(ChatMessage::user(user_message));
-
-        let tool_specs = self.tool_broker.list_tools(&agent_ctx).await;
-        let available_tool_names = available_tool_names(&tool_specs);
-        let tool_defs = specs_to_rig_definitions(&tool_specs);
-        let max_iterations = self.config.max_iterations;
-        let mut iteration: u32 = 0;
-        let mut invalid_tool_call_recovery_attempts: u32 = 0;
-
-        let run_result = loop {
-            iteration += 1;
-            if iteration > max_iterations {
-                let err = AgentError::MaxIterationsExceeded {
-                    task_id: task.id,
-                    iterations: iteration,
-                };
-                self.send_report(SubAgentReport::Stuck {
-                    task_id: task.id,
-                    reason: format!("max iterations ({max_iterations}) exceeded"),
-                    partial_result: None,
-                })
-                .await;
-                break Err(NeuromancerError::Agent(err));
-            }
-
-            tracing::debug!(
-                task_id = %task.id,
-                iteration,
-                "thinking: calling LLM (session turn)"
-            );
-
-            let rig_messages = conversation.to_rig_messages();
-            let response = match self
-                .llm_client
-                .complete(&system_prompt, rig_messages, tool_defs.clone())
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => match self
-                    .try_recover_invalid_tool_call(
-                        &err,
-                        &mut conversation,
-                        task.id,
-                        &available_tool_names,
-                        &mut invalid_tool_call_recovery_attempts,
-                    )
-                    .await
-                {
-                    Ok(true) => continue,
-                    Ok(false) => break Err(err),
-                    Err(exhausted) => break Err(exhausted),
-                },
-            };
-
-            total_usage.prompt_tokens += response.prompt_tokens;
-            total_usage.completion_tokens += response.completion_tokens;
-            total_usage.total_tokens += response.prompt_tokens + response.completion_tokens;
-
-            if iteration % 5 == 0 {
-                self.send_report(SubAgentReport::Progress {
-                    task_id: task.id,
-                    step: iteration,
-                    description: format!("iteration {iteration}/{max_iterations}"),
-                    artifacts_so_far: vec![],
-                })
-                .await;
-            }
-
-            if response.has_tool_calls() {
-                conversation.add_message(ChatMessage::assistant_tool_calls(
-                    response.tool_calls.clone(),
-                ));
-
-                for call in &response.tool_calls {
-                    let result = self.execute_tool_call(&agent_ctx, call).await;
-
-                    if let ToolOutput::Error(err) = &result.output {
-                        self.send_report(SubAgentReport::ToolFailure {
-                            task_id: task.id,
-                            tool_id: call.tool_id.clone(),
-                            error: err.clone(),
-                            retry_eligible: true,
-                            attempted_count: 1,
-                        })
-                        .await;
-                    }
-
-                    conversation.add_message(ChatMessage::tool_result(result));
-                }
-
-                continue;
-            }
-
-            let output_text = response.text.unwrap_or_default();
-            conversation.add_message(ChatMessage::assistant_text(output_text.clone()));
-
-            let output = TaskOutput {
-                artifacts: vec![Artifact {
-                    kind: ArtifactKind::Text,
-                    name: "response".into(),
-                    content: output_text.clone(),
-                    mime_type: Some("text/plain".into()),
-                }],
-                summary: truncate_summary(&output_text, 200),
-                token_usage: total_usage,
-                duration: start.elapsed(),
-            };
-
-            let checkpoint = Checkpoint {
-                task_id: task.id,
-                state_data: serde_json::to_value(&TaskExecutionState::Completed {
-                    output: output.clone(),
-                })
-                .unwrap_or_default(),
-                created_at: chrono::Utc::now(),
-            };
-            task.checkpoints.push(checkpoint);
-
-            self.send_report(SubAgentReport::Completed {
-                task_id: task.id,
-                artifacts: output.artifacts.clone(),
-                summary: output.summary.clone(),
-            })
-            .await;
-            task.state = TaskState::Completed {
-                output: output.clone(),
-            };
-
-            break Ok(output);
-        };
-
-        session_store
-            .save_conversation(session_id, conversation)
-            .await;
-
-        match run_result {
-            Ok(output) => Ok(TurnExecutionResult {
-                task_id: task.id,
-                output,
-            }),
-            Err(err) => {
-                self.send_report(SubAgentReport::Failed {
-                    task_id: task.id,
-                    error: err.to_string(),
-                    partial_result: None,
-                })
-                .await;
-                task.state = TaskState::Failed {
-                    error: AgentErrorLike::new("execution_failed", err.to_string()),
-                };
-                Err(err)
-            }
         }
     }
 
@@ -1002,6 +774,90 @@ mod tests {
 
     #[tokio::test]
     async fn execute_turn_recovers_from_invalid_tool_call_error() {
+        use neuromancer_core::thread::{
+            AgentThread, CrossReference, MessageId, ThreadId, ThreadStatus, ThreadStore,
+        };
+        use std::sync::Mutex;
+
+        struct MockThreadStore {
+            messages: Mutex<Vec<neuromancer_core::thread::ChatMessage>>,
+        }
+
+        impl MockThreadStore {
+            fn new() -> Self {
+                Self {
+                    messages: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ThreadStore for MockThreadStore {
+            async fn create_thread(&self, _thread: &AgentThread) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn get_thread(
+                &self,
+                _thread_id: &ThreadId,
+            ) -> Result<Option<AgentThread>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn update_status(
+                &self,
+                _thread_id: &ThreadId,
+                _status: ThreadStatus,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn list_threads_by_scope_type(
+                &self,
+                _scope_type: &str,
+            ) -> Result<Vec<AgentThread>, NeuromancerError> {
+                Ok(vec![])
+            }
+            async fn list_threads_for_agent(
+                &self,
+                _agent_id: &str,
+            ) -> Result<Vec<AgentThread>, NeuromancerError> {
+                Ok(vec![])
+            }
+            async fn append_messages(
+                &self,
+                _thread_id: &ThreadId,
+                messages: &[neuromancer_core::thread::ChatMessage],
+            ) -> Result<(), NeuromancerError> {
+                self.messages.lock().unwrap().extend_from_slice(messages);
+                Ok(())
+            }
+            async fn load_messages(
+                &self,
+                _thread_id: &ThreadId,
+                _include_compacted: bool,
+            ) -> Result<Vec<neuromancer_core::thread::ChatMessage>, NeuromancerError> {
+                Ok(self.messages.lock().unwrap().clone())
+            }
+            async fn find_collaboration_thread(
+                &self,
+                _agent_id: &str,
+                _parent_thread_id: &ThreadId,
+            ) -> Result<Option<AgentThread>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn resolve_cross_reference(
+                &self,
+                _message_id: &MessageId,
+            ) -> Result<Option<CrossReference>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn mark_compacted(
+                &self,
+                _thread_id: &ThreadId,
+                _up_to_message_id: &MessageId,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+        }
+
         let llm = Arc::new(SequenceLlmClient::new(vec![
             SequenceItem::Error(invalid_tool_call_error("manage_bills")),
             SequenceItem::Response(LlmResponse {
@@ -1015,14 +871,15 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
         let runtime = AgentRuntime::new(test_config(), llm, broker, tx, 1);
 
-        let session_store = InMemorySessionStore::new();
-        let session_id = uuid::Uuid::new_v4();
+        let thread_store = MockThreadStore::new();
+        let thread_id = "test-thread".to_string();
         let output = runtime
-            .execute_turn(
-                &session_store,
-                session_id,
+            .execute_turn_with_thread_store(
+                &thread_store,
+                &thread_id,
                 TriggerSource::Internal,
                 "What happened?".into(),
+                uuid::Uuid::new_v4(),
             )
             .await
             .expect("turn recovery should succeed");

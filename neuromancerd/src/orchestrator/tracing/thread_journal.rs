@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
 use neuromancer_core::agent::SubAgentReport;
-use neuromancer_core::rpc::{OrchestratorThreadMessage, ThreadEvent, ThreadSummary};
+use neuromancer_core::rpc::{ThreadEvent, ThreadSummary};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::orchestrator::error::System0Error;
@@ -245,60 +245,6 @@ impl ThreadJournal {
             }
         });
         Ok(events)
-    }
-
-    pub(crate) async fn append_messages(
-        &self,
-        thread_id: &str,
-        thread_kind: &str,
-        agent_id: Option<&str>,
-        run_id: Option<&str>,
-        messages: &[OrchestratorThreadMessage],
-    ) -> Result<(), System0Error> {
-        for message in messages {
-            let (event_type, payload) = match message {
-                OrchestratorThreadMessage::Text { role, content } => {
-                    let event_type = if role == "user" {
-                        "message_user"
-                    } else if role == "assistant" {
-                        "message_assistant"
-                    } else {
-                        "message_system"
-                    };
-                    (
-                        event_type.to_string(),
-                        serde_json::json!({ "role": role, "content": content }),
-                    )
-                }
-                OrchestratorThreadMessage::ToolInvocation {
-                    call_id,
-                    tool_id,
-                    arguments,
-                    status,
-                    output,
-                } => (
-                    "tool_result".to_string(),
-                    serde_json::json!({
-                        "call_id": call_id,
-                        "tool_id": tool_id,
-                        "arguments": arguments,
-                        "status": status,
-                        "output": output,
-                    }),
-                ),
-            };
-
-            self.append_event(make_event(
-                thread_id,
-                thread_kind,
-                event_type,
-                agent_id.map(str::to_string),
-                run_id.map(str::to_string),
-                payload,
-            ))
-            .await?;
-        }
-        Ok(())
     }
 
     fn current_seq_for_locked(&self, thread_id: &str, path: &Path) -> Result<u64, System0Error> {

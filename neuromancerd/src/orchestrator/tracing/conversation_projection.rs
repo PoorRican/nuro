@@ -1,87 +1,6 @@
 use std::collections::HashMap;
 
-use neuromancer_agent::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use neuromancer_core::rpc::{OrchestratorThreadMessage, ThreadEvent};
-use neuromancer_core::tool::{ToolOutput, ToolResult};
-
-pub(crate) fn conversation_to_thread_messages(
-    messages: &[neuromancer_agent::conversation::ChatMessage],
-) -> Vec<OrchestratorThreadMessage> {
-    use neuromancer_agent::conversation::{MessageContent, MessageRole};
-
-    let mut result = Vec::new();
-    let mut pending_tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
-
-    for msg in messages {
-        match (&msg.role, &msg.content) {
-            (MessageRole::System, _) => {}
-            (MessageRole::User, MessageContent::Text(text)) => {
-                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
-                result.push(OrchestratorThreadMessage::Text {
-                    role: "user".to_string(),
-                    content: text.clone(),
-                });
-            }
-            (MessageRole::Assistant, MessageContent::Text(text)) => {
-                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
-                result.push(OrchestratorThreadMessage::Text {
-                    role: "assistant".to_string(),
-                    content: text.clone(),
-                });
-            }
-            (MessageRole::Assistant, MessageContent::ToolCalls(calls)) => {
-                flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
-                for call in calls {
-                    pending_tool_calls.push((
-                        call.id.clone(),
-                        call.tool_id.clone(),
-                        call.arguments.clone(),
-                    ));
-                }
-            }
-            (MessageRole::Tool, MessageContent::ToolResult(tool_result)) => {
-                if let Some(pos) = pending_tool_calls
-                    .iter()
-                    .position(|(id, _, _)| *id == tool_result.call_id)
-                {
-                    let (call_id, tool_id, arguments) = pending_tool_calls.remove(pos);
-                    let (status, output) = match &tool_result.output {
-                        ToolOutput::Success(v) => ("success".to_string(), v.clone()),
-                        ToolOutput::Error(e) => {
-                            ("error".to_string(), serde_json::Value::String(e.clone()))
-                        }
-                    };
-                    result.push(OrchestratorThreadMessage::ToolInvocation {
-                        call_id,
-                        tool_id,
-                        arguments,
-                        status,
-                        output,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    flush_pending_tool_calls(&mut pending_tool_calls, &mut result);
-    result
-}
-
-fn flush_pending_tool_calls(
-    pending: &mut Vec<(String, String, serde_json::Value)>,
-    result: &mut Vec<OrchestratorThreadMessage>,
-) {
-    for (call_id, tool_id, arguments) in pending.drain(..) {
-        result.push(OrchestratorThreadMessage::ToolInvocation {
-            call_id,
-            tool_id,
-            arguments,
-            status: "pending".to_string(),
-            output: serde_json::Value::Null,
-        });
-    }
-}
 
 pub(crate) fn infer_thread_state_from_events(events: &[ThreadEvent]) -> String {
     for event in events.iter().rev() {
@@ -104,49 +23,6 @@ pub(crate) fn normalize_error_message(message: impl Into<String>) -> String {
         text.push_str("...");
     }
     text
-}
-
-pub(crate) fn reconstruct_subagent_conversation(events: &[ThreadEvent]) -> ConversationContext {
-    let mut conversation = ConversationContext::new(
-        u32::MAX,
-        TruncationStrategy::SlidingWindow { keep_last: 50 },
-    );
-
-    for message in thread_events_to_thread_messages(events) {
-        match message {
-            OrchestratorThreadMessage::Text { role, content } => {
-                if role == "user" {
-                    conversation.add_message(ChatMessage::user(content));
-                } else if role == "assistant" {
-                    conversation.add_message(ChatMessage::assistant_text(content));
-                }
-            }
-            OrchestratorThreadMessage::ToolInvocation {
-                call_id,
-                tool_id: _,
-                arguments: _,
-                status,
-                output,
-            } => {
-                let tool_output = if status == "error" {
-                    let text = output
-                        .get("error")
-                        .and_then(|value| value.as_str())
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| output.to_string());
-                    ToolOutput::Error(text)
-                } else {
-                    ToolOutput::Success(output)
-                };
-                conversation.add_message(ChatMessage::tool_result(ToolResult {
-                    call_id,
-                    output: tool_output,
-                }));
-            }
-        }
-    }
-
-    conversation
 }
 
 pub(crate) fn thread_events_to_thread_messages(
