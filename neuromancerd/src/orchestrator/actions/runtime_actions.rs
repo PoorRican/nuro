@@ -4,7 +4,9 @@ use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_core::argument_tokens::expand_user_query_tokens;
 use neuromancer_core::error::{NeuromancerError, ToolError};
 use neuromancer_core::rpc::{DelegatedRun, OrchestratorOutputItem, ThreadSummary, TurnDelegation};
-use neuromancer_core::task::{Artifact, ArtifactKind, Task, TaskOutput, TaskState, TokenUsage};
+use neuromancer_core::task::{
+    AgentOutput, Artifact, ArtifactKind, Task, TaskOutput, TaskState, TokenUsage,
+};
 use neuromancer_core::thread::{AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, ThreadStore, TruncationStrategy};
 use neuromancer_core::tool::{ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
@@ -505,6 +507,23 @@ async fn run_delegated_task(
         )
         .await;
 
+    // --- Optional extraction step ---
+    // Try to extract structured TaskOutput from the agent's raw output via an
+    // additional LLM turn. Falls back to AgentOutput::into_task_output() on failure.
+    let extracted_output = match &result {
+        Ok(turn_output) => {
+            try_extract_task_output(
+                &*runtime,
+                &*thread_store,
+                &thread_id,
+                task_id,
+                &turn_output.output,
+            )
+            .await
+        }
+        Err(_) => None,
+    };
+
     // --- Process the result ---
     let (run_state, summary, error, full_output, task_output) =
         process_delegation_result(
@@ -512,6 +531,7 @@ async fn run_delegated_task(
             &broker,
             result,
             &delegation_started_at,
+            extracted_output,
         )
         .await;
 
@@ -616,11 +636,123 @@ async fn run_delegated_task(
     );
 }
 
+const EXTRACTION_PROMPT: &str = r#"Summarize the work you just completed into a structured output. Respond ONLY with a valid JSON object in this exact format (no markdown fencing, no extra text):
+{"summary":"<brief 1-2 sentence summary>","artifacts":[{"kind":"text","name":"response","content":"<your primary response text>"}]}
+If you produced code, use kind "code". If you produced a URL, use kind "url". Include all relevant output items as separate artifacts."#;
+
+/// Run an extraction turn to convert an AgentOutput into a structured TaskOutput.
+///
+/// Injects an extraction prompt as a user message into the agent's thread and runs one
+/// more LLM turn. The agent responds with structured JSON which is parsed into TaskOutput.
+/// Returns None if extraction fails (caller should fall back to `into_task_output()`).
+async fn try_extract_task_output(
+    runtime: &AgentRuntime,
+    thread_store: &dyn ThreadStore,
+    thread_id: &str,
+    task_id: neuromancer_core::task::TaskId,
+    agent_output: &AgentOutput,
+) -> Option<TaskOutput> {
+    let extraction_id = uuid::Uuid::new_v4();
+    let thread_id_owned = thread_id.to_string();
+    #[allow(deprecated)]
+    let extraction_result = runtime
+        .execute_turn_with_thread_store(
+            thread_store,
+            &thread_id_owned,
+            TriggerSource::Internal,
+            EXTRACTION_PROMPT.to_string(),
+            extraction_id,
+            vec![],
+        )
+        .await;
+
+    match extraction_result {
+        Ok(extraction) => {
+            let parsed = parse_extraction_response(&extraction.output.message, agent_output);
+            if parsed.is_none() {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "extraction_parse_failed_using_fallback"
+                );
+            }
+            parsed
+        }
+        Err(err) => {
+            tracing::warn!(
+                task_id = %task_id,
+                error = ?err,
+                "extraction_turn_failed"
+            );
+            None
+        }
+    }
+}
+
+/// Parse a structured extraction response into a TaskOutput.
+///
+/// Accepts raw JSON or JSON wrapped in markdown code fences. Falls back to None
+/// if the response can't be parsed, letting the caller use `AgentOutput::into_task_output()`.
+fn parse_extraction_response(message: &str, fallback: &AgentOutput) -> Option<TaskOutput> {
+    let json_str = message.trim();
+
+    // Strip optional markdown code fences
+    let json_str = if json_str.starts_with("```") {
+        json_str
+            .strip_prefix("```json")
+            .or_else(|| json_str.strip_prefix("```"))
+            .and_then(|s| s.rsplit_once("```").map(|(content, _)| content))
+            .unwrap_or(json_str)
+            .trim()
+    } else {
+        json_str
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let summary = parsed.get("summary")?.as_str()?.to_string();
+    let artifacts_json = parsed.get("artifacts")?.as_array()?;
+
+    let mut artifacts = Vec::new();
+    for a in artifacts_json {
+        let content = a.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        artifacts.push(Artifact {
+            kind: match a.get("kind").and_then(|v| v.as_str()).unwrap_or("text") {
+                "code" => ArtifactKind::Code,
+                "file" => ArtifactKind::File,
+                "url" => ArtifactKind::Url,
+                "data" => ArtifactKind::Data,
+                _ => ArtifactKind::Text,
+            },
+            name: a
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("response")
+                .to_string(),
+            content: content.to_string(),
+            mime_type: a.get("mime_type").and_then(|v| v.as_str()).map(String::from),
+        });
+    }
+
+    if artifacts.is_empty() {
+        return None;
+    }
+
+    Some(TaskOutput {
+        summary,
+        artifacts,
+        token_usage: fallback.token_usage.clone(),
+        duration: fallback.duration,
+    })
+}
+
 async fn process_delegation_result(
     ctx: &DelegationContext,
     broker: &System0ToolBroker,
     result: Result<neuromancer_agent::runtime::TurnExecutionResult, NeuromancerError>,
     started_at: &Instant,
+    extracted_output: Option<TaskOutput>,
 ) -> (
     String,
     Option<String>,
@@ -632,7 +764,8 @@ async fn process_delegation_result(
         Ok(turn_output) => {
             let response_text = turn_output.output.message.clone();
             let is_no_reply = response_text.trim() == "NO_REPLY";
-            let task_output = turn_output.output.into_task_output();
+            let task_output =
+                extracted_output.unwrap_or_else(|| turn_output.output.into_task_output());
 
             let mut summary_text = task_output.summary.clone();
             if summary_text.trim().is_empty() {
@@ -833,5 +966,97 @@ async fn journal_thread_created(
     event.call_id = Some(call_id.to_string());
     if let Err(err) = thread_journal.append_event(event).await {
         tracing::error!(thread_id = %thread_id, error = ?err, "thread_journal_write_failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample_agent_output() -> AgentOutput {
+        AgentOutput {
+            message: "The answer is 42.".to_string(),
+            token_usage: TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            },
+            duration: Duration::from_millis(500),
+        }
+    }
+
+    #[test]
+    fn parse_extraction_valid_json() {
+        let fallback = sample_agent_output();
+        let response = r#"{"summary":"Computed the answer","artifacts":[{"kind":"text","name":"response","content":"The answer is 42."}]}"#;
+
+        let result = parse_extraction_response(response, &fallback).unwrap();
+        assert_eq!(result.summary, "Computed the answer");
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0].content, "The answer is 42.");
+        assert_eq!(result.token_usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn parse_extraction_markdown_fenced_json() {
+        let fallback = sample_agent_output();
+        let response = "```json\n{\"summary\":\"Done\",\"artifacts\":[{\"kind\":\"code\",\"name\":\"script\",\"content\":\"print('hi')\"}]}\n```";
+
+        let result = parse_extraction_response(response, &fallback).unwrap();
+        assert_eq!(result.summary, "Done");
+        assert!(matches!(result.artifacts[0].kind, ArtifactKind::Code));
+        assert_eq!(result.artifacts[0].content, "print('hi')");
+    }
+
+    #[test]
+    fn parse_extraction_multiple_artifacts() {
+        let fallback = sample_agent_output();
+        let response = r#"{"summary":"Generated code and docs","artifacts":[{"kind":"code","name":"main.rs","content":"fn main() {}"},{"kind":"text","name":"docs","content":"Documentation here"}]}"#;
+
+        let result = parse_extraction_response(response, &fallback).unwrap();
+        assert_eq!(result.artifacts.len(), 2);
+        assert!(matches!(result.artifacts[0].kind, ArtifactKind::Code));
+        assert!(matches!(result.artifacts[1].kind, ArtifactKind::Text));
+    }
+
+    #[test]
+    fn parse_extraction_skips_empty_content() {
+        let fallback = sample_agent_output();
+        let response = r#"{"summary":"Partial","artifacts":[{"kind":"text","name":"empty","content":""},{"kind":"text","name":"real","content":"data"}]}"#;
+
+        let result = parse_extraction_response(response, &fallback).unwrap();
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0].name, "real");
+    }
+
+    #[test]
+    fn parse_extraction_returns_none_for_invalid_json() {
+        let fallback = sample_agent_output();
+        assert!(parse_extraction_response("not json at all", &fallback).is_none());
+    }
+
+    #[test]
+    fn parse_extraction_returns_none_for_missing_summary() {
+        let fallback = sample_agent_output();
+        let response = r#"{"artifacts":[{"kind":"text","name":"r","content":"x"}]}"#;
+        assert!(parse_extraction_response(response, &fallback).is_none());
+    }
+
+    #[test]
+    fn parse_extraction_returns_none_for_empty_artifacts() {
+        let fallback = sample_agent_output();
+        let response = r#"{"summary":"Nothing","artifacts":[]}"#;
+        assert!(parse_extraction_response(response, &fallback).is_none());
+    }
+
+    #[test]
+    fn parse_extraction_preserves_fallback_usage_and_duration() {
+        let fallback = sample_agent_output();
+        let response = r#"{"summary":"Done","artifacts":[{"kind":"text","name":"r","content":"ok"}]}"#;
+
+        let result = parse_extraction_response(response, &fallback).unwrap();
+        assert_eq!(result.token_usage.prompt_tokens, 100);
+        assert_eq!(result.duration, Duration::from_millis(500));
     }
 }
