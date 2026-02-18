@@ -65,11 +65,17 @@ async fn test_system0_broker() -> System0ToolBroker {
         .await
         .expect("thread store");
     let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> = Arc::new(thread_store);
+    let memory_pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("memory pool");
+    let memory_store: Arc<dyn neuromancer_core::memory::MemoryStore> =
+        Arc::new(neuromancer_memory_simple::SqliteMemoryStore::new(memory_pool).await.expect("memory store"));
     System0ToolBroker::new(
         HashMap::new(),
         test_config_snapshot(),
         &default_system0_tools(),
         thread_store,
+        memory_store,
         journal,
         test_self_improvement_config(),
         &["manage-bills".to_string()],

@@ -1,8 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
+use neuromancer_core::memory::MemoryStore;
 use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorTurnResult, ThreadSummary,
 };
@@ -12,6 +14,8 @@ use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, Too
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_core::xdg::XdgLayout;
 use tokio::sync::{mpsc, oneshot};
+
+use std::str::FromStr;
 
 use crate::orchestrator::actions::dispatch::dispatch_tool;
 use crate::orchestrator::bootstrap::map_xdg_err;
@@ -87,8 +91,25 @@ impl System0Runtime {
         let thread_store = SqliteThreadStore::open(&layout.runtime_root().join("threads.sqlite"))
             .await
             .map_err(|err| System0Error::Config(err.to_string()))?;
-        let thread_store: std::sync::Arc<dyn neuromancer_core::thread::ThreadStore> =
-            std::sync::Arc::new(thread_store);
+        let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> =
+            Arc::new(thread_store);
+
+        let memory_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::from_str(
+                    &format!("sqlite://{}", layout.runtime_root().join("memory.sqlite").display()),
+                )
+                .map_err(|err| System0Error::Config(err.to_string()))?
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+            )
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let memory_store: Arc<dyn MemoryStore> =
+            Arc::new(neuromancer_memory_simple::SqliteMemoryStore::new(memory_pool)
+                .await
+                .map_err(|err| System0Error::Config(err.to_string()))?);
 
         // Ensure System0's AgentThread exists.
         let system0_thread_id = crate::orchestrator::state::SYSTEM0_AGENT_ID.to_string();
@@ -124,6 +145,7 @@ impl System0Runtime {
             config_snapshot,
             &allowlisted_system0_tools,
             thread_store.clone(),
+            memory_store,
             thread_journal.clone(),
             config.orchestrator.self_improvement.clone(),
             &known_skill_ids,
@@ -149,9 +171,11 @@ impl System0Runtime {
             report_tx,
         )?;
 
+        let memory_store_for_worker = system0_broker.memory_store().await;
         let (turn_tx, turn_worker) = builder::spawn_turn_worker(
             system0_agent_runtime,
             thread_store,
+            memory_store_for_worker,
             system0_thread_id,
             system0_broker,
             thread_journal.clone(),

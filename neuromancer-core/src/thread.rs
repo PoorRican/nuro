@@ -316,4 +316,10 @@ pub trait ThreadStore: Send + Sync {
         thread_id: &ThreadId,
         up_to_message_id: &MessageId,
     ) -> Result<(), NeuromancerError>;
+
+    /// Return the total estimated token count of un-compacted messages in a thread.
+    async fn total_uncompacted_tokens(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<u32, NeuromancerError>;
 }

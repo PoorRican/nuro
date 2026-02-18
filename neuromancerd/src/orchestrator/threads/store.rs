@@ -564,6 +564,20 @@ impl neuromancer_core::thread::ThreadStore for SqliteThreadStore {
         .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
         Ok(())
     }
+
+    async fn total_uncompacted_tokens(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Result<u32, NeuromancerError> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(token_estimate), 0) FROM thread_messages WHERE thread_id = ? AND compacted = 0",
+        )
+        .bind(thread_id)
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(|e| NeuromancerError::Infra(InfraError::Database(e.to_string())))?;
+        Ok(total as u32)
+    }
 }
 
 #[cfg(test)]

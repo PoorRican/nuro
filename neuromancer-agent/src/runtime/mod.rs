@@ -856,6 +856,13 @@ mod tests {
             ) -> Result<(), NeuromancerError> {
                 Ok(())
             }
+            async fn total_uncompacted_tokens(
+                &self,
+                _thread_id: &ThreadId,
+            ) -> Result<u32, NeuromancerError> {
+                let msgs = self.messages.lock().unwrap();
+                Ok(msgs.iter().map(|m| m.token_estimate).sum())
+            }
         }
 
         let llm = Arc::new(SequenceLlmClient::new(vec![

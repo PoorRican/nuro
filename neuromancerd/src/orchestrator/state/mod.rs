@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use neuromancer_agent::runtime::AgentRuntime;
 use neuromancer_core::agent::{RemediationAction, SubAgentReport};
+use neuromancer_core::memory::MemoryStore;
 use neuromancer_core::thread::ThreadStore;
 use neuromancer_core::config::SelfImprovementConfig;
 use neuromancer_core::error::{NeuromancerError, ToolError};
@@ -103,6 +104,7 @@ impl System0ToolBroker {
         config_snapshot: serde_json::Value,
         allowlisted_tools: &[String],
         thread_store: Arc<dyn ThreadStore>,
+        memory_store: Arc<dyn MemoryStore>,
         thread_journal: ThreadJournal,
         self_improvement: SelfImprovementConfig,
         known_skill_ids: &[String],
@@ -121,6 +123,7 @@ impl System0ToolBroker {
                 agents: AgentRegistry {
                     subagents,
                     thread_store,
+                    memory_store,
                     execution_guard,
                 },
                 tasks: task_manager,
@@ -208,6 +211,11 @@ impl System0ToolBroker {
     pub(crate) async fn thread_store(&self) -> Arc<dyn ThreadStore> {
         let inner = self.inner.lock().await;
         inner.agents.thread_store.clone()
+    }
+
+    pub(crate) async fn memory_store(&self) -> Arc<dyn MemoryStore> {
+        let inner = self.inner.lock().await;
+        inner.agents.memory_store.clone()
     }
 
     pub(crate) async fn runtime_for_agent(&self, agent_id: &str) -> Option<Arc<AgentRuntime>> {

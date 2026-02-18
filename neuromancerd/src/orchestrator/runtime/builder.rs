@@ -144,6 +144,7 @@ pub(super) fn build_system0_agent(
 pub(super) fn spawn_turn_worker(
     system0_agent_runtime: Arc<AgentRuntime>,
     thread_store: Arc<dyn ThreadStore>,
+    memory_store: Arc<dyn neuromancer_core::memory::MemoryStore>,
     system0_thread_id: ThreadId,
     system0_broker: System0ToolBroker,
     thread_journal: ThreadJournal,
@@ -151,6 +152,7 @@ pub(super) fn spawn_turn_worker(
     let core = Arc::new(AsyncMutex::new(System0TurnWorker {
         agent_runtime: system0_agent_runtime,
         thread_store,
+        memory_store,
         system0_thread_id,
         system0_broker,
         thread_journal,

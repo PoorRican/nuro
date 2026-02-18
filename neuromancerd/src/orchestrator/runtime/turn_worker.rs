@@ -2,12 +2,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_agent::runtime::AgentRuntime;
+use neuromancer_core::memory::MemoryStore;
 use neuromancer_core::rpc::{OrchestratorTurnResult, ThreadEvent};
 use neuromancer_core::thread::{ThreadId, ThreadStore};
+use neuromancer_core::tool::AgentContext;
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
 use crate::orchestrator::error::System0Error;
 use crate::orchestrator::state::{SYSTEM0_AGENT_ID, System0ToolBroker};
+use crate::orchestrator::threads::compaction;
 use crate::orchestrator::tracing::conversation_projection::normalize_error_message;
 use crate::orchestrator::tracing::thread_journal::{ThreadJournal, make_event};
 
@@ -16,6 +19,7 @@ use super::extract_response_text;
 pub(super) struct System0TurnWorker {
     pub(super) agent_runtime: Arc<AgentRuntime>,
     pub(super) thread_store: Arc<dyn ThreadStore>,
+    pub(super) memory_store: Arc<dyn MemoryStore>,
     pub(super) system0_thread_id: ThreadId,
     pub(super) system0_broker: System0ToolBroker,
     pub(super) thread_journal: ThreadJournal,
@@ -91,6 +95,37 @@ impl System0TurnWorker {
 
         self.journal_turn_events(turn_id, &tool_invocations, &response, &turn_started_at)
             .await;
+
+        // Post-turn compaction check
+        if let Ok(Some(thread)) = self.thread_store.get_thread(&self.system0_thread_id).await {
+            let compact_ctx = AgentContext {
+                agent_id: SYSTEM0_AGENT_ID.to_string(),
+                task_id: turn_id,
+                allowed_tools: vec![],
+                allowed_mcp_servers: vec![],
+                allowed_peer_agents: vec![],
+                allowed_secrets: vec![],
+                allowed_memory_partitions: vec![
+                    "system0".to_string(),
+                    "workspace:default".to_string(),
+                ],
+            };
+            if let Err(err) = compaction::maybe_compact_thread(
+                &*self.thread_store,
+                &*self.memory_store,
+                &compact_ctx,
+                &thread,
+            )
+            .await
+            {
+                tracing::warn!(
+                    turn_id = %turn_id,
+                    error = ?err,
+                    "compaction_failed"
+                );
+            }
+        }
+
         tracing::info!(
             turn_id = %turn_id,
             delegated_tasks = delegated_tasks.len(),
