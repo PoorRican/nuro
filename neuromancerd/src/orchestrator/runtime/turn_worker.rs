@@ -54,8 +54,11 @@ impl System0TurnWorker {
         event.turn_id = Some(turn_id.to_string());
         let _ = self.thread_journal.append_event(event).await;
 
-        // Load memory summaries for injection into context
-        let injected_context = self.load_memory_context(turn_id).await;
+        // Load ephemeral context: memory summaries + task status
+        let mut injected_context = self.load_memory_context(turn_id).await;
+        if let Some(task_msg) = self.load_task_status_context().await {
+            injected_context.push(task_msg);
+        }
 
         let output = match self
             .agent_runtime
@@ -194,6 +197,22 @@ impl System0TurnWorker {
         );
 
         vec![ChatMessage::system(&combined)]
+    }
+
+    /// Build a task queue status summary for injection into System0 context.
+    /// Returns `None` if the queue is empty.
+    async fn load_task_status_context(&self) -> Option<ChatMessage> {
+        let (queued, running, completed, failed, total) =
+            self.system0_broker.task_queue_snapshot().await;
+
+        if total == 0 {
+            return None;
+        }
+
+        let status = format!(
+            "[Task queue status] queued={queued} running={running} completed={completed} failed={failed} total={total}"
+        );
+        Some(ChatMessage::system(&status))
     }
 
     async fn journal_turn_events(
