@@ -49,10 +49,10 @@ cargo run -p neuromancerd -- -c neuromancer.toml
 ```text
 CLI (`neuroctl orchestrator turn`)
   -> Admin JSON-RPC (`orchestrator.turn`)
-    -> `neuromancerd::orchestrator::OrchestratorRuntime::orchestrator_turn`
+    -> `neuromancerd::orchestrator::System0Runtime::turn`
       -> turn queue (`mpsc<TurnRequest>`)
-        -> `RuntimeCore::process_turn`
-          -> System0 `AgentRuntime::execute_turn(...)`
+        -> `System0TurnWorker::process_turn`
+          -> System0 `AgentRuntime::execute_turn_with_thread_store(...)`
             -> `System0ToolBroker` -> `actions::dispatch::dispatch_tool`
               -> runtime/adaptive/authenticated_adaptive action handlers
           -> thread/event journaling + delegated run updates
@@ -63,9 +63,10 @@ CLI (`neuroctl orchestrator turn`)
 
 See `neuromancerd/CLAUDE.md` for the full orchestrator module map. Key entry points:
 
-- `neuromancerd/src/orchestrator/runtime.rs`: `OrchestratorRuntime` public API and turn worker
+- `neuromancerd/src/orchestrator/runtime/mod.rs`: `System0Runtime` public API, `ToolBroker` impl for `System0ToolBroker`
+- `neuromancerd/src/orchestrator/runtime/builder.rs`: sub-agent construction, `SqliteThreadStore` + System0 `AgentThread` creation, worker spawning
 - `neuromancerd/src/orchestrator/actions/dispatch.rs`: tool-class dispatch (Runtime / Adaptive / AuthenticatedAdaptive)
-- `neuromancerd/src/orchestrator/state.rs`: `System0ToolBroker` state and tool spec registry
+- `neuromancerd/src/orchestrator/state/mod.rs`: `System0ToolBroker` state, tool spec registry, `Arc<dyn ThreadStore>`
 
 ### Self-Improvement Security Model
 
@@ -90,12 +91,26 @@ High/critical risk defaults to blocked for authorization unless explicitly force
 - Adaptive tools: `list_proposals`, `get_proposal`, `propose_config_change`, `propose_skill_add`, `propose_skill_update`, `propose_agent_add`, `propose_agent_update`, `analyze_failures`, `score_skills`, `adapt_routing`, `record_lesson`, `run_redteam_eval`, `list_audit_records`
 - Authenticated adaptive tools: `authorize_proposal`, `apply_authorized_proposal`, `modify_skill`
 
-## Core Traits (in `neuromancer-core`)
+## Core Traits and Types (in `neuromancer-core`)
 
 - `ToolBroker` (`tool.rs`) — policy-enforced tool execution scoped to `AgentContext`.
+- `ThreadStore` (`thread.rs`) — async trait for persistent thread/message storage (SQLite-backed via `SqliteThreadStore` in neuromancerd).
 - `MemoryStore` (`memory.rs`) — partitioned persistent storage with TTL, tags, pagination.
 - `SecretsBroker` (`secrets.rs`) — ACL-gated secret resolution with handle-based use.
 - `PolicyEngine` (`policy.rs`) — stacked pre/post gates on tool calls and LLM calls.
+
+### Thread Infrastructure (`thread.rs`)
+
+`AgentThread` is the unified conversation record for all agent interactions. Key types:
+
+- **`AgentThread`** — persistent thread record: `id`, `agent_id`, `scope`, `compaction_policy`, `context_window_budget`, `status`, timestamps
+- **`ThreadScope`** — `System0`, `Task { task_id }`, `UserConversation { conversation_id }`, `Collaboration { parent_thread_id, root_scope }`
+- **`ThreadStatus`** — `Active`, `Completed`, `Failed`, `Suspended`
+- **`CompactionPolicy`** — `SummarizeToMemory { target_partition, summarizer_model, threshold_pct }`, `InPlace { strategy }`, `None`
+- **`ThreadStore`** trait — CRUD for threads + `append_messages` / `load_messages` for conversation persistence, `find_collaboration_thread`, `mark_compacted`
+- **`ChatMessage`** — message types (`MessageRole`, `MessageContent`, `MessageMetadata`) used by both agent runtime and thread store
+
+Message types (`ChatMessage`, `MessageRole`, `MessageContent`, `TruncationStrategy`, etc.) are defined in `neuromancer-core/src/thread.rs` and re-exported by `neuromancer-agent/src/conversation.rs`.
 
 ## RPC and CLI Surface
 

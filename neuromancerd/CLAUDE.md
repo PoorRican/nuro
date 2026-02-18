@@ -30,8 +30,11 @@ cargo run -p neuromancerd -- --validate -c neuromancer.toml
 
 ### Runtime Core
 
-- `runtime.rs`: `OrchestratorRuntime`, turn queue worker, orchestrator RPC helpers, thread/runs/context APIs.
-- `state.rs`: `System0ToolBroker` state, tool spec registry, invocation recording, proposal creation helpers.
+- `runtime/mod.rs`: `System0Runtime` public API (`turn`, `subagent_turn`, `graceful_shutdown`, `enqueue_direct`), `ToolBroker` impl for `System0ToolBroker`.
+- `runtime/builder.rs`: builds sub-agents, System0 agent runtime, spawns turn/task/watchdog workers, creates `SqliteThreadStore` + System0 `AgentThread`.
+- `runtime/turn_worker.rs`: `System0TurnWorker` — processes turn queue via `AgentRuntime::execute_turn_with_thread_store` backed by `SqliteThreadStore`.
+- `runtime/rpc_queries.rs`: orchestrator RPC query implementations (threads, runs, context, stats, events, outputs, resurrection).
+- `state.rs`: `System0ToolBroker` state, tool spec registry, invocation recording, proposal creation helpers. Holds `Arc<dyn ThreadStore>` for thread persistence.
 - `bootstrap.rs`: build orchestrator agent config.
 - `prompt.rs`: prompt loading/rendering.
 - `llm_clients.rs`: LLM client builders (generic OpenAI-compatible via `base_url`), provider defaults, and retry-limit resolution.
@@ -66,11 +69,16 @@ cargo run -p neuromancerd -- --validate -c neuromancer.toml
 - `adaptation/lessons.rs`: lessons partition constant.
 - `adaptation/redteam.rs`: lightweight continuous red-team report.
 
+### Threads
+
+- `threads/mod.rs`: re-exports `SqliteThreadStore`.
+- `threads/store.rs`: `SqliteThreadStore` — SQLite-backed `ThreadStore` implementation (`threads` + `thread_messages` tables, WAL mode). Separate `threads.sqlite` database for high write throughput. Constructors: `open(path)` and `in_memory()`.
+
 ### Tracing
 
-- `tracing/thread_journal.rs`: append/read JSONL thread events + index snapshots.
+- `tracing/thread_journal.rs`: append/read JSONL thread events + index snapshots. Parallel audit log (not the source of truth for conversation state — that's `ThreadStore`).
 - `tracing/event_query.rs`: query filtering helpers.
-- `tracing/conversation_projection.rs`: conversation reconstruction and timeline conversion.
+- `tracing/conversation_projection.rs`: `thread_events_to_thread_messages` (JSONL events → `OrchestratorThreadMessage`), `infer_thread_state_from_events`, `normalize_error_message`.
 - `tracing/jsonl_io.rs`: low-level JSONL read/write.
 
 ### Skills
@@ -85,17 +93,27 @@ cargo run -p neuromancerd -- --validate -c neuromancer.toml
 ```text
 neuroctl orchestrator turn "message"
   -> POST /rpc (`admin.rs`) -> `orchestrator.turn`
-    -> `OrchestratorRuntime::orchestrator_turn`
+    -> `System0Runtime::turn`
       -> enqueue `TurnRequest { message, trigger_type }` on mpsc
-        -> worker: `RuntimeCore::process_turn`
+        -> `System0TurnWorker::process_turn`
           -> journal `message_user`
-          -> System0 `AgentRuntime::execute_turn(..., TriggerSource::Cli, ...)`
+          -> System0 `AgentRuntime::execute_turn_with_thread_store(thread_store, system0_thread_id, ...)`
+            -> loads history from SqliteThreadStore, runs thinking-acting loop, flushes delta back
             -> `System0ToolBroker.call_tool` -> dispatch -> action handler
           -> journal tool invocations + `message_assistant`
       <- `OrchestratorTurnResult { turn_id, response, delegated_tasks, tool_invocations }`
 ```
 
 Current ingress behavior: orchestrator turns are enqueued with `TriggerType::Admin` (CLI/chat boundary).
+
+## Thread Infrastructure
+
+All conversation state is persisted in `SqliteThreadStore` (separate `threads.sqlite` database). The JSONL `ThreadJournal` remains as a parallel audit/event log but is not the source of truth for conversation reconstruction.
+
+- **System0 thread**: Created at startup with `ThreadScope::System0`, `CompactionPolicy::SummarizeToMemory`, 128K budget.
+- **Sub-agent threads**: Created per delegation with `ThreadScope::Task { task_id }`, `CompactionPolicy::InPlace`.
+- **Thread resurrection**: Updates thread status to `Active` via `ThreadStore::update_status()`.
+- **Messages**: Persisted by `AgentRuntime::execute_turn_with_thread_store` which flushes only the delta (new messages from the current turn).
 
 ## Self-Improvement Lifecycle and Gating
 

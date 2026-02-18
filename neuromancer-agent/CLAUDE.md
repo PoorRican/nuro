@@ -17,22 +17,24 @@ cargo test --all                           # Run all workspace tests
 
 `neuromancer-agent` is the agent execution runtime — it takes a `Task` and runs it through a deterministic Thinking→Acting loop until the LLM produces a final text response (no more tool calls). It is **not** a planner; it is a supervised executor.
 
-Entry point: `AgentRuntime::execute(&self, task: &mut Task) -> Result<TaskOutput, NeuromancerError>`
+Entry points:
+- `AgentRuntime::execute(&self, task: &mut Task) -> Result<TaskOutput, NeuromancerError>` — standalone task execution
+- `AgentRuntime::execute_turn_with_thread_store(&self, thread_store, thread_id, source, message, task_id) -> Result<TurnExecutionResult, NeuromancerError>` — conversational turn backed by persistent `ThreadStore`
 
 ## Module Map
 
 | File | Purpose |
 |------|---------|
-| `runtime.rs` | `AgentRuntime` — the state machine loop (Initializing→Thinking→Acting→Completed) |
-| `conversation.rs` | `ConversationContext` + `ChatMessage` — token-budgeted message buffer with truncation |
+| `runtime/mod.rs` | `AgentRuntime` — the state machine loop (Initializing→Thinking→Acting→Completed), both standalone `execute` and thread-backed `execute_turn_with_thread_store` |
+| `conversation.rs` | `ConversationContext` + re-exports of `ChatMessage` from `neuromancer-core::thread` — token-budgeted in-memory message buffer with truncation |
 | `llm.rs` | `LlmClient` trait + `RigLlmClient<M>` adapter + `MockLlmClient` for tests |
 | `model_router.rs` | `ModelRouter` — resolves agent role slots to `ModelSlotConfig` |
-| `session.rs` | `InMemorySessionStore` — per-session conversation state (`load_or_create`, `save_conversation`, `get`) with `AgentSessionId` and `AgentSessionState` |
 
 ## Architecture
 
-### Execution Loop (`runtime.rs`)
+### Execution Loop (`runtime/mod.rs`)
 
+**Standalone execution** (`execute`):
 ```
 AgentRuntime::execute(task)
   1. Build AgentContext (security scope: allowed tools, secrets, memory partitions)
@@ -46,6 +48,19 @@ AgentRuntime::execute(task)
   5. On completion: create Checkpoint, send SubAgentReport::Completed
 ```
 
+**Thread-backed turn** (`execute_turn_with_thread_store`):
+```
+AgentRuntime::execute_turn_with_thread_store(thread_store, thread_id, source, message, task_id)
+  1. Load existing messages from thread_store.load_messages(thread_id)
+  2. Build ConversationContext, replay persisted history, add new user message
+  3. Record pre_turn_count (where new messages start)
+  4. Run same Thinking→Acting loop as execute()
+  5. Flush delta (messages[pre_turn_count..]) to thread_store.append_messages()
+  6. Return TurnExecutionResult { task_id, output }
+```
+
+`ConversationContext` is an in-memory working buffer — it is NOT the source of truth. It is built from `ThreadStore` data at turn start and its new messages are flushed back after completion.
+
 Tool failures are non-fatal — the error is added to conversation context so the LLM can self-correct.
 
 ### rig-core Integration (`llm.rs`)
@@ -53,6 +68,8 @@ Tool failures are non-fatal — the error is added to conversation context so th
 The crate does **not** use rig's `Agent` type. It wraps rig's `CompletionModel` trait via `RigLlmClient<M>`, keeping the custom state machine independent of rig's agent lifecycle. Token counts from rig are currently placeholder zeros.
 
 ### Conversation Management (`conversation.rs`)
+
+Message types (`ChatMessage`, `MessageRole`, `MessageContent`, `TruncationStrategy`, etc.) are defined in `neuromancer-core::thread` and re-exported here. `ConversationContext` and `to_rig_messages()` remain in this file.
 
 - Token estimation: `text.len() / 4` (chars-per-token heuristic), 50 tokens per tool call
 - Truncation triggers when `token_used > token_budget`
@@ -77,6 +94,9 @@ These are the main types this crate consumes — defined in the workspace root's
 - **`Task`** / **`TaskState`** / **`TaskOutput`** — work unit lifecycle and results
 - **`ToolBroker`** trait — `list_tools(ctx)` and `call_tool(ctx, call)` (policy-gated)
 - **`ToolSpec`** / **`ToolCall`** / **`ToolResult`** — tool metadata, invocations, and results
+- **`ThreadStore`** trait — persistent thread/message storage (`append_messages`, `load_messages`); used by `execute_turn_with_thread_store`
+- **`AgentThread`** / **`ThreadScope`** / **`ThreadStatus`** — thread record, scope variants, lifecycle status
+- **`ChatMessage`** / **`MessageRole`** / **`MessageContent`** — message types shared between agent and thread store
 - **`SubAgentReport`** — enum sent to orchestrator: Progress, Stuck, ToolFailure, Completed, Failed
 - **`NeuromancerError`** — domain error hierarchy (AgentError, LlmError, ToolError, PolicyError, InfraError)
 
