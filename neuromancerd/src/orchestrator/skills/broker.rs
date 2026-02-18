@@ -4,7 +4,9 @@ use std::time::Duration;
 use chrono::Utc;
 use neuromancer_core::agent::TaskExecutionState;
 use neuromancer_core::error::{NeuromancerError, ToolError};
-use neuromancer_core::task::{Checkpoint, Task, TaskPriority, TaskState};
+use neuromancer_core::task::{
+    AgentOutput, Checkpoint, CollaborationResult, Task, TaskPriority, TaskState, ThreadMessageRef,
+};
 use neuromancer_core::thread::{
     AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, ThreadStore, TruncationStrategy,
 };
@@ -286,20 +288,26 @@ impl ToolBroker for OrchestratorSkillBroker {
 
         let output = result?;
 
-        // Context-aware terminal behavior: wrap collaboration results with
-        // thread cross-reference so the caller can trace the collaboration lineage.
+        // Wrap result with CollaborationResult when a collaboration thread exists,
+        // providing a cross-reference back to the collaboration thread.
         let result_json = if let Some(ref thread_id) = collab_thread_id {
-            serde_json::json!({
-                "collaboration": true,
-                "thread_id": thread_id,
-                "summary": output.summary,
-                "artifacts": serde_json::to_value(&output.artifacts).unwrap_or_default(),
-                "token_usage": {
-                    "prompt_tokens": output.token_usage.prompt_tokens,
-                    "completion_tokens": output.token_usage.completion_tokens,
-                    "total_tokens": output.token_usage.total_tokens,
+            let collab_result = CollaborationResult {
+                agent_output: AgentOutput {
+                    message: output.summary.clone(),
+                    token_usage: output.token_usage.clone(),
+                    duration: output.duration,
                 },
-            })
+                thread_ref: ThreadMessageRef {
+                    thread_id: thread_id.clone(),
+                    message_id: uuid::Uuid::nil(),
+                },
+            };
+            serde_json::to_value(&collab_result).map_err(|err| {
+                NeuromancerError::Tool(ToolError::ExecutionFailed {
+                    tool_id: "request_agent_assistance".to_string(),
+                    message: err.to_string(),
+                })
+            })?
         } else {
             serde_json::to_value(&output).map_err(|err| {
                 NeuromancerError::Tool(ToolError::ExecutionFailed {
@@ -358,6 +366,8 @@ mod tests {
     use neuromancer_core::task::{Artifact, ArtifactKind, TaskOutput, TokenUsage};
     use neuromancer_core::tool::{ToolBroker, ToolCall, ToolOutput};
     use neuromancer_skills::SkillRegistry;
+
+    use neuromancer_core::task::CollaborationResult;
 
     use crate::orchestrator::security::execution_guard::PlaceholderExecutionGuard;
     use crate::orchestrator::state::{TaskManager, TaskStore};
@@ -633,7 +643,9 @@ mod tests {
         let ToolOutput::Success(payload) = result.output else {
             panic!("expected success payload");
         };
-        assert_eq!(payload["summary"], serde_json::json!("collaborated"));
+        let collab_result: CollaborationResult =
+            serde_json::from_value(payload).expect("should deserialize as CollaborationResult");
+        assert_eq!(collab_result.agent_output.message, "collaborated");
 
         // Verify collaboration thread was created with correct properties.
         let collab_thread_id = check_handle.await.expect("worker handle");
@@ -645,5 +657,136 @@ mod tests {
             .expect("find_collaboration_thread")
             .expect("should find existing collaboration thread");
         assert_eq!(found.id, collab_thread_id);
+    }
+
+    #[tokio::test]
+    async fn collaboration_thread_is_reused_across_calls() {
+        let manager = test_manager().await;
+        let thread_store = test_thread_store().await;
+        let caller_task_id = uuid::Uuid::new_v4();
+        let caller_thread_id = format!("planner-{}", &caller_task_id.to_string()[..8]);
+
+        let now = Utc::now();
+        thread_store
+            .create_thread(&AgentThread {
+                id: caller_thread_id.clone(),
+                agent_id: "planner".to_string(),
+                scope: ThreadScope::Task {
+                    task_id: caller_task_id.to_string(),
+                },
+                compaction_policy: CompactionPolicy::InPlace {
+                    strategy: TruncationStrategy::default(),
+                },
+                context_window_budget: 128_000,
+                status: ThreadStatus::Active,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("create caller thread");
+
+        manager
+            .register_execution_context(
+                caller_task_id,
+                TaskExecutionContext {
+                    turn_id: None,
+                    call_id: None,
+                    thread_id: Some(caller_thread_id.clone()),
+                    trigger_type: TriggerType::Internal,
+                    publish_output: false,
+                },
+            )
+            .await;
+
+        // First call: spawn worker, collect collab thread id
+        let manager_w1 = manager.clone();
+        tokio::spawn(async move {
+            let child = manager_w1.wait_for_next_task().await.expect("child1");
+            manager_w1
+                .transition(
+                    child.id,
+                    Some("queued"),
+                    TaskState::Completed {
+                        output: completed_output("first"),
+                    },
+                    None,
+                )
+                .await
+                .expect("complete child1");
+        });
+
+        let broker = OrchestratorSkillBroker::new(
+            test_skill_broker(),
+            manager.clone(),
+            thread_store.clone(),
+        );
+        let ctx = AgentContext {
+            task_id: caller_task_id,
+            ..test_ctx(vec!["browser".to_string()])
+        };
+
+        let result1 = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "first request",
+                        "timeout_secs": 5,
+                    }),
+                },
+            )
+            .await
+            .expect("first assistance");
+        let ToolOutput::Success(payload1) = result1.output else {
+            panic!("expected success");
+        };
+        let collab1: CollaborationResult =
+            serde_json::from_value(payload1).expect("deserialize result1");
+        let thread_id_1 = collab1.thread_ref.thread_id;
+
+        // Second call: same caller context → should reuse the collaboration thread
+        let manager_w2 = manager.clone();
+        tokio::spawn(async move {
+            let child = manager_w2.wait_for_next_task().await.expect("child2");
+            manager_w2
+                .transition(
+                    child.id,
+                    Some("queued"),
+                    TaskState::Completed {
+                        output: completed_output("second"),
+                    },
+                    None,
+                )
+                .await
+                .expect("complete child2");
+        });
+
+        let result2 = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-2".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "second request",
+                        "timeout_secs": 5,
+                    }),
+                },
+            )
+            .await
+            .expect("second assistance");
+        let ToolOutput::Success(payload2) = result2.output else {
+            panic!("expected success");
+        };
+        let collab2: CollaborationResult =
+            serde_json::from_value(payload2).expect("deserialize result2");
+        let thread_id_2 = collab2.thread_ref.thread_id;
+
+        // The thread IDs should be the same — reused, not created new
+        assert_eq!(thread_id_1, thread_id_2, "collaboration thread should be reused");
     }
 }

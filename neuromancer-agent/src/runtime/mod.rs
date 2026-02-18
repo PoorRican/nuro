@@ -93,7 +93,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
-            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
+            allowed_peer_agents: self.config.capabilities.can_request.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -339,7 +339,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
-            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
+            allowed_peer_agents: self.config.capabilities.can_request.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -391,7 +391,7 @@ impl AgentRuntime {
                 };
                 self.send_report(SubAgentReport::Stuck {
                     task_id: task.id,
-                    thread_id: None,
+                    thread_id: Some(thread_id.clone()),
                     reason: format!("max iterations ({max_iterations}) exceeded"),
                     partial_result: None,
                 })
@@ -435,7 +435,7 @@ impl AgentRuntime {
             if iteration % 5 == 0 {
                 self.send_report(SubAgentReport::Progress {
                     task_id: task.id,
-                    thread_id: None,
+                    thread_id: Some(thread_id.clone()),
                     step: iteration,
                     description: format!("iteration {iteration}/{max_iterations}"),
                     artifacts_so_far: vec![],
@@ -454,7 +454,7 @@ impl AgentRuntime {
                     if let ToolOutput::Error(err) = &result.output {
                         self.send_report(SubAgentReport::ToolFailure {
                             task_id: task.id,
-                            thread_id: None,
+                            thread_id: Some(thread_id.clone()),
                             tool_id: call.tool_id.clone(),
                             error: err.clone(),
                             retry_eligible: true,
@@ -493,7 +493,7 @@ impl AgentRuntime {
 
             self.send_report(SubAgentReport::Completed {
                 task_id: task.id,
-                thread_id: None,
+                thread_id: Some(thread_id.clone()),
                 artifacts: task_output.artifacts.clone(),
                 summary: task_output.summary.clone(),
             })
@@ -517,7 +517,7 @@ impl AgentRuntime {
             Err(err) => {
                 self.send_report(SubAgentReport::Failed {
                     task_id: task.id,
-                    thread_id: None,
+                    thread_id: Some(thread_id.clone()),
                     error: err.to_string(),
                     partial_result: None,
                 })
