@@ -11,7 +11,7 @@ use neuromancer_core::rpc::{
 use neuromancer_core::thread::{
     AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, UserConversation,
 };
-use neuromancer_core::task::{Task, TaskId, TaskOutput};
+use neuromancer_core::task::{OutputMode, Task, TaskId, TaskOutput};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 use neuromancer_core::xdg::XdgLayout;
@@ -271,6 +271,8 @@ impl System0Runtime {
         &self,
         thread_id: String,
         message: String,
+        output_mode: OutputMode,
+        trigger_source: TriggerSource,
     ) -> Result<OrchestratorSubagentTurnResult, System0Error> {
         if thread_id.trim().is_empty() {
             return Err(System0Error::InvalidRequest(
@@ -311,10 +313,11 @@ impl System0Runtime {
             .execute_turn_with_thread_store(
                 &*thread_store,
                 &thread_id,
-                TriggerSource::Internal,
+                trigger_source,
                 message.clone(),
                 run_uuid,
                 vec![],
+                output_mode,
             )
             .await;
         let (run_state, response, error) = match run_result {
@@ -413,11 +416,18 @@ impl System0Runtime {
             ));
         }
 
-        // Verify the agent exists.
-        self.system0_broker
+        // Verify the agent exists and supports user conversations.
+        let runtime = self
+            .system0_broker
             .runtime_for_agent(&agent_id)
             .await
             .ok_or_else(|| System0Error::ResourceNotFound(format!("agent '{agent_id}'")))?;
+
+        if !runtime.config().capabilities.user_conversation {
+            return Err(System0Error::InvalidRequest(format!(
+                "agent '{agent_id}' does not support user conversations"
+            )));
+        }
 
         let thread_store = self.system0_broker.thread_store().await;
 
@@ -473,8 +483,25 @@ impl System0Runtime {
         };
 
         // Execute the turn via `subagent_turn` (bypasses System0 turn queue).
-        self.subagent_turn(conversation.thread_id.clone(), message)
+        match self
+            .subagent_turn(
+                conversation.thread_id.clone(),
+                message,
+                OutputMode::Passthrough,
+                TriggerSource::Chat,
+            )
             .await
+        {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                tracing::error!(
+                    agent_id = %agent_id,
+                    error = ?err,
+                    "user_conversation_turn_failed"
+                );
+                Err(err)
+            }
+        }
     }
 
     /// List all UserConversation sessions.

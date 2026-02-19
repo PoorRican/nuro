@@ -32,6 +32,7 @@ tower-http = { workspace = true }
 clap = { workspace = true }
 notify = { workspace = true }
 rig-core = { workspace = true }
+schemars = { workspace = true }
 humantime = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }

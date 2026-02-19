@@ -111,6 +111,7 @@ impl LlmClient for EchoLlmClient {
         _system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         _tool_definitions: Vec<rig::completion::ToolDefinition>,
+        _output_schema: Option<schemars::Schema>,
     ) -> Result<neuromancer_agent::llm::LlmResponse, NeuromancerError> {
         let fallback = messages
             .iter()

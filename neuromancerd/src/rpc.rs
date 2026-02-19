@@ -14,6 +14,8 @@ use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::orchestrator::{System0Error, System0Runtime};
+use neuromancer_core::task::OutputMode;
+use neuromancer_core::trigger::TriggerSource;
 use neuromancer_core::rpc::{
     ConfigReloadResult, HealthResult, JSON_RPC_GENERIC_SERVER_ERROR, JSON_RPC_INTERNAL_ERROR,
     JSON_RPC_INVALID_PARAMS, JSON_RPC_INVALID_REQUEST, JSON_RPC_METHOD_NOT_FOUND,
@@ -192,7 +194,12 @@ async fn op_orchestrator_subagent_turn(
     };
 
     runtime
-        .subagent_turn(params.thread_id, params.message)
+        .subagent_turn(
+            params.thread_id,
+            params.message,
+            OutputMode::Extract,
+            TriggerSource::Internal,
+        )
         .await
         .map_err(map_system0_error)
 }

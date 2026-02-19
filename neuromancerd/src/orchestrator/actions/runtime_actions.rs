@@ -504,6 +504,7 @@ async fn run_delegated_task(
             instruction,
             task_id,
             vec![],
+            neuromancer_core::task::OutputMode::Passthrough,
         )
         .await;
 
@@ -663,6 +664,7 @@ async fn try_extract_task_output(
             EXTRACTION_PROMPT.to_string(),
             extraction_id,
             vec![],
+            neuromancer_core::task::OutputMode::Passthrough,
         )
         .await;
 

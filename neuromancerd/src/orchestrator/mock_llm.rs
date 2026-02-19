@@ -16,6 +16,7 @@ impl LlmClient for TwoStepMockLlmClient {
         _system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
+        _output_schema: Option<schemars::Schema>,
     ) -> Result<neuromancer_agent::llm::LlmResponse, NeuromancerError> {
         let mut issued_tools = self.issued_tools.lock().map_err(|_| {
             NeuromancerError::Infra(neuromancer_core::error::InfraError::Config(

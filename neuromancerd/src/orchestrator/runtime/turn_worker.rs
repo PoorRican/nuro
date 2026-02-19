@@ -7,6 +7,7 @@ use neuromancer_core::rpc::{OrchestratorTurnResult, ThreadEvent};
 use neuromancer_core::thread::{ChatMessage, ThreadId, ThreadStore};
 use neuromancer_core::secrets::TextRedactor;
 use neuromancer_core::tool::AgentContext;
+use neuromancer_core::task::OutputMode;
 use neuromancer_core::trigger::{TriggerSource, TriggerType};
 
 use crate::orchestrator::error::System0Error;
@@ -70,6 +71,7 @@ impl System0TurnWorker {
                 message.clone(),
                 turn_id,
                 injected_context,
+                OutputMode::Passthrough,
             )
             .await
         {
