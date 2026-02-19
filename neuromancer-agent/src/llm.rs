@@ -35,11 +35,13 @@ pub trait LlmClient: Send + Sync {
     /// `system_prompt` - the system instruction text.
     /// `messages` - chat history in rig Message format.
     /// `tool_definitions` - available tools for this call.
+    /// `output_schema` - optional JSON Schema for structured output.
     async fn complete(
         &self,
         system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
+        output_schema: Option<schemars::Schema>,
     ) -> Result<LlmResponse, NeuromancerError>;
 }
 
@@ -65,6 +67,7 @@ where
         system_prompt: &str,
         messages: Vec<rig::completion::Message>,
         tool_definitions: Vec<rig::completion::ToolDefinition>,
+        output_schema: Option<schemars::Schema>,
     ) -> Result<LlmResponse, NeuromancerError> {
         let (current_prompt, chat_history) = split_prompt_and_history(messages);
 
@@ -73,6 +76,7 @@ where
             .completion_request(current_prompt.clone())
             .messages(chat_history)
             .tools(tool_definitions)
+            .output_schema_opt(output_schema)
             .build();
 
         let history_vec: Vec<_> = request.chat_history.iter().collect();
@@ -115,9 +119,8 @@ where
         Ok(LlmResponse {
             text,
             tool_calls,
-            // Token counts not exposed by rig's CompletionResponse, estimate from content
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens: response.usage.input_tokens as u32,
+            completion_tokens: response.usage.output_tokens as u32,
         })
     }
 }
@@ -198,6 +201,7 @@ impl LlmClient for MockLlmClient {
         _system_prompt: &str,
         _messages: Vec<rig::completion::Message>,
         _tool_definitions: Vec<rig::completion::ToolDefinition>,
+        _output_schema: Option<schemars::Schema>,
     ) -> Result<LlmResponse, NeuromancerError> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {

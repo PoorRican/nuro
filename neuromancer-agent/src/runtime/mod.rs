@@ -11,8 +11,8 @@ use neuromancer_core::argument_tokens;
 use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::secrets::{SecretRef, SecretUsage, SecretsBroker, TextRedactor};
 use neuromancer_core::task::{
-    AgentErrorLike, AgentOutput, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput,
-    TaskState, TokenUsage,
+    AgentErrorLike, AgentOutput, Artifact, ArtifactKind, Checkpoint, OutputMode, Task, TaskId,
+    TaskOutput, TaskOutputSchema, TaskState, TokenUsage,
 };
 use neuromancer_core::thread::{ThreadId, ThreadStore};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult};
@@ -57,6 +57,10 @@ impl AgentRuntime {
             report_tx,
             tool_call_retry_limit,
         }
+    }
+
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
     }
 
     pub fn with_secrets_broker(mut self, broker: Arc<dyn SecretsBroker>) -> Self {
@@ -164,7 +168,7 @@ impl AgentRuntime {
             let rig_messages = conversation.to_rig_messages();
             let response = match self
                 .llm_client
-                .complete(&system_prompt, rig_messages, tool_defs.clone())
+                .complete(&system_prompt, rig_messages, tool_defs.clone(), None)
                 .await
             {
                 Ok(response) => response,
@@ -315,6 +319,7 @@ impl AgentRuntime {
         user_message: String,
         task_id: TaskId,
         injected_context: Vec<ChatMessage>,
+        output_mode: OutputMode,
     ) -> Result<TurnExecutionResult, NeuromancerError> {
         let mut task = Task::new_with_id(
             task_id,
@@ -408,7 +413,7 @@ impl AgentRuntime {
             let rig_messages = conversation.to_rig_messages();
             let response = match self
                 .llm_client
-                .complete(&system_prompt, rig_messages, tool_defs.clone())
+                .complete(&system_prompt, rig_messages, tool_defs.clone(), None)
                 .await
             {
                 Ok(response) => response,
@@ -472,14 +477,58 @@ impl AgentRuntime {
             let output_text = response.text.unwrap_or_default();
             conversation.add_message(ChatMessage::assistant_text(output_text.clone()));
 
-            let agent_output = AgentOutput {
+            let mut agent_output = AgentOutput {
                 message: output_text,
-                token_usage: total_usage,
+                token_usage: total_usage.clone(),
                 duration: start.elapsed(),
             };
 
-            // Convert to TaskOutput for state machine bookkeeping (checkpoint, task state).
-            let task_output = agent_output.clone().into_task_output();
+            // If Extract mode, run a structured output extraction step.
+            // Build extraction messages WITHOUT modifying the main conversation
+            // (extraction is ephemeral — not persisted to thread store).
+            let task_output = if matches!(output_mode, OutputMode::Extract) {
+                let mut extraction_msgs = conversation.to_rig_messages();
+                extraction_msgs.push(rig::completion::Message::user(
+                    "Extract a structured JSON summary from your response above.",
+                ));
+
+                let schema = schemars::schema_for!(TaskOutputSchema);
+                let extracted = match self
+                    .llm_client
+                    .complete(&system_prompt, extraction_msgs, vec![], Some(schema))
+                    .await
+                {
+                    Ok(extraction_response) => {
+                        total_usage.prompt_tokens += extraction_response.prompt_tokens;
+                        total_usage.completion_tokens +=
+                            extraction_response.completion_tokens;
+                        total_usage.total_tokens += extraction_response.prompt_tokens
+                            + extraction_response.completion_tokens;
+                        agent_output.token_usage = total_usage.clone();
+
+                        extraction_response
+                            .text
+                            .as_deref()
+                            .and_then(|t| serde_json::from_str::<TaskOutputSchema>(t).ok())
+                            .map(|schema| {
+                                schema.into_task_output(total_usage.clone(), start.elapsed())
+                            })
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = ?err,
+                            "extraction_step_failed_falling_back"
+                        );
+                        None
+                    }
+                };
+
+                // Fallback to into_task_output() if extraction didn't produce a result
+                extracted.unwrap_or_else(|| agent_output.clone().into_task_output())
+            } else {
+                agent_output.clone().into_task_output()
+            };
 
             let checkpoint = Checkpoint {
                 task_id: task.id,
@@ -717,6 +766,7 @@ mod tests {
             _system_prompt: &str,
             _messages: Vec<rig::completion::Message>,
             _tool_definitions: Vec<rig::completion::ToolDefinition>,
+            _output_schema: Option<schemars::Schema>,
         ) -> Result<LlmResponse, NeuromancerError> {
             let mut items = self.items.lock().expect("sequence lock");
             if items.is_empty() {
@@ -1054,9 +1104,254 @@ mod tests {
                 "What happened?".into(),
                 uuid::Uuid::new_v4(),
                 vec![],
+                OutputMode::Passthrough,
             )
             .await
             .expect("turn recovery should succeed");
         assert!(output.output.message.contains("Recovered turn response"));
+    }
+
+    /// Helper: minimal ThreadStore for turn-based tests.
+    fn mock_thread_store() -> impl ThreadStore {
+        use neuromancer_core::thread::{
+            AgentThread, CrossReference, MessageId, ThreadId, ThreadStatus, ThreadStore,
+        };
+        use std::sync::Mutex;
+
+        struct InMemoryThreadStore {
+            messages: Mutex<Vec<neuromancer_core::thread::ChatMessage>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ThreadStore for InMemoryThreadStore {
+            async fn create_thread(&self, _: &AgentThread) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn get_thread(
+                &self,
+                _: &ThreadId,
+            ) -> Result<Option<AgentThread>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn update_status(
+                &self,
+                _: &ThreadId,
+                _: ThreadStatus,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn list_threads_by_scope_type(
+                &self,
+                _: &str,
+            ) -> Result<Vec<AgentThread>, NeuromancerError> {
+                Ok(vec![])
+            }
+            async fn list_threads_for_agent(
+                &self,
+                _: &str,
+            ) -> Result<Vec<AgentThread>, NeuromancerError> {
+                Ok(vec![])
+            }
+            async fn append_messages(
+                &self,
+                _: &ThreadId,
+                messages: &[neuromancer_core::thread::ChatMessage],
+            ) -> Result<(), NeuromancerError> {
+                self.messages.lock().unwrap().extend_from_slice(messages);
+                Ok(())
+            }
+            async fn load_messages(
+                &self,
+                _: &ThreadId,
+                _: bool,
+            ) -> Result<Vec<neuromancer_core::thread::ChatMessage>, NeuromancerError> {
+                Ok(self.messages.lock().unwrap().clone())
+            }
+            async fn find_collaboration_thread(
+                &self,
+                _: &str,
+                _: &ThreadId,
+            ) -> Result<Option<AgentThread>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn resolve_cross_reference(
+                &self,
+                _: &MessageId,
+            ) -> Result<Option<CrossReference>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn mark_compacted(
+                &self,
+                _: &ThreadId,
+                _: &MessageId,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn total_uncompacted_tokens(
+                &self,
+                _: &ThreadId,
+            ) -> Result<u32, NeuromancerError> {
+                let msgs = self.messages.lock().unwrap();
+                Ok(msgs.iter().map(|m| m.token_estimate).sum())
+            }
+            async fn find_user_conversation(
+                &self,
+                _: &str,
+            ) -> Result<Option<neuromancer_core::thread::UserConversation>, NeuromancerError> {
+                Ok(None)
+            }
+            async fn save_user_conversation(
+                &self,
+                _: &neuromancer_core::thread::UserConversation,
+            ) -> Result<(), NeuromancerError> {
+                Ok(())
+            }
+            async fn list_user_conversations(
+                &self,
+            ) -> Result<Vec<neuromancer_core::thread::UserConversation>, NeuromancerError> {
+                Ok(vec![])
+            }
+        }
+
+        InMemoryThreadStore {
+            messages: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_mode_runs_extraction_step_and_returns_structured_output() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // LLM client that counts calls and returns terminal text then extraction JSON.
+        struct ExtractLlm {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for ExtractLlm {
+            async fn complete(
+                &self,
+                _system_prompt: &str,
+                _messages: Vec<rig::completion::Message>,
+                _tool_definitions: Vec<rig::completion::ToolDefinition>,
+                _output_schema: Option<schemars::Schema>,
+            ) -> Result<LlmResponse, NeuromancerError> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => Ok(LlmResponse {
+                        text: Some("Here is the analysis of your data.".into()),
+                        tool_calls: vec![],
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                    }),
+                    1 => {
+                        // Extraction call — return structured JSON
+                        let schema_json = serde_json::json!({
+                            "summary": "Data analysis complete",
+                            "artifacts": [
+                                {
+                                    "kind": "code",
+                                    "name": "analysis.py",
+                                    "content": "print('hello')"
+                                }
+                            ],
+                            "no_reply": false
+                        });
+                        Ok(LlmResponse {
+                            text: Some(serde_json::to_string(&schema_json).unwrap()),
+                            tool_calls: vec![],
+                            prompt_tokens: 30,
+                            completion_tokens: 15,
+                        })
+                    }
+                    _ => panic!("unexpected LLM call #{n}"),
+                }
+            }
+        }
+
+        let llm = Arc::new(ExtractLlm {
+            call_count: AtomicUsize::new(0),
+        });
+        let broker = Arc::new(MockToolBroker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let runtime = AgentRuntime::new(test_config(), llm.clone(), broker, tx, 1);
+        let thread_store = mock_thread_store();
+
+        let output = runtime
+            .execute_turn_with_thread_store(
+                &thread_store,
+                &"extract-thread".to_string(),
+                TriggerSource::Internal,
+                "Analyze data".into(),
+                uuid::Uuid::new_v4(),
+                vec![],
+                OutputMode::Extract,
+            )
+            .await
+            .expect("extraction turn should succeed");
+
+        // 2 LLM calls: main response + extraction
+        assert_eq!(llm.call_count.load(Ordering::SeqCst), 2);
+        // The agent output message is from the first call
+        assert!(output.output.message.contains("analysis of your data"));
+        // Token usage should include both calls
+        assert_eq!(output.output.token_usage.prompt_tokens, 40); // 10 + 30
+        assert_eq!(output.output.token_usage.completion_tokens, 35); // 20 + 15
+    }
+
+    #[tokio::test]
+    async fn passthrough_mode_skips_extraction_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingLlm {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmClient for CountingLlm {
+            async fn complete(
+                &self,
+                _system_prompt: &str,
+                _messages: Vec<rig::completion::Message>,
+                _tool_definitions: Vec<rig::completion::ToolDefinition>,
+                _output_schema: Option<schemars::Schema>,
+            ) -> Result<LlmResponse, NeuromancerError> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => Ok(LlmResponse {
+                        text: Some("Simple passthrough response.".into()),
+                        tool_calls: vec![],
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                    }),
+                    _ => panic!("unexpected LLM call #{n} — extraction should not run"),
+                }
+            }
+        }
+
+        let llm = Arc::new(CountingLlm {
+            call_count: AtomicUsize::new(0),
+        });
+        let broker = Arc::new(MockToolBroker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let runtime = AgentRuntime::new(test_config(), llm.clone(), broker, tx, 1);
+        let thread_store = mock_thread_store();
+
+        let output = runtime
+            .execute_turn_with_thread_store(
+                &thread_store,
+                &"passthrough-thread".to_string(),
+                TriggerSource::Internal,
+                "Simple question".into(),
+                uuid::Uuid::new_v4(),
+                vec![],
+                OutputMode::Passthrough,
+            )
+            .await
+            .expect("passthrough turn should succeed");
+
+        // Only 1 LLM call — no extraction step
+        assert_eq!(llm.call_count.load(Ordering::SeqCst), 1);
+        assert!(output.output.message.contains("passthrough response"));
     }
 }
