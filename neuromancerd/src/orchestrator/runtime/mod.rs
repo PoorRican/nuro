@@ -36,6 +36,7 @@ pub struct System0Runtime {
     turn_tx: mpsc::Sender<TurnRequest>,
     system0_broker: System0ToolBroker,
     thread_journal: ThreadJournal,
+    report_tx: mpsc::Sender<neuromancer_core::agent::SubAgentReport>,
     _task_worker: tokio::task::JoinHandle<()>,
     _watchdog_worker: tokio::task::JoinHandle<()>,
     _turn_worker: tokio::task::JoinHandle<()>,
@@ -165,6 +166,7 @@ impl System0Runtime {
             }
         });
 
+        let report_tx_for_runtime = report_tx.clone();
         let system0_agent_runtime = builder::build_system0_agent(
             config,
             &layout,
@@ -190,6 +192,7 @@ impl System0Runtime {
             turn_tx,
             system0_broker: runtime_broker,
             thread_journal,
+            report_tx: report_tx_for_runtime,
             _task_worker: task_worker,
             _watchdog_worker: watchdog_worker,
             _turn_worker: turn_worker,
@@ -498,6 +501,14 @@ impl System0Runtime {
                     agent_id = %agent_id,
                     error = ?err,
                     "user_conversation_turn_failed"
+                );
+                let _ = self.report_tx.try_send(
+                    neuromancer_core::agent::SubAgentReport::Failed {
+                        task_id: uuid::Uuid::nil(),
+                        thread_id: Some(conversation.thread_id.clone()),
+                        error: format!("user_conversation({agent_id}): {err}"),
+                        partial_result: None,
+                    },
                 );
                 Err(err)
             }
