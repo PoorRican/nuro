@@ -15,6 +15,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 gray_matter = { workspace = true }
 yaml-rust2 = { workspace = true }
-
-[dev-dependencies]
 uuid = { workspace = true }

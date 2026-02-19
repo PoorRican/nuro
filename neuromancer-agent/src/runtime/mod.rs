@@ -1,19 +1,25 @@
+//! `AgentRuntime` state machine: LLM completions + tool execution until final response.
+
+mod helpers;
+mod recovery;
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use neuromancer_core::agent::{AgentConfig, SubAgentReport, TaskExecutionState};
-use neuromancer_core::error::{AgentError, LlmError, NeuromancerError};
+use neuromancer_core::error::{AgentError, NeuromancerError};
 use neuromancer_core::task::{
-    Artifact, ArtifactKind, Checkpoint, Task, TaskOutput, TaskState, TokenUsage,
+    AgentErrorLike, Artifact, ArtifactKind, Checkpoint, Task, TaskId, TaskOutput, TaskState,
+    TokenUsage,
 };
-use neuromancer_core::tool::{
-    AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSpec,
-};
+use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult};
 use neuromancer_core::trigger::TriggerSource;
 
 use crate::conversation::{ChatMessage, ConversationContext, TruncationStrategy};
 use crate::llm::LlmClient;
 use crate::session::{AgentSessionId, InMemorySessionStore};
+
+use helpers::{available_tool_names, specs_to_rig_definitions, truncate_summary};
 
 #[derive(Debug, Clone)]
 pub struct TurnExecutionResult {
@@ -47,6 +53,8 @@ impl AgentRuntime {
         }
     }
 
+    // TODO: there seems to be significant code duplication between `execute` and `execute_turn`
+
     /// Execute a task through the full state machine lifecycle.
     /// Returns the final TaskOutput on success.
     pub async fn execute(&self, task: &mut Task) -> Result<TaskOutput, NeuromancerError> {
@@ -54,7 +62,9 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
 
         // Transition: Initializing
-        task.state = TaskState::Running;
+        task.state = TaskState::Running {
+            execution_state: TaskExecutionState::Initializing { task_id: task.id },
+        };
         tracing::info!(
             task_id = %task.id,
             agent_id = %self.config.id,
@@ -67,6 +77,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
+            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -111,6 +122,15 @@ impl AgentRuntime {
                     partial_result: None,
                 })
                 .await;
+                self.send_report(SubAgentReport::Failed {
+                    task_id: task.id,
+                    error: err.to_string(),
+                    partial_result: None,
+                })
+                .await;
+                task.state = TaskState::Failed {
+                    error: AgentErrorLike::new("max_iterations_exceeded", err.to_string()),
+                };
                 return Err(NeuromancerError::Agent(err));
             }
 
@@ -250,6 +270,9 @@ impl AgentRuntime {
                 summary: output.summary.clone(),
             })
             .await;
+            task.state = TaskState::Completed {
+                output: output.clone(),
+            };
 
             return Ok(output);
         }
@@ -263,11 +286,38 @@ impl AgentRuntime {
         source: TriggerSource,
         user_message: String,
     ) -> Result<TurnExecutionResult, NeuromancerError> {
-        let mut task = Task::new(source, user_message.clone(), self.config.id.clone());
+        self.execute_turn_with_task_id(
+            session_store,
+            session_id,
+            source,
+            user_message,
+            TaskId::new_v4(),
+        )
+        .await
+    }
+
+    /// Execute a single conversational turn using a caller-supplied task id.
+    /// This allows the orchestrator to correlate run_id and task_id deterministically.
+    pub async fn execute_turn_with_task_id(
+        &self,
+        session_store: &InMemorySessionStore,
+        session_id: AgentSessionId,
+        source: TriggerSource,
+        user_message: String,
+        task_id: TaskId,
+    ) -> Result<TurnExecutionResult, NeuromancerError> {
+        let mut task = Task::new_with_id(
+            task_id,
+            source,
+            user_message.clone(),
+            self.config.id.clone(),
+        );
         let start = Instant::now();
         let mut total_usage = TokenUsage::default();
 
-        task.state = TaskState::Running;
+        task.state = TaskState::Running {
+            execution_state: TaskExecutionState::Initializing { task_id: task.id },
+        };
         tracing::info!(
             task_id = %task.id,
             agent_id = %self.config.id,
@@ -279,6 +329,7 @@ impl AgentRuntime {
             task_id: task.id,
             allowed_tools: self.config.capabilities.skills.clone(),
             allowed_mcp_servers: self.config.capabilities.mcp_servers.clone(),
+            allowed_peer_agents: self.config.capabilities.a2a_peers.clone(),
             allowed_secrets: self.config.capabilities.secrets.clone(),
             allowed_memory_partitions: self.config.capabilities.memory_partitions.clone(),
         };
@@ -421,6 +472,9 @@ impl AgentRuntime {
                 summary: output.summary.clone(),
             })
             .await;
+            task.state = TaskState::Completed {
+                output: output.clone(),
+            };
 
             break Ok(output);
         };
@@ -429,10 +483,24 @@ impl AgentRuntime {
             .save_conversation(session_id, conversation)
             .await;
 
-        run_result.map(|output| TurnExecutionResult {
-            task_id: task.id,
-            output,
-        })
+        match run_result {
+            Ok(output) => Ok(TurnExecutionResult {
+                task_id: task.id,
+                output,
+            }),
+            Err(err) => {
+                self.send_report(SubAgentReport::Failed {
+                    task_id: task.id,
+                    error: err.to_string(),
+                    partial_result: None,
+                })
+                .await;
+                task.state = TaskState::Failed {
+                    error: AgentErrorLike::new("execution_failed", err.to_string()),
+                };
+                Err(err)
+            }
+        }
     }
 
     async fn execute_tool_call(&self, ctx: &AgentContext, call: &ToolCall) -> ToolResult {
@@ -450,166 +518,6 @@ impl AgentRuntime {
             tracing::error!("failed to send agent report: {e}");
         }
     }
-
-    async fn try_recover_invalid_tool_call(
-        &self,
-        err: &NeuromancerError,
-        conversation: &mut ConversationContext,
-        task_id: uuid::Uuid,
-        available_tool_names: &[String],
-        recovery_attempts: &mut u32,
-    ) -> Result<bool, NeuromancerError> {
-        let NeuromancerError::Llm(LlmError::InvalidResponse { reason }) = err else {
-            return Ok(false);
-        };
-        if !is_invalid_tool_call_reason(reason) {
-            return Ok(false);
-        }
-
-        let attempted_tool_id =
-            extract_attempted_tool_name(reason).unwrap_or_else(|| "__invalid_tool__".to_string());
-        let available_tools_display = if available_tool_names.is_empty() {
-            "none".to_string()
-        } else {
-            available_tool_names.join(", ")
-        };
-
-        tracing::warn!(
-            task_id = %task_id,
-            agent_id = %self.config.id,
-            attempted_tool_id = %attempted_tool_id,
-            available_tools = %available_tools_display,
-            retry_attempt = *recovery_attempts + 1,
-            retry_limit = self.tool_call_retry_limit,
-            "llm_bad_tool_call_detected"
-        );
-
-        if *recovery_attempts >= self.tool_call_retry_limit {
-            tracing::error!(
-                task_id = %task_id,
-                agent_id = %self.config.id,
-                attempted_tool_id = %attempted_tool_id,
-                retries = *recovery_attempts,
-                retry_limit = self.tool_call_retry_limit,
-                "llm_bad_tool_call_retry_exhausted"
-            );
-            return Err(NeuromancerError::Llm(LlmError::InvalidResponse {
-                reason: format!(
-                    "invalid tool-call recovery exhausted after {} retries: {reason}",
-                    self.tool_call_retry_limit
-                ),
-            }));
-        }
-
-        *recovery_attempts += 1;
-        let call_id = format!("invalid-tool-recovery-{}", *recovery_attempts);
-        let recovery_error = format!(
-            "Tool '{attempted_tool_id}' is unavailable or invalid. Available tools: {available_tools_display}. Original error: {reason}"
-        );
-
-        conversation.add_message(ChatMessage::assistant_tool_calls(vec![ToolCall {
-            id: call_id.clone(),
-            tool_id: attempted_tool_id.clone(),
-            arguments: serde_json::json!({}),
-        }]));
-        conversation.add_message(ChatMessage::tool_result(ToolResult {
-            call_id,
-            output: ToolOutput::Error(recovery_error.clone()),
-        }));
-
-        self.send_report(SubAgentReport::ToolFailure {
-            task_id,
-            tool_id: attempted_tool_id.clone(),
-            error: recovery_error,
-            retry_eligible: *recovery_attempts < self.tool_call_retry_limit,
-            attempted_count: *recovery_attempts,
-        })
-        .await;
-
-        tracing::info!(
-            task_id = %task_id,
-            agent_id = %self.config.id,
-            attempted_tool_id = %attempted_tool_id,
-            recovery_attempt = *recovery_attempts,
-            retry_limit = self.tool_call_retry_limit,
-            "llm_bad_tool_call_recovered"
-        );
-
-        Ok(true)
-    }
-}
-
-fn available_tool_names(specs: &[ToolSpec]) -> Vec<String> {
-    let mut names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn is_invalid_tool_call_reason(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    lower.contains("tool call validation failed")
-        || lower.contains("attempted to call tool")
-        || lower.contains("request.tools")
-        || lower.contains("tool_use_failed")
-}
-
-fn extract_attempted_tool_name(reason: &str) -> Option<String> {
-    for marker in [
-        "attempted to call tool '",
-        "attempted to call tool \"",
-        "\"name\":\"",
-        "\"name\": \"",
-        "'name':'",
-        "'name': '",
-    ] {
-        if let Some(tool_name) = extract_tool_name_after_marker(reason, marker) {
-            return Some(tool_name);
-        }
-    }
-    None
-}
-
-fn extract_tool_name_after_marker(reason: &str, marker: &str) -> Option<String> {
-    let start = reason.find(marker)?;
-    let tail = &reason[start + marker.len()..];
-    let mut tool_name = String::new();
-    for ch in tail.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
-            tool_name.push(ch);
-        } else {
-            break;
-        }
-    }
-    if tool_name.is_empty() {
-        None
-    } else {
-        Some(tool_name)
-    }
-}
-
-/// Convert neuromancer ToolSpecs to rig ToolDefinitions.
-fn specs_to_rig_definitions(specs: &[ToolSpec]) -> Vec<rig::completion::ToolDefinition> {
-    specs
-        .iter()
-        .map(|s| rig::completion::ToolDefinition {
-            name: s.name.clone(),
-            description: s.description.clone(),
-            parameters: s.parameters_schema.clone(),
-        })
-        .collect()
-}
-
-/// Truncate text to at most `max_len` characters for summaries.
-// NOTE: [low pri] ideally this would use another utility LLM
-fn truncate_summary(text: &str, max_len: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_len {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(max_len).collect();
-        format!("{truncated}...")
-    }
 }
 
 #[cfg(test)]
@@ -619,7 +527,9 @@ mod tests {
     use neuromancer_core::agent::{
         AgentCapabilities, AgentHealthConfig, AgentMode, AgentModelConfig,
     };
+    use neuromancer_core::error::LlmError;
     use neuromancer_core::task::Task;
+    use neuromancer_core::tool::ToolSpec;
     use neuromancer_core::trigger::TriggerSource;
 
     struct MockToolBroker;
@@ -808,10 +718,10 @@ mod tests {
 
     #[test]
     fn truncate_summary_handles_multibyte_unicode_safely() {
-        let input = "I’m testing — unicode boundaries";
+        let input = "I\u{2019}m testing \u{2014} unicode boundaries";
         let output = truncate_summary(input, 10);
         assert!(output.ends_with("..."));
-        assert!(output.starts_with("I’m testi"));
+        assert!(output.starts_with("I\u{2019}m testi"));
     }
 
     #[tokio::test]

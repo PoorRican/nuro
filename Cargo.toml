@@ -67,6 +67,13 @@ rmcp = { version = "0.1", features = ["client", "transport-sse", "transport-chil
 # Secrets
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1", features = ["derive"] }
+aes-gcm = "0.10"
+keyring = { version = "3", features = ["apple-native"] }
+aho-corasick = "1"
+arc-swap = "1"
+rand = "0.8"
+base64 = "0.22"
+urlencoding = "2"
 
 # Discord
 twilight-gateway = "0.16"

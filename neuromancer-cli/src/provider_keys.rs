@@ -55,6 +55,7 @@ pub fn provider_env_var(provider: &str) -> Option<String> {
         "openai" => "OPENAI_API_KEY".to_string(),
         "anthropic" => "ANTHROPIC_API_KEY".to_string(),
         "groq" => "GROQ_API_KEY".to_string(),
+        "fireworks" => "FIREWORKS_API_KEY".to_string(),
         "gemini" | "google" => "GEMINI_API_KEY".to_string(),
         "xai" => "XAI_API_KEY".to_string(),
         "mistral" => "MISTRAL_API_KEY".to_string(),
@@ -145,6 +146,14 @@ mod tests {
         assert_eq!(
             provider_env_var("anthropic").as_deref(),
             Some("ANTHROPIC_API_KEY")
+        );
+    }
+
+    #[test]
+    fn provider_env_var_maps_fireworks() {
+        assert_eq!(
+            provider_env_var("fireworks").as_deref(),
+            Some("FIREWORKS_API_KEY")
         );
     }
 

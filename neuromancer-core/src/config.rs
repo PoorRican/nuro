@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{
     AgentCapabilities, AgentConfig, AgentHealthConfig, AgentMode, AgentModelConfig,
 };
+use crate::secrets::{SecretInjectionMode, SecretKind, TotpAlgorithm, TotpParams, TotpPolicy};
 
 /// Top-level Neuromancer configuration loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +52,8 @@ pub struct SecretsConfig {
     pub backend: String,
     pub keyring_service: Option<String>,
     pub require_acl: bool,
+    #[serde(default)]
+    pub entries: HashMap<String, SecretEntryConfig>,
 }
 
 impl Default for SecretsConfig {
@@ -59,6 +62,60 @@ impl Default for SecretsConfig {
             backend: "local_encrypted".into(),
             keyring_service: None,
             require_acl: true,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Per-secret entry configuration from TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretEntryConfig {
+    #[serde(default)]
+    pub kind: SecretKind,
+    /// If set to "pass://vault/item/field", resolved via Proton Pass CLI.
+    /// If absent, value is stored locally in encrypted SQLite.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub allowed_agents: Vec<String>,
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    #[serde(default, alias = "injection_modes")]
+    pub allowed_injection_modes: Vec<SecretInjectionMode>,
+    #[serde(default)]
+    pub totp_policy: Option<TotpPolicy>,
+    #[serde(default)]
+    pub totp_digits: Option<u32>,
+    #[serde(default)]
+    pub totp_period: Option<u64>,
+    #[serde(default)]
+    pub totp_algorithm: Option<TotpAlgorithm>,
+    /// Optional TTL for auto-expiry (e.g. "24h", "7d"), parsed via humantime.
+    #[serde(default)]
+    pub ttl: Option<String>,
+    /// Reserved for future rotation tracking.
+    #[serde(default)]
+    pub rotation_metadata: Option<serde_json::Value>,
+}
+
+impl SecretEntryConfig {
+    /// Returns true if any TOTP-specific key is set on this entry.
+    pub fn has_totp_fields(&self) -> bool {
+        self.totp_policy.is_some()
+            || self.totp_digits.is_some()
+            || self.totp_period.is_some()
+            || self.totp_algorithm.is_some()
+    }
+
+    /// SDS defaulting for TOTP params (stub only, runtime integration deferred).
+    pub fn effective_totp_params(&self) -> TotpParams {
+        TotpParams {
+            digits: self.totp_digits.unwrap_or(6),
+            period: self.totp_period.unwrap_or(30),
+            algorithm: self.totp_algorithm.clone().unwrap_or(TotpAlgorithm::Sha1),
         }
     }
 }
@@ -82,6 +139,8 @@ impl Default for MemoryConfig {
 pub struct ModelSlotConfig {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default = "default_tool_call_retry_limit")]
     pub tool_call_retry_limit: u32,
 }
@@ -556,6 +615,58 @@ capabilities.filesystem_roots = []
     }
 
     #[test]
+    fn model_slot_base_url_defaults_to_none() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "groq"
+model = "test-model"
+
+[orchestrator]
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .base_url
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_slot_base_url_parses_explicit_value() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[models.executor]
+provider = "openai"
+model = "gpt-4"
+base_url = "https://my-proxy.example.com/v1"
+
+[orchestrator]
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        assert_eq!(
+            cfg.models
+                .get("executor")
+                .expect("executor model should be present")
+                .base_url
+                .as_deref(),
+            Some("https://my-proxy.example.com/v1")
+        );
+    }
+
+    #[test]
     fn self_improvement_defaults_are_applied() {
         let cfg = OrchestratorConfig::default();
         assert!(!cfg.self_improvement.enabled);
@@ -641,5 +752,101 @@ capabilities.filesystem_roots = []
                 .max_policy_denial_increase_pct,
             2.5
         );
+    }
+
+    #[test]
+    fn secrets_totp_seed_fields_parse() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[secrets]
+backend = "local_encrypted"
+require_acl = true
+
+[secrets.entries.github_totp]
+kind = "totp_seed"
+allowed_agents = ["browser"]
+totp_policy = "autonomous"
+totp_digits = 6
+totp_period = 30
+totp_algorithm = "sha1"
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        let entry = cfg
+            .secrets
+            .entries
+            .get("github_totp")
+            .expect("entry should exist");
+        assert_eq!(entry.kind, SecretKind::TotpSeed);
+        assert_eq!(entry.totp_policy, Some(TotpPolicy::Autonomous));
+        assert_eq!(entry.totp_digits, Some(6));
+        assert_eq!(entry.totp_period, Some(30));
+        assert_eq!(entry.totp_algorithm, Some(TotpAlgorithm::Sha1));
+        assert!(entry.has_totp_fields());
+    }
+
+    #[test]
+    fn secrets_entry_unknown_field_is_rejected() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[secrets]
+backend = "local_encrypted"
+require_acl = true
+
+[secrets.entries.bad]
+kind = "credential"
+allowed_agents = ["planner"]
+mystery = "nope"
+"#;
+
+        let err = toml::from_str::<NeuromancerConfig>(toml).expect_err("config should fail");
+        assert!(err.to_string().contains("unknown field `mystery`"));
+    }
+
+    #[test]
+    fn secrets_entry_allows_legacy_and_sds_injection_mode_keys() {
+        let toml = r#"
+[global]
+instance_id = "t"
+workspace_dir = "/tmp"
+data_dir = "/tmp"
+
+[secrets]
+backend = "local_encrypted"
+require_acl = true
+
+[secrets.entries.legacy]
+kind = "credential"
+allowed_agents = ["planner"]
+injection_modes = ["handle_replacement"]
+
+[secrets.entries.sds]
+kind = "credential"
+allowed_agents = ["planner"]
+allowed_injection_modes = ["handle_replacement"]
+"#;
+
+        let cfg: NeuromancerConfig = toml::from_str(toml).expect("config should parse");
+        let legacy = cfg.secrets.entries.get("legacy").expect("legacy entry");
+        assert_eq!(legacy.allowed_injection_modes.len(), 1);
+        assert!(matches!(
+            legacy.allowed_injection_modes[0],
+            SecretInjectionMode::HandleReplacement
+        ));
+
+        let sds = cfg.secrets.entries.get("sds").expect("sds entry");
+        assert_eq!(sds.allowed_injection_modes.len(), 1);
+        assert!(matches!(
+            sds.allowed_injection_modes[0],
+            SecretInjectionMode::HandleReplacement
+        ));
     }
 }

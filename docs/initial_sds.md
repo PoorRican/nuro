@@ -11,33 +11,27 @@
 * **A2A** for agent-to-agent delegation and isolation boundaries
 * **OpenTelemetry** for end-to-end observability
 
-No new "plugin protocol" is introduced: external extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the "instruction + packaging" layer.
+Extensibility is primarily via **MCP servers** and **A2A peers**, with **skills** as the "instruction + packaging" layer.
 
 **Key architectural invariants:**
-* Public ingress is `orchestrator.turn`.
-* System0 is a rig-backed orchestrator agent that mediates turns, delegates work, and maintains single-session history through `neuromancer-agent`.
+* Public ingress is `orchestrator.turn` and the chat UI.
+* System0 is a rig-backed **dynamic router** agent (LLM-powered, tool-first) that mediates turns, delegates work, and maintains single-session history through `neuromancer-agent`.
+* All user inputs (CLI and external channels such as Discord/iMessage) are normalized into System0 turn processing.
+* Only the CLI path currently emits `TriggerType::Admin`; other ingress paths are non-admin by default.
 * Mutation privilege boundary is `TriggerType::Admin` only; proposal analysis/read flows are allowed for non-admin triggers, but authorization/apply mutation flows are denied unless the active turn is admin.
-
-**v0.1-alpha directives (authoritative):**
-* No backward compatibility for removed RPC/CLI task/message surfaces.
-* Prompt configuration is file-path based (`system_prompt_path`).
-* Prompt files must exist and be non-empty markdown files at startup.
-* Setup is explicit via `neuroctl install` (optional `--config <path>` override; no startup auto-bootstrap).
-* `neuroctl install` prompts for provider API keys (one per configured provider) when interactive, writing temporary plaintext files under `XDG_RUNTIME_HOME` for v0.1-alpha.
-* OS-specific keychain integration MUST replace temporary plaintext runtime key files.
 
 ---
 
 ## 1. Motivation and problem statement
 
-Neuromancer is explicitly designed around failures repeatedly seen in the wild:
+Neuromancer is explicitly designed around failures from OpenClaw and other similar frameworks repeatedly seen in the wild:
 
 * **Secrets leaking into model context and logs**: there are reports of resolved provider API keys being serialized into the LLM prompt context on every turn in OpenClaw gateway setups—meaning keys can leak cross-provider and persist in provider logs. ([GitHub][1])
 * **"Leaky skills" as a systemic pattern**: security research found a non-trivial fraction of marketplace skills that *instruct the agent* to mishandle secrets/PII, forcing API keys/passwords/credit-card data into the LLM context window or plaintext logs—i.e., not "a bug," but a predictable outcome of the architecture. ([Snyk][2])
 * **Long-running instability and process leakage**: reports of orphaned child processes accumulating over 24–48 hours, memory pressure peaking in the tens of GB, and degraded Discord processing latency. ([GitHub][3])
 * **Supply chain reality**: credible practitioners converge on the same missing ingredients—provenance, mediated execution, and **specific + revocable permissions** tied to identity. ([1Password][4])
 
-**Neuromancer v0.5** is therefore defined by: **least privilege**, **isolation**, **brokered secrets**, and **observable operations**, while staying compatible with the ecosystems forming around MCP, A2A, and skills.
+**Neuromancer** is therefore defined by: **least privilege**, **isolation**, **brokered secrets**, and **observable operations**, while staying compatible with the ecosystems forming around MCP, A2A, and skills.
 
 ---
 
@@ -49,7 +43,7 @@ Neuromancer is explicitly designed around failures repeatedly seen in the wild:
    A resilient, long-running service with explicit lifecycle management and resource controls (no "CLI app that you keep alive with prayers").
 
 2. **System0 orchestration, LLM-powered agents**
-   The orchestrator is a first-class LLM runtime (System0) that mediates user/admin turns, policy, and delegation. It handles `orchestrator.turn` ingress directly, maintains one ongoing conversation context, and delegates complex execution to sub-agents via controlled tooling.
+   The orchestrator is a first-class LLM runtime (System0) that acts as a dynamic router for user/admin turns, policy, and delegation. It handles `orchestrator.turn` ingress directly, maintains one ongoing conversation context, and delegates complex execution to sub-agents via controlled tooling. System0 may run a smaller model optimized for reliable tool-calling.
 
 3. **No new plugin protocol**
 
@@ -72,11 +66,11 @@ Neuromancer is explicitly designed around failures repeatedly seen in the wild:
 6. **Admin API for runtime introspection**
    Localhost admin surface with JSON-RPC methods for orchestrator turns, thread/event/run diagnostics, and configuration reload.
 
-### 2.2 Non-goals (v0.1-alpha)
+### 2.2 Non-goals
 
 * A public skill marketplace / package manager (v0.5 supports local skill packs; supply-chain hardening is *foundation work*).
 * Full multi-tenant enterprise RBAC UI.
-* A polished web UI (v0.5 exposes a local admin API; a GUI is not required).
+* A polished web UI; a TUI will be provided for advanced administration, experimentation, and observability.
 
 ---
 
@@ -89,7 +83,7 @@ Neuromancer is split into **control plane** and **data plane**. The control plan
 The daemon process hosts **System0**, which mediates user/admin turns and delegates execution to sub-agents. The orchestrator:
 
 * Loads **central TOML config**
-* Runs **Trigger Manager** (Discord + cron)
+* Runs **Trigger Manager** (eg: time-based triggers, external messaging services, etc)
 * Maintains **Secrets Broker**, **Memory Store**, **MCP Client Pool**, **A2A Registry**
 * Accepts public ingress from `orchestrator.turn` and processes one queued turn at a time
 * Supervises sub-agent runtimes (in-process, subprocess, or container)
@@ -97,7 +91,9 @@ The daemon process hosts **System0**, which mediates user/admin turns and delega
 * Facilitates cross-agent communication and remediation
 * Provides an **Admin API** on localhost
 
-System0 itself is an LLM agent and can reason/plan, but outbound actions are constrained by an allowlisted tool broker and trigger/capability policy.
+System0 is a dynamic router and control-plane LLM agent. It facilitates user↔sub-agent communication, self-improvement/self-modification workflows, and administrative actions via plaintext tool calls. Outbound actions are constrained by an allowlisted tool broker and trigger/capability policy.
+
+Sub-agent intercommunication is defined by central configuration. System0 can initiate one-time exceptions or permanent configuration changes through the proposal/authorization/apply lifecycle (admin-gated).
 
 ```rust
 struct Orchestrator {
@@ -125,7 +121,7 @@ impl Orchestrator {
 }
 ```
 
-### 3.2 Data plane: sub-agent runtimes (rig Agents do ALL reasoning)
+### 3.2 Data plane: sub-agent runtimes (isolated domain execution)
 
 Each sub-agent runtime wraps a **rig Agent** configured with a strict **capability set**:
 
@@ -137,7 +133,7 @@ Each sub-agent runtime wraps a **rig Agent** configured with a strict **capabili
 * Allowed filesystem roots
 * Allowed outbound network policy
 
-Sub-agents are the **only** components that call LLMs. They are constructed using rig's `AgentBuilder`, given tools via rig's tool trait and `.mcp_tool()`, and execute via `agent.chat()`.
+Both System0 and sub-agents can call LLMs. System0 handles dynamic routing and control-plane mediation; sub-agents perform specialized domain execution. Sub-agents may ingest external data (e.g., search indexes, RSS feeds, web results), but remain self-contained and isolated according to configured boundaries.
 
 ### 3.3 Architecture diagram
 
@@ -167,8 +163,6 @@ Discord / Cron -------->|     neuromancerd (control)     |<-------- Admin API
                   v                   v                    v
            [MCP servers...]   [Playwright MCP]    [FS MCP / built-in]
 ```
-
-**Key difference from v0.5-r1:** There is no deterministic global routing layer in v0.1-alpha. System0 handles turns directly as the orchestrator.
 
 ### 3.4 Orchestrator module structure
 
@@ -334,6 +328,8 @@ loop {
 Public ingress is message-turn based:
 * `orchestrator.turn` enqueues one input message.
 * Runtime executes one System0 turn against the single session.
+* External channel inputs and CLI inputs are both routed through System0.
+* Only CLI-originated turns currently carry `TriggerType::Admin`.
 * Delegated runs are tracked internally and exposed via:
   * `orchestrator.runs.list`
   * `orchestrator.runs.get`

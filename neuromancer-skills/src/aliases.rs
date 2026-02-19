@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-pub(crate) fn build_skill_tool_aliases(
+pub fn build_skill_tool_aliases(
     allowed_skills: &[String],
 ) -> (HashMap<String, String>, HashMap<String, Vec<String>>) {
     let canonical_skills: HashSet<&str> = allowed_skills.iter().map(String::as_str).collect();

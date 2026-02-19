@@ -7,16 +7,78 @@ use crate::tool::AgentContext;
 
 pub type SecretRef = String;
 
+/// Classification of secret content.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretKind {
+    /// API keys, bearer tokens, passwords.
+    #[default]
+    Credential,
+    /// TOTP seed metadata is parsed from config; runtime generation is not integrated yet.
+    TotpSeed,
+    /// Browser session cookies/tokens. Supports agent write-back and TTL expiry.
+    BrowserSession,
+    /// TLS certificates, SSH keys. Injected via file mount.
+    CertificateOrKey,
+}
+
+/// TOTP secret policy from config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotpPolicy {
+    Autonomous,
+    Escalate,
+}
+
+/// TOTP algorithm from config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotpAlgorithm {
+    #[default]
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+/// Parsed TOTP parameters (stub for future runtime integration).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpParams {
+    pub digits: u32,
+    pub period: u64,
+    pub algorithm: TotpAlgorithm,
+}
+
+impl Default for TotpParams {
+    fn default() -> Self {
+        Self {
+            digits: 6,
+            period: 30,
+            algorithm: TotpAlgorithm::Sha1,
+        }
+    }
+}
+
 /// How a resolved secret should be injected into a tool execution context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretInjectionMode {
-    /// Set as an environment variable.
+    /// Primary mode. `{{SECRET_ID}}` tokens in tool call arguments are replaced
+    /// with the plaintext value at execution time via `argument_tokens::expand_tokens`.
+    HandleReplacement,
+
+    /// Set as an environment variable for an MCP child process.
+    /// Discouraged — prefer HandleReplacement.
     EnvVar { name: String },
+
     /// Set as an HTTP header.
     Header { name: String },
-    /// Mount as a file.
+
+    /// Mount as a file (e.g. TLS certs, SSH keys).
     FileMount { path: String },
+
+    /// Browser cookie jar — value is JSON-serialized cookies.
+    /// Injected as a temp file passed to the browser MCP server.
+    CookieJar { domain: String },
 }
 
 /// What the secret is being used for (audit trail).
@@ -38,10 +100,12 @@ pub struct ResolvedSecret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretAcl {
     pub secret_id: String,
+    pub kind: SecretKind,
     pub allowed_agents: Vec<AgentId>,
     pub allowed_skills: Vec<String>,
     pub allowed_mcp_servers: Vec<String>,
     pub injection_modes: Vec<SecretInjectionMode>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Handle-based secret resolution. Secrets never enter LLM context.
@@ -63,4 +127,15 @@ pub trait SecretsBroker: Send + Sync {
 
     /// Revoke/delete a secret.
     async fn revoke(&self, id: &str) -> Result<(), NeuromancerError>;
+
+    /// Store a session value from an agent (ACL-checked).
+    /// Only allowed for BrowserSession-kind entries where the agent
+    /// is in the entry's allowed_agents list.
+    async fn store_session(
+        &self,
+        ctx: &AgentContext,
+        id: &str,
+        value: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), NeuromancerError>;
 }

@@ -66,6 +66,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                base_url: None,
                 tool_call_retry_limit: 1,
             },
         );
@@ -74,6 +75,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                base_url: None,
                 tool_call_retry_limit: 1,
             },
         );
@@ -82,6 +84,7 @@ mod tests {
             ModelSlotConfig {
                 provider: "anthropic".into(),
                 model: "claude-sonnet".into(),
+                base_url: None,
                 tool_call_retry_limit: 1,
             },
         );

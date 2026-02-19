@@ -1,29 +1,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::SkillError;
 
-pub(crate) struct ParsedCsv {
-    pub(crate) headers: Vec<String>,
-    pub(crate) rows: Vec<HashMap<String, String>>,
-    pub(crate) row_count: usize,
-    pub(crate) total_balance: f64,
+pub struct ParsedCsv {
+    pub headers: Vec<String>,
+    pub rows: Vec<HashMap<String, String>>,
+    pub row_count: usize,
+    pub total_balance: f64,
 }
 
-pub(crate) fn parse_csv_content(
-    path: &Path,
-    content: &str,
-) -> Result<ParsedCsv, OrchestratorRuntimeError> {
+// TODO: this should be removed. This should be handled by script execution.
+pub fn parse_csv_content(path: &Path, content: &str) -> Result<ParsedCsv, SkillError> {
     let mut lines = content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty());
 
     let Some(header_line) = lines.next() else {
-        return Err(OrchestratorRuntimeError::ResourceNotFound(format!(
-            "csv file is empty: {}",
-            path.display()
-        )));
+        return Err(SkillError::CsvEmpty(path.display().to_string()));
     };
 
     let headers: Vec<String> = header_line
@@ -32,8 +27,8 @@ pub(crate) fn parse_csv_content(
         .collect();
 
     if headers.is_empty() {
-        return Err(OrchestratorRuntimeError::Config(format!(
-            "csv file has no headers: {}",
+        return Err(SkillError::CsvEmpty(format!(
+            "no headers in {}",
             path.display()
         )));
     }
@@ -47,12 +42,11 @@ pub(crate) fn parse_csv_content(
             .collect();
 
         if values.len() != headers.len() {
-            return Err(OrchestratorRuntimeError::Config(format!(
-                "csv row has {} columns but expected {} in {}",
-                values.len(),
-                headers.len(),
-                path.display()
-            )));
+            return Err(SkillError::CsvColumnMismatch {
+                expected: headers.len(),
+                actual: values.len(),
+                path: path.display().to_string(),
+            });
         }
 
         let mut row = HashMap::new();

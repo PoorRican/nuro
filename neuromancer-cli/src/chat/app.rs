@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use neuromancer_core::rpc::ThreadSummary;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 
 use crate::CliError;
 use crate::rpc_client::RpcClient;
@@ -16,6 +17,14 @@ use super::composer::{ComposerState, DEFAULT_MAX_VISIBLE_LINES};
 use super::events::{fetch_all_thread_events, timeline_items_from_events};
 use super::timeline::{MessageRoleTag, TimelineItem, short_thread_id, status_style};
 use super::{PendingOutcome, SYSTEM_THREAD_ID};
+
+const ESC_NAVIGATION_WINDOW: Duration = Duration::from_millis(850);
+const AUTO_COLLAPSE_SIDEBAR_WIDTH: u16 = 92;
+const MIN_RIGHT_COLUMN_WIDTH: u16 = 58;
+const PANE_GUTTER_WIDTH: u16 = 1;
+const INPUT_FOCUS_COLOR: Color = Color::Rgb(120, 210, 176);
+const INPUT_BACKGROUND: Color = Color::Rgb(58, 58, 68);
+const SIDEBAR_BACKGROUND: Color = Color::Rgb(40, 44, 58);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
@@ -40,6 +49,12 @@ impl FocusPane {
             Self::Input => Self::Main,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Compose,
+    Navigate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,16 +92,17 @@ impl MainFilter {
 }
 
 #[derive(Debug, Clone)]
-struct ThreadView {
-    id: String,
-    title: String,
-    kind: ThreadKind,
-    agent_id: Option<String>,
-    state: String,
-    active: bool,
-    resurrected: bool,
-    read_only: bool,
-    items: Vec<TimelineItem>,
+pub(super) struct ThreadView {
+    pub(super) id: String,
+    pub(super) title: String,
+    pub(super) kind: ThreadKind,
+    pub(super) agent_id: Option<String>,
+    pub(super) state: String,
+    pub(super) active: bool,
+    pub(super) resurrected: bool,
+    pub(super) read_only: bool,
+    pub(super) items: Vec<TimelineItem>,
+    pub(super) render_revision: u64,
 }
 
 impl ThreadView {
@@ -101,6 +117,7 @@ impl ThreadView {
             resurrected: false,
             read_only: false,
             items: vec![],
+            render_revision: 0,
         }
     }
 
@@ -133,6 +150,7 @@ impl ThreadView {
             resurrected: summary.resurrected,
             read_only,
             items: vec![],
+            render_revision: 0,
         }
     }
 
@@ -165,6 +183,24 @@ impl ThreadView {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadRenderCacheKey {
+    thread_id: String,
+    revision: u64,
+    selected: usize,
+    selected_fill_width: usize,
+    filter: MainFilter,
+    timeline_focused: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadRenderCache {
+    key: ThreadRenderCacheKey,
+    lines: Vec<Line<'static>>,
+    ranges: Vec<(usize, usize)>,
+    selected_visible_idx: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ChatApp {
     threads: Vec<ThreadView>,
@@ -179,8 +215,13 @@ pub(super) struct ChatApp {
     pub(super) status: Option<String>,
     last_input_cursor_rel: Option<(u16, u16)>,
     last_main_viewport_rows: usize,
+    sidebar_collapsed: bool,
+    sidebar_auto_collapsed: bool,
+    mode: InteractionMode,
+    esc_armed_at: Option<Instant>,
     pending_thread_id: Option<String>,
     pending_placeholder_index_by_thread: HashMap<String, usize>,
+    thread_render_cache: Option<ThreadRenderCache>,
 }
 
 impl ChatApp {
@@ -198,8 +239,13 @@ impl ChatApp {
             status: Some("System0 thread ready".to_string()),
             last_input_cursor_rel: None,
             last_main_viewport_rows: 1,
+            sidebar_collapsed: false,
+            sidebar_auto_collapsed: false,
+            mode: InteractionMode::Compose,
+            esc_armed_at: None,
             pending_thread_id: None,
             pending_placeholder_index_by_thread: HashMap::new(),
+            thread_render_cache: None,
         }
     }
 
@@ -215,6 +261,19 @@ impl ChatApp {
             self.status = Some("Loaded existing System0 context".to_string());
         }
         Ok(())
+    }
+
+    pub(super) fn bootstrap_demo(&mut self) {
+        let (threads, active) = super::demo::build_demo_threads();
+        self.threads = threads;
+        self.active_thread = active;
+        self.sidebar_selected = active;
+        let thread_id = self.threads[active].id.clone();
+        self.selected_item_by_thread.insert(
+            thread_id,
+            self.threads[active].items.len().saturating_sub(1),
+        );
+        self.status = Some("DEMO MODE".to_string());
     }
 
     pub(super) async fn handle_pending_outcome(
@@ -356,6 +415,7 @@ impl ChatApp {
                     MessageRoleTag::System,
                     "Saved sub-agent thread. Press Enter to resurrect and continue.",
                 ));
+                thread.render_revision = thread.render_revision.wrapping_add(1);
             }
             threads.push(thread);
         }
@@ -420,6 +480,7 @@ impl ChatApp {
             .find(|thread| thread.id == thread_id)
         {
             thread.items = items;
+            thread.render_revision = thread.render_revision.wrapping_add(1);
             let selected = self
                 .selected_item_by_thread
                 .get(thread_id)
@@ -457,6 +518,7 @@ impl ChatApp {
                     MessageRoleTag::System,
                     format!("SYSTEM ERROR: {message}"),
                 ));
+                thread.render_revision = thread.render_revision.wrapping_add(1);
                 let selected = thread.items.len().saturating_sub(1);
                 self.selected_item_by_thread
                     .insert(thread_id.clone(), selected);
@@ -467,6 +529,14 @@ impl ChatApp {
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.sidebar_auto_collapsed = area.width < AUTO_COLLAPSE_SIDEBAR_WIDTH;
+        if self.focus == FocusPane::Sidebar && !self.sidebar_visible() {
+            self.focus = FocusPane::Main;
+        }
+
         self.composer.max_visible_lines = if area.height < 22 {
             4
         } else if area.height < 34 {
@@ -476,68 +546,101 @@ impl ChatApp {
         };
         self.composer.ensure_cursor_visible();
 
-        let max_input_height = area.height.saturating_sub(6).max(3);
+        let max_input_height = area.height.saturating_sub(9).max(3);
         let input_box_height = (self.composer.input_height() as u16)
             .saturating_add(2)
             .clamp(3, max_input_height);
-        let chunks = Layout::default()
+
+        let right_column = if self.sidebar_visible() {
+            let max_sidebar = area.width.saturating_sub(MIN_RIGHT_COLUMN_WIDTH);
+            let sidebar_width = (((area.width as f32) * 0.28) as u16)
+                .clamp(20, 38)
+                .min(max_sidebar);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(sidebar_width),
+                    Constraint::Min(MIN_RIGHT_COLUMN_WIDTH),
+                ])
+                .split(area);
+            self.render_sidebar(frame, columns[0]);
+            columns[1]
+        } else {
+            area
+        };
+
+        let right_content = if right_column.width > 2 {
+            right_column.inner(Margin {
+                horizontal: 1,
+                vertical: 0,
+            })
+        } else {
+            right_column
+        };
+
+        let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
+                Constraint::Length(1),
                 Constraint::Length(input_box_height),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ])
-            .split(area);
+            .split(right_content);
 
-        let body = if chunks[0].width < 84 {
-            let sidebar_height = (chunks[0].height / 3).clamp(5, 10);
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(sidebar_height), Constraint::Min(6)])
-                .split(chunks[0])
-        } else {
-            let max_sidebar = chunks[0].width.saturating_sub(20).max(18);
-            let sidebar_width = (((chunks[0].width as f32) * 0.30) as u16)
-                .clamp(18, 38)
-                .min(max_sidebar);
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(sidebar_width), Constraint::Min(20)])
-                .split(chunks[0])
-        };
-
-        self.render_sidebar(frame, body[0]);
-        self.render_thread(frame, body[1]);
-        self.render_input(frame, chunks[1]);
-        self.render_status(frame, chunks[2]);
+        self.render_thread(frame, right_chunks[0]);
+        frame.render_widget(Paragraph::new(" "), right_chunks[1]);
+        self.render_input(frame, right_chunks[2]);
+        frame.render_widget(Paragraph::new(" "), right_chunks[3]);
+        self.render_status(frame, right_chunks[4]);
     }
 
     fn render_sidebar(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = if self.focus == FocusPane::Sidebar {
-            Block::default()
-                .title("Threads")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let focused = self.focus == FocusPane::Sidebar;
+        let primary_text = if focused { Color::White } else { Color::Gray };
+        let secondary_text = if focused {
+            Color::DarkGray
         } else {
-            Block::default().title("Threads").borders(Borders::ALL)
+            Color::Gray
         };
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new("threads").style(
+                Style::default()
+                    .fg(secondary_text)
+                    .bg(SIDEBAR_BACKGROUND)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            split[0],
+        );
         let items: Vec<ListItem<'static>> = self
             .threads
             .iter()
             .map(|thread| {
                 if thread.kind == ThreadKind::System {
-                    ListItem::new(Line::from(vec![
-                        Span::styled("System0", Style::default().fg(Color::Cyan)),
-                        Span::styled(" [active]", Style::default().fg(Color::DarkGray)),
-                    ]))
+                    ListItem::new(Line::from(vec![Span::styled(
+                        "system0",
+                        Style::default().fg(primary_text),
+                    )]))
                 } else {
-                    let mode_label = if thread.read_only { " saved" } else { " live" };
                     ListItem::new(Line::from(vec![
-                        Span::raw(thread.title.clone()),
-                        Span::raw(" ["),
-                        Span::styled(thread.state.clone(), status_style(&thread.state)),
-                        Span::raw("]"),
-                        Span::styled(mode_label, Style::default().fg(Color::DarkGray)),
+                        Span::styled(thread.title.clone(), Style::default().fg(primary_text)),
+                        Span::raw(" "),
+                        Span::styled(
+                            thread.state.clone(),
+                            if focused {
+                                status_style(&thread.state)
+                            } else {
+                                Style::default().fg(Color::Gray)
+                            },
+                        ),
                     ]))
                 }
             })
@@ -551,117 +654,156 @@ impl ChatApp {
 
         let mut highlight = Style::default()
             .fg(Color::White)
-            .bg(Color::DarkGray)
+            .bg(Color::Rgb(54, 58, 76))
             .add_modifier(Modifier::BOLD);
-        if self.focus != FocusPane::Sidebar {
+        if !focused {
             highlight = highlight.remove_modifier(Modifier::BOLD);
         }
 
         let list = List::new(items)
-            .block(block)
-            .highlight_symbol("▶ ")
-            .highlight_style(highlight);
+            .style(Style::default().bg(SIDEBAR_BACKGROUND))
+            .highlight_symbol("» ")
+            .highlight_style(highlight)
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
 
-        frame.render_stateful_widget(list, area, &mut state);
+        frame.render_stateful_widget(list, split[1], &mut state);
     }
 
     fn render_thread(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let thread = self.current_thread().clone();
-        let title = if thread.read_only {
-            format!("Conversation: {} (read-only)", thread.title)
-        } else {
-            format!("Conversation: {}", thread.title)
-        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
 
-        let block = if self.focus == FocusPane::Main {
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue))
-        } else {
-            Block::default().title(title).borders(Borders::ALL)
+        let (thread_id, thread_revision, item_count) = {
+            let thread = self.current_thread();
+            (
+                thread.id.clone(),
+                thread.render_revision,
+                thread.items.len(),
+            )
         };
-
         let selected = self
             .current_thread_selected_item()
-            .min(thread.items.len().saturating_sub(1));
+            .min(item_count.saturating_sub(1));
         let horizontal_offset = self
             .horizontal_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0);
-        let inner_width = area.width.saturating_sub(2) as usize;
-        let selected_fill_width = horizontal_offset.saturating_add(inner_width.max(1));
-        let (lines, ranges, selected_visible_idx) =
-            build_thread_lines(&thread, selected, selected_fill_width, self.main_filter);
-        let viewport_rows = area.height.saturating_sub(2) as usize;
+        let visible_width = area.width as usize;
+        let selected_fill_width = horizontal_offset.saturating_add(visible_width.max(1));
+        let timeline_focused =
+            self.mode == InteractionMode::Navigate || self.focus == FocusPane::Main;
+
+        let cache_key = ThreadRenderCacheKey {
+            thread_id: thread_id.clone(),
+            revision: thread_revision,
+            selected,
+            selected_fill_width,
+            filter: self.main_filter,
+            timeline_focused,
+        };
+        let cache_miss = self
+            .thread_render_cache
+            .as_ref()
+            .map_or(true, |cache| cache.key != cache_key);
+        if cache_miss {
+            let (lines, ranges, selected_visible_idx) = {
+                let thread = self.current_thread();
+                build_thread_lines(
+                    thread,
+                    selected,
+                    selected_fill_width,
+                    self.main_filter,
+                    timeline_focused,
+                )
+            };
+            self.thread_render_cache = Some(ThreadRenderCache {
+                key: cache_key,
+                lines,
+                ranges,
+                selected_visible_idx,
+            });
+        }
+
+        let selected_range = self
+            .thread_render_cache
+            .as_ref()
+            .and_then(|cache| cache.ranges.get(cache.selected_visible_idx).copied());
+        let viewport_rows = area.height as usize;
         self.last_main_viewport_rows = viewport_rows.max(1);
 
-        self.ensure_selected_visible_for(
-            &thread.id,
-            &ranges,
-            viewport_rows.max(1),
-            selected_visible_idx,
-        );
+        self.ensure_selected_visible_for(&thread_id, selected_range, viewport_rows.max(1));
 
-        let max_vertical = lines.len().saturating_sub(viewport_rows.max(1));
+        let max_vertical = self
+            .thread_render_cache
+            .as_ref()
+            .map(|cache| cache.lines.len().saturating_sub(viewport_rows.max(1)))
+            .unwrap_or(0);
         let mut vertical_offset = self
             .vertical_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0)
             .min(max_vertical);
         self.vertical_scroll_by_thread
-            .insert(thread.id.clone(), vertical_offset);
+            .insert(thread_id.clone(), vertical_offset);
 
+        let lines = self
+            .thread_render_cache
+            .as_ref()
+            .map(|cache| cache.lines.clone())
+            .unwrap_or_default();
         let paragraph = Paragraph::new(Text::from(lines))
-            .block(block)
             .scroll((vertical_offset as u16, horizontal_offset as u16));
 
         frame.render_widget(paragraph, area);
 
         vertical_offset = self
             .vertical_scroll_by_thread
-            .get(&thread.id)
+            .get(&thread_id)
             .copied()
             .unwrap_or(0)
             .min(max_vertical);
         self.vertical_scroll_by_thread
-            .insert(thread.id, vertical_offset);
+            .insert(thread_id, vertical_offset);
     }
 
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let read_only = self.current_thread().read_only;
-        let title = if read_only {
-            "Input (read-only sub-agent thread)"
-        } else {
-            "Input"
-        };
-
-        let mut block = Block::default().title(title).borders(Borders::ALL);
-        if self.focus == FocusPane::Input && !read_only {
-            block = block.border_style(Style::default().fg(Color::Green));
-        } else if read_only {
-            block = block.border_style(Style::default().fg(Color::DarkGray));
+        if area.width <= PANE_GUTTER_WIDTH {
+            return;
         }
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(PANE_GUTTER_WIDTH), Constraint::Min(1)])
+            .split(area);
+        let gutter_area = split[0];
+        let body_area = split[1];
+
+        let read_only = self.current_thread().read_only;
+        let input_focused =
+            self.mode != InteractionMode::Navigate && self.focus == FocusPane::Input;
+        self.render_focus_gutter(frame, gutter_area, input_focused);
+
+        let block = Block::default()
+            .padding(Padding::new(1, 1, 1, 1))
+            .style(Style::default().bg(INPUT_BACKGROUND));
+        let inner = block.inner(body_area);
 
         let lines = self.composer.prefixed_lines();
         let paragraph = Paragraph::new(Text::from(lines))
             .block(block)
+            .style(Style::default().bg(INPUT_BACKGROUND))
             .wrap(Wrap { trim: false })
             .scroll((self.composer.scroll_line_offset as u16, 0));
 
-        frame.render_widget(paragraph, area);
+        frame.render_widget(paragraph, body_area);
         self.last_input_cursor_rel = None;
 
-        if self.focus != FocusPane::Input || read_only {
+        if self.mode == InteractionMode::Navigate || self.focus != FocusPane::Input || read_only {
             return;
         }
 
-        let inner = area.inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -675,9 +817,18 @@ impl ChatApp {
     }
 
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect) {
+        let mode_label = match self.mode {
+            InteractionMode::Compose => "input",
+            InteractionMode::Navigate => "navigation",
+        };
+        let sidebar_label = if self.sidebar_visible() {
+            "open"
+        } else {
+            "hidden"
+        };
         let status = self.status.clone().unwrap_or_else(|| {
             format!(
-                "Filter: {} (1:all 2:delegates 3:failures 4:system-tools) | Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | Ctrl+J/Ctrl+N/Shift+Enter: newline | q: quit",
+                "Mode:{mode_label} Sidebar:{sidebar_label} Filter:{} | Esc Esc: navigation mode | i: input mode | Ctrl+B: toggle sidebar | Tab/Shift+Tab: focus | Enter: send/open | Space: expand | Left/Right: h-scroll | 1-4: filter | q: quit",
                 self.main_filter.label()
             )
         });
@@ -714,21 +865,38 @@ impl ChatApp {
             return AppAction::None;
         }
 
+        self.expire_esc_arm();
         let read_only_input = self.current_thread().read_only;
 
         if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
             return AppAction::Quit;
         }
 
+        if key.code == KeyCode::Esc {
+            return self.handle_escape_press();
+        }
+        self.esc_armed_at = None;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
+        {
+            self.toggle_sidebar();
+            return AppAction::None;
+        }
+
+        if self.mode == InteractionMode::Navigate {
+            return self.handle_navigation_key(key);
+        }
+
         if key.code == KeyCode::BackTab
             || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
         {
-            self.focus = self.focus.prev();
+            self.cycle_focus_backward();
             return AppAction::None;
         }
 
         if key.code == KeyCode::Tab {
-            self.focus = self.focus.next();
+            self.cycle_focus_forward();
             return AppAction::None;
         }
 
@@ -907,6 +1075,158 @@ impl ChatApp {
         }
     }
 
+    fn sidebar_visible(&self) -> bool {
+        !self.sidebar_collapsed && !self.sidebar_auto_collapsed
+    }
+
+    fn render_focus_gutter(&self, frame: &mut Frame<'_>, area: Rect, active: bool) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let lines = (0..area.height)
+            .map(|_| {
+                Line::from(Span::styled(
+                    if active { "┃" } else { " " },
+                    Style::default().fg(INPUT_FOCUS_COLOR).bg(INPUT_BACKGROUND),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).style(Style::default().bg(INPUT_BACKGROUND)),
+            area,
+        );
+    }
+
+    fn cycle_focus_forward(&mut self) {
+        let mut next = self.focus.next();
+        if next == FocusPane::Sidebar && !self.sidebar_visible() {
+            next = next.next();
+        }
+        self.focus = next;
+    }
+
+    fn cycle_focus_backward(&mut self) {
+        let mut prev = self.focus.prev();
+        if prev == FocusPane::Sidebar && !self.sidebar_visible() {
+            prev = prev.prev();
+        }
+        self.focus = prev;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        if !self.sidebar_visible() && self.focus == FocusPane::Sidebar {
+            self.focus = FocusPane::Main;
+        }
+        self.status = Some(if self.sidebar_visible() {
+            "Thread sidebar shown".to_string()
+        } else {
+            "Thread sidebar hidden".to_string()
+        });
+    }
+
+    fn expire_esc_arm(&mut self) {
+        if let Some(armed_at) = self.esc_armed_at
+            && armed_at.elapsed() > ESC_NAVIGATION_WINDOW
+        {
+            self.esc_armed_at = None;
+        }
+    }
+
+    fn handle_escape_press(&mut self) -> AppAction {
+        if self.mode == InteractionMode::Navigate {
+            self.mode = InteractionMode::Compose;
+            self.focus = FocusPane::Input;
+            self.esc_armed_at = None;
+            self.status = Some("Input mode".to_string());
+            return AppAction::None;
+        }
+
+        if self
+            .esc_armed_at
+            .is_some_and(|armed| armed.elapsed() <= ESC_NAVIGATION_WINDOW)
+        {
+            self.mode = InteractionMode::Navigate;
+            self.focus = FocusPane::Main;
+            self.esc_armed_at = None;
+            self.status = Some(
+                "Navigation mode: Up/Down to move, Enter to open, Space to expand, i to edit"
+                    .to_string(),
+            );
+            return AppAction::None;
+        }
+
+        self.esc_armed_at = Some(Instant::now());
+        self.status = Some("Press Esc again quickly to enter navigation mode".to_string());
+        AppAction::None
+    }
+
+    fn handle_navigation_key(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.mode = InteractionMode::Compose;
+                self.focus = FocusPane::Input;
+                self.status = Some("Input mode".to_string());
+                AppAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => {
+                self.select_main_prev();
+                AppAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => {
+                self.select_main_next();
+                AppAction::None
+            }
+            KeyCode::Left => {
+                let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    8
+                } else {
+                    1
+                };
+                let current = self.current_thread_horizontal_offset();
+                self.set_current_thread_horizontal_offset(current.saturating_sub(step));
+                AppAction::None
+            }
+            KeyCode::Right => {
+                let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    8
+                } else {
+                    1
+                };
+                let current = self.current_thread_horizontal_offset();
+                self.set_current_thread_horizontal_offset(current.saturating_add(step));
+                AppAction::None
+            }
+            KeyCode::Home => {
+                self.set_current_thread_horizontal_offset(0);
+                AppAction::None
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_selected_item();
+                AppAction::None
+            }
+            KeyCode::Enter => self.open_selected_main_link(),
+            KeyCode::Char('1') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::All);
+                AppAction::None
+            }
+            KeyCode::Char('2') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::DelegatesOnly);
+                AppAction::None
+            }
+            KeyCode::Char('3') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::FailuresOnly);
+                AppAction::None
+            }
+            KeyCode::Char('4') if key.modifiers.is_empty() => {
+                self.set_main_filter(MainFilter::SystemToolsOnly);
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
     fn start_local_send(&mut self, message: String) -> AppAction {
         let thread_id = self.current_thread().id.clone();
         let is_system = thread_id == SYSTEM_THREAD_ID;
@@ -922,6 +1242,7 @@ impl ChatApp {
             thread
                 .items
                 .push(TimelineItem::text(MessageRoleTag::Assistant, "Thinking..."));
+            thread.render_revision = thread.render_revision.wrapping_add(1);
             let placeholder_idx = thread.items.len().saturating_sub(1);
             self.pending_placeholder_index_by_thread
                 .insert(thread.id.clone(), placeholder_idx);
@@ -948,7 +1269,6 @@ impl ChatApp {
         let current_pos = selected_visible_position(&visible, selected);
         let new_pos = current_pos.saturating_sub(1);
         self.set_current_thread_selected_item(visible[new_pos]);
-        self.ensure_selected_visible_current();
     }
 
     fn select_main_next(&mut self) {
@@ -960,23 +1280,22 @@ impl ChatApp {
         let current_pos = selected_visible_position(&visible, selected);
         let new_pos = (current_pos + 1).min(visible.len().saturating_sub(1));
         self.set_current_thread_selected_item(visible[new_pos]);
-        self.ensure_selected_visible_current();
     }
 
     fn toggle_selected_item(&mut self) {
         self.align_selection_to_filter_current();
         let selected = self.current_thread_selected_item();
         let thread_id = self.current_thread().id.clone();
-        if let Some(item) = self
+        if let Some(thread) = self
             .threads
             .iter_mut()
             .find(|thread| thread.id == thread_id)
-            .and_then(|thread| thread.items.get_mut(selected))
+            && let Some(item) = thread.items.get_mut(selected)
             && item.is_toggleable()
         {
             item.toggle();
+            thread.render_revision = thread.render_revision.wrapping_add(1);
         }
-        self.ensure_selected_visible_current();
     }
 
     fn open_selected_sidebar_thread(&mut self) -> AppAction {
@@ -985,17 +1304,20 @@ impl ChatApp {
             .min(self.threads.len().saturating_sub(1));
         self.focus = FocusPane::Main;
 
-        let thread = self.current_thread().clone();
-        if thread.id == SYSTEM_THREAD_ID {
+        let (thread_id, read_only) = {
+            let thread = self.current_thread();
+            (thread.id.clone(), thread.read_only)
+        };
+        if thread_id == SYSTEM_THREAD_ID {
             return AppAction::OpenThread {
-                thread_id: thread.id,
+                thread_id,
                 resurrect: false,
             };
         }
 
         AppAction::OpenThread {
-            thread_id: thread.id,
-            resurrect: thread.read_only,
+            thread_id,
+            resurrect: read_only,
         }
     }
 
@@ -1075,7 +1397,6 @@ impl ChatApp {
     fn set_main_filter(&mut self, filter: MainFilter) {
         self.main_filter = filter;
         self.align_selection_to_filter_current();
-        self.ensure_selected_visible_current();
         self.status = Some(format!("Main filter: {}", self.main_filter.label()));
     }
 
@@ -1113,36 +1434,17 @@ impl ChatApp {
         self.set_current_thread_selected_item(fallback);
     }
 
-    fn ensure_selected_visible_current(&mut self) {
-        let thread = self.current_thread().clone();
-        let selected = self
-            .current_thread_selected_item()
-            .min(thread.items.len().saturating_sub(1));
-        let (_, ranges, selected_visible_idx) =
-            build_thread_lines(&thread, selected, 1, self.main_filter);
-        self.ensure_selected_visible_for(
-            &thread.id,
-            &ranges,
-            self.last_main_viewport_rows.max(1),
-            selected_visible_idx,
-        );
-    }
-
     fn ensure_selected_visible_for(
         &mut self,
         thread_id: &str,
-        ranges: &[(usize, usize)],
+        selected_range: Option<(usize, usize)>,
         viewport_rows: usize,
-        selected_idx: usize,
     ) {
-        if ranges.is_empty() {
+        let Some((start, end)) = selected_range else {
             self.vertical_scroll_by_thread
                 .insert(thread_id.to_string(), 0);
             return;
-        }
-
-        let selected = selected_idx.min(ranges.len().saturating_sub(1));
-        let (start, end) = ranges[selected];
+        };
 
         let mut offset = self
             .vertical_scroll_by_thread
@@ -1179,6 +1481,10 @@ impl ChatApp {
             "messages": messages,
         })
     }
+
+    pub(super) fn animation_active(&self) -> bool {
+        false
+    }
 }
 
 fn build_thread_lines(
@@ -1186,6 +1492,7 @@ fn build_thread_lines(
     selected: usize,
     selected_fill_width: usize,
     filter: MainFilter,
+    timeline_focused: bool,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>, usize) {
     if thread.items.is_empty() {
         return (
@@ -1229,18 +1536,19 @@ fn build_thread_lines(
     for (visible_pos, idx) in visible_indices.iter().enumerate() {
         let item = &thread.items[*idx];
         let start = lines.len();
+        let selected_item = visible_pos == selected_visible_idx;
         let item_lines = item.lines(
-            visible_pos == selected_visible_idx,
+            selected_item,
             &assistant_label,
-            if visible_pos == selected_visible_idx {
-                Some(selected_fill_width)
-            } else {
-                None
-            },
+            Some(selected_fill_width),
+            timeline_focused,
         );
         lines.extend(item_lines);
         let end = lines.len().saturating_sub(1);
         ranges.push((start, end));
+        if visible_pos + 1 < visible_indices.len() {
+            lines.push(Line::from(" "));
+        }
     }
 
     (lines, ranges, selected_visible_idx)
@@ -1366,6 +1674,67 @@ mod tests {
     }
 
     #[test]
+    fn double_escape_enters_navigation_mode() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Input;
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(Event::Key(key(KeyCode::Esc)), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Compose);
+        let _ = app.handle_event(Event::Key(key(KeyCode::Esc)), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Navigate);
+        assert_eq!(app.focus, FocusPane::Main);
+    }
+
+    #[test]
+    fn navigation_mode_scrolls_and_exits_with_i() {
+        let mut app = ChatApp::new();
+        if let Some(system) = app
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == SYSTEM_THREAD_ID)
+        {
+            system
+                .items
+                .push(TimelineItem::text(MessageRoleTag::User, "first"));
+            system
+                .items
+                .push(TimelineItem::text(MessageRoleTag::Assistant, "second"));
+        }
+        app.selected_item_by_thread
+            .insert(SYSTEM_THREAD_ID.to_string(), 0);
+        app.mode = InteractionMode::Navigate;
+        app.focus = FocusPane::Main;
+
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(Event::Key(key(KeyCode::Down)), &mut clipboard);
+        assert_eq!(app.current_thread_selected_item(), 1);
+
+        let _ = app.handle_event(Event::Key(key(KeyCode::Char('i'))), &mut clipboard);
+        assert_eq!(app.mode, InteractionMode::Compose);
+        assert_eq!(app.focus, FocusPane::Input);
+    }
+
+    #[test]
+    fn ctrl_b_collapses_sidebar_and_skips_sidebar_focus() {
+        let mut app = ChatApp::new();
+        app.focus = FocusPane::Sidebar;
+        let mut clipboard = MockClipboard { value: None };
+        let _ = app.handle_event(
+            Event::Key(key_with_modifiers(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            )),
+            &mut clipboard,
+        );
+        assert!(app.sidebar_collapsed);
+        assert_eq!(app.focus, FocusPane::Main);
+
+        app.focus = FocusPane::Input;
+        let _ = app.handle_event(Event::Key(key(KeyCode::Tab)), &mut clipboard);
+        assert_eq!(app.focus, FocusPane::Main);
+    }
+
+    #[test]
     fn saved_subagent_threads_are_read_only_until_resurrected() {
         let mut app = ChatApp::new();
         app.sync_thread_summaries(vec![subagent_summary("thread-1", false, false)]);
@@ -1434,9 +1803,9 @@ mod tests {
             MessageRoleTag::Assistant,
             "system reply",
         ));
-        let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All);
+        let (system_lines, _, _) = build_thread_lines(&system, 0, 1, MainFilter::All, true);
         assert!(
-            line_text(&system_lines[0]).starts_with("[System0] "),
+            line_text(&system_lines[1]).contains("system0"),
             "system assistant label should be System0"
         );
 
@@ -1444,9 +1813,9 @@ mod tests {
         subagent
             .items
             .push(TimelineItem::text(MessageRoleTag::Assistant, "agent reply"));
-        let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All);
+        let (subagent_lines, _, _) = build_thread_lines(&subagent, 0, 1, MainFilter::All, true);
         assert!(
-            line_text(&subagent_lines[0]).starts_with("[planner] "),
+            line_text(&subagent_lines[1]).contains("planner"),
             "sub-agent assistant label should use the agent id"
         );
     }
@@ -1477,5 +1846,16 @@ mod tests {
             .find(|thread| thread.id == SYSTEM_THREAD_ID)
             .expect("system thread should exist");
         assert_eq!(system.items.len(), 2);
+    }
+
+    #[test]
+    fn render_smoke_test() {
+        let backend = ratatui::backend::TestBackend::new(140, 42);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal should initialize");
+        let mut app = ChatApp::new();
+        app.bootstrap_demo();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should not panic");
     }
 }

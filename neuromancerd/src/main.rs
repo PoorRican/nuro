@@ -1,6 +1,6 @@
-mod admin;
 mod config;
 mod orchestrator;
+mod rpc;
 mod shutdown;
 mod telemetry;
 
@@ -79,27 +79,27 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 5. Start admin API server
     // -----------------------------------------------------------------------
-    let orchestrator_runtime = Arc::new(
-        orchestrator::OrchestratorRuntime::new(&initial_config, &cli.config)
+    let system0_runtime = Arc::new(
+        orchestrator::System0Runtime::new(&initial_config, &cli.config)
             .await
             .map_err(|err| anyhow!("failed to initialize orchestrator runtime: {err}"))?,
     );
 
-    let admin_state = admin::AppState {
+    let rpc_state = rpc::AppState {
         start_time: Instant::now(),
         config_reload_tx: reload_tx.clone(),
-        orchestrator_runtime: Some(orchestrator_runtime),
+        system0_runtime: Some(system0_runtime.clone()),
     };
 
-    let admin_router = admin::admin_router(admin_state);
+    let rpc_router = rpc::rpc_router(rpc_state);
     let bind_addr = initial_config.admin_api.bind_addr.clone();
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!(bind = %bind_addr, "admin API listening");
 
     // Spawn the admin server as a background task.
-    let admin_handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, admin_router)
+    let rpc_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, rpc_router)
             .with_graceful_shutdown(async move {
                 shutdown_rx.changed().await.ok();
             })
@@ -144,16 +144,22 @@ async fn main() -> Result<()> {
     info!("graceful shutdown: stopping trigger sources (stub)");
 
     // Drain in-flight tasks with timeout
-    info!("graceful shutdown: draining in-flight tasks (stub, 30s timeout)");
+    info!("graceful shutdown: draining in-flight tasks (30s timeout)");
     let drain_timeout = Duration::from_secs(30);
-    let _ = tokio::time::timeout(drain_timeout, async {
-        // Stub: would wait for task queue to drain
-    })
-    .await;
+    match tokio::time::timeout(
+        drain_timeout,
+        system0_runtime.graceful_shutdown(drain_timeout),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("runtime shutdown failed: {err}"),
+        Err(timeout_err) => error!("runtime shutdown timed out: {timeout_err}"),
+    }
 
     // Wait for admin server to finish
     info!("graceful shutdown: stopping admin API");
-    let _ = admin_handle.await;
+    let _ = rpc_handle.await;
 
     // Flush OTEL spans (handled by TelemetryGuard drop, but explicit for clarity)
     info!("graceful shutdown: flushing OTEL spans");

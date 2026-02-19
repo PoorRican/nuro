@@ -4,20 +4,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::SkillError;
 
-fn script_runtime_error(kind: &str, message: impl Into<String>) -> OrchestratorRuntimeError {
-    OrchestratorRuntimeError::Internal(format!("script_{kind}: {}", message.into()))
-}
-
-pub(crate) async fn run_skill_script(
+pub async fn run_skill_script(
     script_path: &Path,
     payload: &serde_json::Value,
     timeout: Duration,
     agent_id: &str,
     task_id: &str,
     tool_id: &str,
-) -> Result<serde_json::Value, OrchestratorRuntimeError> {
+) -> Result<serde_json::Value, SkillError> {
     let started_at = std::time::Instant::now();
     tracing::info!(
         agent_id = %agent_id,
@@ -29,10 +25,7 @@ pub(crate) async fn run_skill_script(
     );
 
     let stdin_payload = serde_json::to_vec(payload).map_err(|err| {
-        script_runtime_error(
-            "io_error",
-            format!("failed to encode script input payload: {err}"),
-        )
+        SkillError::ScriptExecution(format!("failed to encode script input payload: {err}"))
     })?;
 
     let mut child = TokioCommand::new("python3")
@@ -43,52 +36,37 @@ pub(crate) async fn run_skill_script(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed to start python script '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed to start python script '{}': {err}",
+                script_path.display()
+            ))
         })?;
 
     let mut stdin = child.stdin.take().ok_or_else(|| {
-        script_runtime_error(
-            "io_error",
-            format!(
-                "script stdin is unavailable for '{}'",
-                script_path.display()
-            ),
-        )
+        SkillError::ScriptExecution(format!(
+            "script stdin is unavailable for '{}'",
+            script_path.display()
+        ))
     })?;
     stdin.write_all(&stdin_payload).await.map_err(|err| {
-        script_runtime_error(
-            "io_error",
-            format!(
-                "failed to write input to script '{}': {err}",
-                script_path.display()
-            ),
-        )
+        SkillError::ScriptExecution(format!(
+            "failed to write input to script '{}': {err}",
+            script_path.display()
+        ))
     })?;
     drop(stdin);
 
     let mut stdout = child.stdout.take().ok_or_else(|| {
-        script_runtime_error(
-            "io_error",
-            format!(
-                "script stdout is unavailable for '{}'",
-                script_path.display()
-            ),
-        )
+        SkillError::ScriptExecution(format!(
+            "script stdout is unavailable for '{}'",
+            script_path.display()
+        ))
     })?;
     let mut stderr = child.stderr.take().ok_or_else(|| {
-        script_runtime_error(
-            "io_error",
-            format!(
-                "script stderr is unavailable for '{}'",
-                script_path.display()
-            ),
-        )
+        SkillError::ScriptExecution(format!(
+            "script stderr is unavailable for '{}'",
+            script_path.display()
+        ))
     })?;
 
     let stdout_task = tokio::spawn(async move {
@@ -102,100 +80,73 @@ pub(crate) async fn run_skill_script(
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed waiting for script '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed waiting for script '{}': {err}",
+                script_path.display()
+            ))
         })?,
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(script_runtime_error(
-                "timeout",
-                format!(
-                    "script '{}' exceeded timeout of {}ms",
-                    script_path.display(),
-                    timeout.as_millis()
-                ),
-            ));
+            return Err(SkillError::ScriptTimeout(format!(
+                "script '{}' exceeded timeout of {}ms",
+                script_path.display(),
+                timeout.as_millis()
+            )));
         }
     };
 
     let stdout_bytes = stdout_task
         .await
         .map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed joining stdout reader for '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed joining stdout reader for '{}': {err}",
+                script_path.display()
+            ))
         })?
         .map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed reading script stdout '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed reading script stdout '{}': {err}",
+                script_path.display()
+            ))
         })?;
     let stderr_bytes = stderr_task
         .await
         .map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed joining stderr reader for '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed joining stderr reader for '{}': {err}",
+                script_path.display()
+            ))
         })?
         .map_err(|err| {
-            script_runtime_error(
-                "io_error",
-                format!(
-                    "failed reading script stderr '{}': {err}",
-                    script_path.display()
-                ),
-            )
+            SkillError::ScriptExecution(format!(
+                "failed reading script stderr '{}': {err}",
+                script_path.display()
+            ))
         })?;
 
     let stderr = String::from_utf8_lossy(&stderr_bytes);
     if !status.success() {
-        return Err(script_runtime_error(
-            "io_error",
-            format!(
-                "script '{}' exited with status {}: {}",
-                script_path.display(),
-                status,
-                stderr.trim()
-            ),
-        ));
+        return Err(SkillError::ScriptExecution(format!(
+            "script '{}' exited with status {}: {}",
+            script_path.display(),
+            status,
+            stderr.trim()
+        )));
     }
 
     let stdout = String::from_utf8(stdout_bytes).map_err(|err| {
-        script_runtime_error(
-            "invalid_json",
-            format!(
-                "script '{}' emitted non-utf8 stdout: {err}",
-                script_path.display()
-            ),
-        )
+        SkillError::ScriptInvalidOutput(format!(
+            "script '{}' emitted non-utf8 stdout: {err}",
+            script_path.display()
+        ))
     })?;
     let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|err| {
-        script_runtime_error(
-            "invalid_json",
-            format!(
-                "script '{}' emitted invalid JSON: {err}; stderr='{}'",
-                script_path.display(),
-                stderr.trim()
-            ),
-        )
+        SkillError::ScriptInvalidOutput(format!(
+            "script '{}' emitted invalid JSON: {err}; stderr='{}'",
+            script_path.display(),
+            stderr.trim()
+        ))
     })?;
 
     tracing::info!(

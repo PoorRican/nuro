@@ -1,19 +1,13 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::SkillError;
 
-pub fn resolve_local_data_path(
-    local_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
+pub fn resolve_local_data_path(local_root: &Path, relative: &str) -> Result<PathBuf, SkillError> {
     resolve_relative_path_under_root(local_root, relative, "data file")
 }
 
-pub fn resolve_skill_script_path(
-    skill_root: &Path,
-    relative: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
+pub fn resolve_skill_script_path(skill_root: &Path, relative: &str) -> Result<PathBuf, SkillError> {
     resolve_relative_path_under_root(skill_root, relative, "skill script")
 }
 
@@ -21,10 +15,10 @@ fn resolve_relative_path_under_root(
     root: &Path,
     relative: &str,
     file_type: &str,
-) -> Result<PathBuf, OrchestratorRuntimeError> {
+) -> Result<PathBuf, SkillError> {
     let input = Path::new(relative);
     if input.is_absolute() {
-        return Err(OrchestratorRuntimeError::PathViolation(format!(
+        return Err(SkillError::PathViolation(format!(
             "absolute paths are not allowed: {relative}"
         )));
     }
@@ -34,14 +28,14 @@ fn resolve_relative_path_under_root(
             component,
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         ) {
-            return Err(OrchestratorRuntimeError::PathViolation(format!(
+            return Err(SkillError::PathViolation(format!(
                 "path traversal is not allowed: {relative}"
             )));
         }
     }
 
     let root_canonical = fs::canonicalize(root).map_err(|err| {
-        OrchestratorRuntimeError::ResourceNotFound(format!(
+        SkillError::PathUnavailable(format!(
             "{} root '{}' is unavailable: {err}",
             file_type,
             root.display()
@@ -50,7 +44,7 @@ fn resolve_relative_path_under_root(
 
     let full_path = root.join(input);
     let target_canonical = fs::canonicalize(&full_path).map_err(|err| {
-        OrchestratorRuntimeError::ResourceNotFound(format!(
+        SkillError::PathUnavailable(format!(
             "{} '{}' is unavailable: {err}",
             file_type,
             full_path.display()
@@ -58,7 +52,7 @@ fn resolve_relative_path_under_root(
     })?;
 
     if !target_canonical.starts_with(&root_canonical) {
-        return Err(OrchestratorRuntimeError::PathViolation(format!(
+        return Err(SkillError::PathViolation(format!(
             "resolved path '{}' escapes '{}'",
             target_canonical.display(),
             root_canonical.display()
@@ -84,7 +78,7 @@ mod tests {
         let absolute = local_root.join("data/accounts.csv");
         let err = resolve_local_data_path(&local_root, absolute.to_string_lossy().as_ref())
             .expect_err("absolute path should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
@@ -92,7 +86,7 @@ mod tests {
         let local_root = temp_dir("nm_local_root");
         let err = resolve_local_data_path(&local_root, "../secrets.txt")
             .expect_err("parent traversal should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
@@ -114,7 +108,7 @@ mod tests {
         let absolute = skill_root.join("scripts/run.py");
         let err = resolve_skill_script_path(&skill_root, absolute.to_string_lossy().as_ref())
             .expect_err("absolute path should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]
@@ -122,7 +116,7 @@ mod tests {
         let skill_root = temp_dir("nm_skill_root");
         let err = resolve_skill_script_path(&skill_root, "../run.py")
             .expect_err("parent traversal should be rejected");
-        assert!(matches!(err, OrchestratorRuntimeError::PathViolation(_)));
+        assert!(matches!(err, SkillError::PathViolation(_)));
     }
 
     #[test]

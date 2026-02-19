@@ -58,7 +58,7 @@ pub enum LlmError {
     ContentFiltered { reason: String },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum ToolError {
     #[error("tool not found: {tool_id}")]
     NotFound { tool_id: String },
@@ -71,6 +71,12 @@ pub enum ToolError {
 
     #[error("MCP server down: {server_id}")]
     McpServerDown { server_id: String },
+
+    #[error("capability denied for agent {agent_id}: {capability}")]
+    CapabilityDenied {
+        agent_id: AgentId,
+        capability: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,3 +122,33 @@ pub enum InfraError {
 }
 
 pub type CapabilityRef = String;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_denied_formats_and_serializes() {
+        let error = ToolError::CapabilityDenied {
+            agent_id: "planner".to_string(),
+            capability: "can_request:browser".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "capability denied for agent planner: can_request:browser"
+        );
+
+        let encoded = serde_json::to_string(&error).expect("serialize");
+        let decoded: ToolError = serde_json::from_str(&encoded).expect("deserialize");
+        match decoded {
+            ToolError::CapabilityDenied {
+                agent_id,
+                capability,
+            } => {
+                assert_eq!(agent_id, "planner");
+                assert_eq!(capability, "can_request:browser");
+            }
+            other => panic!("expected capability denied, got {other:?}"),
+        }
+    }
+}

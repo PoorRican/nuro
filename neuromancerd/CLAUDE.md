@@ -34,7 +34,7 @@ cargo run -p neuromancerd -- --validate -c neuromancer.toml
 - `state.rs`: `System0ToolBroker` state, tool spec registry, invocation recording, proposal creation helpers.
 - `bootstrap.rs`: build orchestrator agent config.
 - `prompt.rs`: prompt loading/rendering.
-- `llm_clients.rs`: LLM client builders and retry-limit resolution.
+- `llm_clients.rs`: LLM client builders (generic OpenAI-compatible via `base_url`), provider defaults, and retry-limit resolution.
 - `tools.rs`: default/effective System0 tool allowlist.
 - `error.rs`: orchestrator runtime error variants.
 
@@ -92,7 +92,7 @@ neuroctl orchestrator turn "message"
           -> System0 `AgentRuntime::execute_turn(..., TriggerSource::Cli, ...)`
             -> `System0ToolBroker.call_tool` -> dispatch -> action handler
           -> journal tool invocations + `message_assistant`
-      <- `OrchestratorTurnResult { turn_id, response, delegated_runs, tool_invocations }`
+      <- `OrchestratorTurnResult { turn_id, response, delegated_tasks, tool_invocations }`
 ```
 
 Current ingress behavior: orchestrator turns are enqueued with `TriggerType::Admin` (CLI/chat boundary).

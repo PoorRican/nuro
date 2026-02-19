@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use neuromancer_core::config::NeuromancerConfig;
+use neuromancer_core::secrets::SecretKind;
 use neuromancer_core::xdg::{XdgLayout, resolve_path, validate_markdown_prompt_file};
 
 /// Load and deserialize config from a TOML file.
@@ -94,9 +95,50 @@ pub fn validate_config(config: &NeuromancerConfig, config_path: &Path) -> Result
         }
     }
 
+    validate_secret_entries(config)?;
     validate_prompt_config_health(config, config_path)?;
 
     info!("config validation passed");
+    Ok(())
+}
+
+fn validate_secret_entries(config: &NeuromancerConfig) -> Result<()> {
+    for (secret_id, entry) in &config.secrets.entries {
+        match entry.kind {
+            SecretKind::TotpSeed => {
+                if entry.totp_policy.is_none() {
+                    anyhow::bail!(
+                        "secret entry '{}' with kind 'totp_seed' requires 'totp_policy'",
+                        secret_id
+                    );
+                }
+
+                // SDS defaults for stubbed TOTP config path.
+                let params = entry.effective_totp_params();
+                if params.digits == 0 {
+                    anyhow::bail!(
+                        "secret entry '{}' has invalid totp_digits=0 (must be > 0)",
+                        secret_id
+                    );
+                }
+                if params.period == 0 {
+                    anyhow::bail!(
+                        "secret entry '{}' has invalid totp_period=0 (must be > 0)",
+                        secret_id
+                    );
+                }
+            }
+            _ => {
+                if entry.has_totp_fields() {
+                    anyhow::bail!(
+                        "secret entry '{}' sets TOTP fields, but kind is not 'totp_seed'",
+                        secret_id
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -215,6 +257,10 @@ instance_id = "test"
 workspace_dir = "/tmp"
 data_dir = "/tmp"
 
+[secrets]
+backend = "local_encrypted"
+require_acl = true
+
 [models.executor]
 provider = "mock"
 model = "test-double"
@@ -240,6 +286,10 @@ capabilities.filesystem_roots = []
 instance_id = "test"
 workspace_dir = "/tmp"
 data_dir = "/tmp"
+
+[secrets]
+backend = "local_encrypted"
+require_acl = true
 
 [models.executor]
 provider = "mock"
@@ -341,5 +391,84 @@ capabilities.filesystem_roots = []
         let config_path = write_config(&dir, true, true, true);
         let config = load_config(&config_path).expect("load");
         validate_config(&config, &config_path).expect("validation should pass");
+    }
+
+    #[test]
+    fn validate_config_accepts_totp_seed_with_default_params() {
+        let dir = temp_dir("nm_cfg_totp_defaults");
+        let config_path = write_config(&dir, true, false, false);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    r#"
+[secrets.entries.github_totp]
+kind = "totp_seed"
+allowed_agents = ["planner"]
+totp_policy = "autonomous"
+"#
+                )
+            })
+            .expect("append secrets");
+
+        let config = load_config(&config_path).expect("load");
+        validate_config(&config, &config_path).expect("validation should pass");
+    }
+
+    #[test]
+    fn validate_config_rejects_totp_seed_without_policy() {
+        let dir = temp_dir("nm_cfg_totp_missing_policy");
+        let config_path = write_config(&dir, true, false, false);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    r#"
+[secrets.entries.github_totp]
+kind = "totp_seed"
+allowed_agents = ["planner"]
+"#
+                )
+            })
+            .expect("append secrets");
+
+        let config = load_config(&config_path).expect("load");
+        let err = validate_config(&config, &config_path).expect_err("validation should fail");
+        assert!(err.to_string().contains("requires 'totp_policy'"));
+    }
+
+    #[test]
+    fn validate_config_rejects_totp_fields_on_non_totp_kind() {
+        let dir = temp_dir("nm_cfg_totp_invalid_kind");
+        let config_path = write_config(&dir, true, false, false);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    r#"
+[secrets.entries.github_pat]
+kind = "credential"
+allowed_agents = ["planner"]
+totp_policy = "escalate"
+"#
+                )
+            })
+            .expect("append secrets");
+
+        let config = load_config(&config_path).expect("load");
+        let err = validate_config(&config, &config_path).expect_err("validation should fail");
+        assert!(
+            err.to_string()
+                .contains("sets TOTP fields, but kind is not 'totp_seed'")
+        );
     }
 }

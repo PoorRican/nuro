@@ -3,20 +3,19 @@ use std::path::Path;
 
 use neuromancer_core::xdg::validate_markdown_prompt_file;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
+use crate::orchestrator::error::System0Error;
 
-pub fn load_system_prompt_file(path: &Path) -> Result<String, OrchestratorRuntimeError> {
-    validate_markdown_prompt_file(path)
-        .map_err(|err| OrchestratorRuntimeError::Config(err.to_string()))?;
+pub fn load_system_prompt_file(path: &Path) -> Result<String, System0Error> {
+    validate_markdown_prompt_file(path).map_err(|err| System0Error::Config(err.to_string()))?;
     fs::read_to_string(path).map_err(|err| {
-        OrchestratorRuntimeError::Config(format!(
+        System0Error::Config(format!(
             "failed to read system prompt '{}': {err}",
             path.display()
         ))
     })
 }
 
-pub fn render_orchestrator_prompt(
+pub fn render_system0_prompt(
     template: &str,
     mut agents: Vec<String>,
     mut tools: Vec<String>,

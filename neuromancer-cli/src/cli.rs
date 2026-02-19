@@ -170,6 +170,10 @@ pub enum OrchestratorCommand {
         #[command(subcommand)]
         command: OrchestratorEventsCommand,
     },
+    Reports {
+        #[command(subcommand)]
+        command: OrchestratorReportsCommand,
+    },
     Stats {
         #[command(subcommand)]
         command: OrchestratorStatsCommand,
@@ -177,6 +181,10 @@ pub enum OrchestratorCommand {
     Threads {
         #[command(subcommand)]
         command: OrchestratorThreadsCommand,
+    },
+    Outputs {
+        #[command(subcommand)]
+        command: OrchestratorOutputsCommand,
     },
     Subagent {
         #[command(subcommand)]
@@ -197,6 +205,11 @@ pub enum OrchestratorEventsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum OrchestratorReportsCommand {
+    Query(OrchestratorReportsQueryArgs),
+}
+
+#[derive(Debug, Subcommand)]
 pub enum OrchestratorStatsCommand {
     Get,
 }
@@ -213,6 +226,11 @@ pub enum OrchestratorSubagentCommand {
     Turn(OrchestratorSubagentTurnArgs),
 }
 
+#[derive(Debug, Subcommand)]
+pub enum OrchestratorOutputsCommand {
+    Pull(OrchestratorOutputsPullArgs),
+}
+
 #[derive(Debug, Args)]
 pub struct OrchestratorTurnArgs {
     /// Execute one System0 orchestrator turn.
@@ -220,7 +238,11 @@ pub struct OrchestratorTurnArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct OrchestratorChatArgs {}
+pub struct OrchestratorChatArgs {
+    /// Launch in demo mode with synthetic data (no daemon required).
+    #[arg(long)]
+    pub demo: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct OrchestratorRunGetArgs {
@@ -262,6 +284,30 @@ pub struct OrchestratorEventsQueryArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct OrchestratorReportsQueryArgs {
+    #[arg(long)]
+    pub thread_id: Option<String>,
+
+    #[arg(long)]
+    pub run_id: Option<String>,
+
+    #[arg(long)]
+    pub agent_id: Option<String>,
+
+    #[arg(long)]
+    pub report_type: Option<String>,
+
+    #[arg(long)]
+    pub include_remediation: Option<bool>,
+
+    #[arg(long)]
+    pub offset: Option<usize>,
+
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Args)]
 pub struct OrchestratorThreadGetArgs {
     pub thread_id: String,
 
@@ -283,6 +329,12 @@ pub struct OrchestratorSubagentTurnArgs {
     pub thread_id: String,
 
     pub message: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OrchestratorOutputsPullArgs {
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -417,8 +469,25 @@ mod tests {
 
         match cli.command {
             Command::Orchestrator {
-                command: OrchestratorCommand::Chat(_),
-            } => {}
+                command: OrchestratorCommand::Chat(args),
+            } => {
+                assert!(!args.demo);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_chat_demo_flag() {
+        let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "chat", "--demo"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Chat(args),
+            } => {
+                assert!(args.demo);
+            }
             other => panic!("unexpected command parsed: {other:?}"),
         }
     }
@@ -502,6 +571,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_orchestrator_reports_query_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "reports",
+            "query",
+            "--run-id",
+            "run-123",
+            "--report-type",
+            "stuck",
+            "--include-remediation",
+            "true",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Reports { command },
+            } => match command {
+                OrchestratorReportsCommand::Query(args) => {
+                    assert_eq!(args.run_id.as_deref(), Some("run-123"));
+                    assert_eq!(args.report_type.as_deref(), Some("stuck"));
+                    assert_eq!(args.include_remediation, Some(true));
+                }
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_orchestrator_stats_get_command() {
         let cli = Cli::try_parse_from(["neuroctl", "orchestrator", "stats", "get"])
             .expect("cli should parse");
@@ -560,6 +659,30 @@ mod tests {
                 OrchestratorSubagentCommand::Turn(args) => {
                     assert_eq!(args.thread_id, "thread-123");
                     assert_eq!(args.message, "continue from here");
+                }
+            },
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_orchestrator_outputs_pull_command() {
+        let cli = Cli::try_parse_from([
+            "neuroctl",
+            "orchestrator",
+            "outputs",
+            "pull",
+            "--limit",
+            "25",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Orchestrator {
+                command: OrchestratorCommand::Outputs { command },
+            } => match command {
+                OrchestratorOutputsCommand::Pull(args) => {
+                    assert_eq!(args.limit, Some(25));
                 }
             },
             other => panic!("unexpected command parsed: {other:?}"),

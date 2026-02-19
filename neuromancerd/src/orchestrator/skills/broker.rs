@@ -1,115 +1,61 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use chrono::Utc;
+use neuromancer_core::agent::TaskExecutionState;
 use neuromancer_core::error::{NeuromancerError, ToolError};
+use neuromancer_core::task::{Checkpoint, Task, TaskPriority, TaskState};
 use neuromancer_core::tool::{
-    AgentContext, ToolBroker, ToolCall, ToolOutput, ToolResult, ToolSource, ToolSpec,
+    AgentContext, ToolBroker, ToolCall, ToolResult, ToolSource, ToolSpec,
 };
-use neuromancer_skills::{Skill, SkillRegistry};
+use neuromancer_core::trigger::TriggerSource;
+use neuromancer_skills::SkillToolBroker;
 
-use crate::orchestrator::error::OrchestratorRuntimeError;
-use crate::orchestrator::security::execution_guard::ExecutionGuard;
-use crate::orchestrator::skills::aliases::build_skill_tool_aliases;
-use crate::orchestrator::skills::csv::parse_csv_content;
-use crate::orchestrator::skills::path_policy::{
-    resolve_local_data_path, resolve_skill_script_path,
-};
-use crate::orchestrator::skills::script_runner::run_skill_script;
-
-const DEFAULT_SKILL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::orchestrator::state::task_manager::running_state;
+use crate::orchestrator::state::{PersistedCheckpoint, TaskManager};
 
 #[derive(Clone)]
-pub(crate) struct SkillToolBroker {
-    tools: HashMap<String, SkillTool>,
-    tool_aliases: HashMap<String, String>,
-    aliases_by_tool: HashMap<String, Vec<String>>,
-    local_root: PathBuf,
-    execution_guard: Arc<dyn ExecutionGuard>,
+pub(crate) struct OrchestratorSkillBroker {
+    skill_broker: SkillToolBroker,
+    task_manager: TaskManager,
 }
 
-#[derive(Clone)]
-struct SkillTool {
-    description: String,
-    skill_root: PathBuf,
-    markdown_paths: Vec<String>,
-    csv_paths: Vec<String>,
-    script_path: Option<String>,
-    script_timeout: Duration,
-    required_safeguards: Vec<String>,
-}
-
-impl SkillToolBroker {
-    pub(crate) fn new(
-        agent_id: &str,
-        allowed_skills: &[String],
-        skill_registry: &SkillRegistry,
-        local_root: PathBuf,
-        execution_guard: Arc<dyn ExecutionGuard>,
-    ) -> Result<Self, OrchestratorRuntimeError> {
-        let mut tools = HashMap::new();
-        for skill_name in allowed_skills {
-            let skill = skill_registry.get(skill_name).ok_or_else(|| {
-                OrchestratorRuntimeError::Config(format!(
-                    "agent '{}' references missing skill '{}'",
-                    agent_id, skill_name
-                ))
-            })?;
-
-            tools.insert(skill_name.clone(), skill_tool_from_skill(skill));
+impl OrchestratorSkillBroker {
+    pub(crate) fn new(skill_broker: SkillToolBroker, task_manager: TaskManager) -> Self {
+        Self {
+            skill_broker,
+            task_manager,
         }
-
-        let (tool_aliases, aliases_by_tool) = build_skill_tool_aliases(allowed_skills);
-
-        Ok(Self {
-            tools,
-            tool_aliases,
-            aliases_by_tool,
-            local_root,
-            execution_guard,
-        })
     }
 
-    fn resolve_tool_id(&self, ctx: &AgentContext, requested_tool_id: &str) -> Option<String> {
-        let is_allowed = |tool_id: &str| ctx.allowed_tools.iter().any(|allowed| allowed == tool_id);
-        if is_allowed(requested_tool_id) && self.tools.contains_key(requested_tool_id) {
-            return Some(requested_tool_id.to_string());
-        }
-
-        let canonical = self.tool_aliases.get(requested_tool_id)?;
-        if is_allowed(canonical) && self.tools.contains_key(canonical) {
-            Some(canonical.clone())
-        } else {
-            None
+    fn assistance_tool_spec() -> ToolSpec {
+        ToolSpec {
+            id: "request_agent_assistance".to_string(),
+            name: "request_agent_assistance".to_string(),
+            description: "Request help from an allowed peer agent. args: { target_agent, instruction, context?, timeout_secs? }".to_string(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_agent": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "context": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "minimum": 1}
+                },
+                "required": ["target_agent", "instruction"],
+                "additionalProperties": false
+            }),
+            source: ToolSource::Builtin,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl ToolBroker for SkillToolBroker {
+impl ToolBroker for OrchestratorSkillBroker {
     async fn list_tools(&self, ctx: &AgentContext) -> Vec<ToolSpec> {
-        let mut specs = Vec::new();
-        for name in &ctx.allowed_tools {
-            let Some(tool) = self.tools.get(name) else {
-                continue;
-            };
-
-            specs.push(skill_tool_spec(name, name, &tool.description));
-
-            if let Some(aliases) = self.aliases_by_tool.get(name) {
-                for alias in aliases {
-                    specs.push(skill_tool_spec(
-                        alias,
-                        name,
-                        &format!("Alias for '{name}'. {}", tool.description),
-                    ));
-                }
-            }
+        let mut tools = self.skill_broker.list_tools(ctx).await;
+        if !ctx.allowed_peer_agents.is_empty() {
+            tools.push(Self::assistance_tool_spec());
         }
-
-        specs
+        tools
     }
 
     async fn call_tool(
@@ -117,175 +63,307 @@ impl ToolBroker for SkillToolBroker {
         ctx: &AgentContext,
         call: ToolCall,
     ) -> Result<ToolResult, NeuromancerError> {
-        let started_at = Instant::now();
-        let requested_tool_id = call.tool_id.clone();
-        tracing::info!(
-            agent_id = %ctx.agent_id,
-            task_id = %ctx.task_id,
-            tool_id = %requested_tool_id,
-            call_id = %call.id,
-            "skill_tool_started"
-        );
+        if call.tool_id != "request_agent_assistance" {
+            return self.skill_broker.call_tool(ctx, call).await;
+        }
 
-        let Some(canonical_tool_id) = self.resolve_tool_id(ctx, &requested_tool_id) else {
-            return Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: requested_tool_id,
+        let target_agent = call
+            .arguments
+            .get("target_agent")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                NeuromancerError::Tool(ToolError::ExecutionFailed {
+                    tool_id: call.tool_id.clone(),
+                    message: "missing 'target_agent'".to_string(),
+                })
+            })?
+            .to_string();
+        if !ctx
+            .allowed_peer_agents
+            .iter()
+            .any(|peer| peer == &target_agent)
+        {
+            return Err(NeuromancerError::Tool(ToolError::CapabilityDenied {
+                agent_id: ctx.agent_id.clone(),
+                capability: format!("can_request:{target_agent}"),
             }));
+        }
+
+        let instruction = call
+            .arguments
+            .get("instruction")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                NeuromancerError::Tool(ToolError::ExecutionFailed {
+                    tool_id: call.tool_id.clone(),
+                    message: "missing 'instruction'".to_string(),
+                })
+            })?
+            .to_string();
+        let timeout_secs = call
+            .arguments
+            .get("timeout_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(300);
+        let context = call
+            .arguments
+            .get("context")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned);
+        let child_instruction = match context {
+            Some(context) => format!("{instruction}\n\nContext:\n{context}"),
+            None => instruction,
         };
 
-        if canonical_tool_id != requested_tool_id {
-            tracing::warn!(
-                agent_id = %ctx.agent_id,
+        // Caller enters WaitingForInput while the child task runs.
+        let wait_checkpoint = assistance_wait_checkpoint(ctx.task_id, &target_agent);
+        if let Err(err) = self
+            .task_manager
+            .transition(
+                ctx.task_id,
+                Some("running"),
+                running_state(wait_checkpoint.execution_state.clone()),
+                Some(wait_checkpoint),
+            )
+            .await
+        {
+            tracing::debug!(
                 task_id = %ctx.task_id,
-                requested_tool_id = %requested_tool_id,
-                canonical_tool_id = %canonical_tool_id,
-                "skill_tool_alias_used"
+                error = ?err,
+                "caller_wait_state_transition_skipped"
             );
         }
 
-        let Some(tool) = self.tools.get(&canonical_tool_id) else {
-            return Err(NeuromancerError::Tool(ToolError::NotFound {
-                tool_id: canonical_tool_id,
-            }));
-        };
+        let mut task = Task::new(TriggerSource::Internal, child_instruction, target_agent);
+        task.parent_id = Some(ctx.task_id);
+        task.priority = TaskPriority::Normal;
+        task.state = TaskState::Queued;
 
-        let mut markdown_docs = Vec::new();
-        for raw in &tool.markdown_paths {
-            let path = resolve_local_data_path(&self.local_root, raw)
-                .map_err(map_tool_err(&canonical_tool_id))?;
-            let content = fs::read_to_string(&path).map_err(|err| {
-                NeuromancerError::Tool(ToolError::ExecutionFailed {
-                    tool_id: canonical_tool_id.clone(),
-                    message: err.to_string(),
-                })
-            })?;
-            markdown_docs.push(serde_json::json!({
-                "path": raw,
-                "content": content,
-            }));
-        }
+        let task_id = self.task_manager.enqueue_direct(task).await?;
+        let result = self
+            .task_manager
+            .await_task_result(task_id, Duration::from_secs(timeout_secs))
+            .await;
 
-        let mut csv_docs = Vec::new();
-        for raw in &tool.csv_paths {
-            let path = resolve_local_data_path(&self.local_root, raw)
-                .map_err(map_tool_err(&canonical_tool_id))?;
-            let content = fs::read_to_string(&path).map_err(|err| {
-                NeuromancerError::Tool(ToolError::ExecutionFailed {
-                    tool_id: canonical_tool_id.clone(),
-                    message: err.to_string(),
-                })
-            })?;
-            let parsed =
-                parse_csv_content(&path, &content).map_err(map_tool_err(&canonical_tool_id))?;
-            csv_docs.push(serde_json::json!({
-                "path": raw,
-                "headers": parsed.headers,
-                "rows": parsed.rows,
-                "summary": {
-                    "row_count": parsed.row_count,
-                    "total_balance": parsed.total_balance,
-                }
-            }));
-        }
-
-        let script_result = if let Some(relative_script_path) = tool.script_path.as_deref() {
-            self.execution_guard
-                .pre_skill_script_execution(&canonical_tool_id, &tool.required_safeguards)
-                .map_err(map_tool_err(&canonical_tool_id))?;
-
-            let script_path = resolve_skill_script_path(&tool.skill_root, relative_script_path)
-                .map_err(map_tool_err(&canonical_tool_id))?;
-
-            let payload = serde_json::json!({
-                "local_root": self.local_root.display().to_string(),
-                "skill": canonical_tool_id.clone(),
-                "data_sources": {
-                    "markdown": tool.markdown_paths.clone(),
-                    "csv": tool.csv_paths.clone(),
-                },
-                "arguments": call.arguments.clone(),
-            });
-
-            Some(
-                run_skill_script(
-                    &script_path,
-                    &payload,
-                    tool.script_timeout,
-                    &ctx.agent_id,
-                    &ctx.task_id.to_string(),
-                    &canonical_tool_id,
-                )
-                .await
-                .map_err(map_tool_err(&canonical_tool_id))?,
+        // Move caller back into active execution once assistance wait ends.
+        if let Err(err) = self
+            .task_manager
+            .transition(
+                ctx.task_id,
+                Some("running"),
+                running_state(TaskExecutionState::Thinking {
+                    conversation_len: 0,
+                    iteration: 0,
+                }),
+                None,
             )
-        } else {
-            None
-        };
+            .await
+        {
+            tracing::debug!(
+                task_id = %ctx.task_id,
+                error = ?err,
+                "caller_resume_state_transition_skipped"
+            );
+        }
 
-        tracing::info!(
-            agent_id = %ctx.agent_id,
-            task_id = %ctx.task_id,
-            tool_id = %requested_tool_id,
-            skill_id = %canonical_tool_id,
-            call_id = %call.id,
-            duration_ms = started_at.elapsed().as_millis(),
-            "skill_tool_finished"
-        );
+        let output = result?;
 
         Ok(ToolResult {
             call_id: call.id,
-            output: ToolOutput::Success(serde_json::json!({
-                "skill": canonical_tool_id,
-                "markdown": markdown_docs,
-                "csv": csv_docs,
-                "script_result": script_result,
-            })),
+            output: neuromancer_core::tool::ToolOutput::Success(
+                serde_json::to_value(output).map_err(|err| {
+                    NeuromancerError::Tool(ToolError::ExecutionFailed {
+                        tool_id: "request_agent_assistance".to_string(),
+                        message: err.to_string(),
+                    })
+                })?,
+            ),
         })
     }
 }
 
-fn map_tool_err(tool_id: &str) -> impl Fn(OrchestratorRuntimeError) -> NeuromancerError + '_ {
-    move |err| {
-        NeuromancerError::Tool(ToolError::ExecutionFailed {
-            tool_id: tool_id.to_string(),
-            message: err.to_string(),
-        })
-    }
-}
-
-fn skill_tool_from_skill(skill: &Skill) -> SkillTool {
-    let metadata = &skill.metadata;
-    SkillTool {
-        description: if metadata.description.trim().is_empty() {
-            format!("Skill {}", metadata.name)
-        } else {
-            metadata.description.clone()
-        },
-        skill_root: skill.path.clone(),
-        markdown_paths: metadata.data_sources.markdown.clone(),
-        csv_paths: metadata.data_sources.csv.clone(),
-        script_path: metadata.execution.script.clone(),
-        script_timeout: metadata
-            .execution
-            .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_SKILL_SCRIPT_TIMEOUT),
-        required_safeguards: metadata.safeguards.human_approval.clone(),
-    }
-}
-
-fn skill_tool_spec(name: &str, skill_id: &str, description: &str) -> ToolSpec {
-    ToolSpec {
-        id: name.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
-        parameters_schema: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
+fn assistance_wait_checkpoint(task_id: uuid::Uuid, target_agent: &str) -> PersistedCheckpoint {
+    let created_at = Utc::now();
+    let marker = Checkpoint {
+        task_id,
+        state_data: serde_json::json!({
+            "event": "request_agent_assistance_wait",
+            "target_agent": target_agent,
         }),
-        source: ToolSource::Skill {
-            skill_id: skill_id.to_string(),
-        },
+        created_at,
+    };
+    let execution_state = TaskExecutionState::WaitingForInput {
+        question: format!("Awaiting assistance from '{target_agent}'"),
+        checkpoint: marker,
+    };
+
+    PersistedCheckpoint {
+        task_id,
+        created_at,
+        execution_state,
+        conversation_json: None,
+        reason: Some("awaiting request_agent_assistance".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use neuromancer_core::error::{AgentError, ToolError};
+    use neuromancer_core::task::{Artifact, ArtifactKind, TaskOutput, TokenUsage};
+    use neuromancer_core::tool::{ToolBroker, ToolCall, ToolOutput};
+    use neuromancer_skills::SkillRegistry;
+
+    use crate::orchestrator::security::execution_guard::PlaceholderExecutionGuard;
+    use crate::orchestrator::state::{TaskManager, TaskStore};
+
+    async fn test_manager() -> TaskManager {
+        let store = TaskStore::in_memory().await.expect("store");
+        TaskManager::new(store).await.expect("task manager")
+    }
+
+    fn test_skill_broker() -> SkillToolBroker {
+        let registry = SkillRegistry::new(vec![]);
+        SkillToolBroker::new(
+            "planner",
+            &[],
+            &registry,
+            PathBuf::from("."),
+            Arc::new(PlaceholderExecutionGuard),
+        )
+        .expect("skill broker")
+    }
+
+    fn test_ctx(allowed_peers: Vec<String>) -> AgentContext {
+        AgentContext {
+            agent_id: "planner".to_string(),
+            task_id: uuid::Uuid::new_v4(),
+            allowed_tools: vec![],
+            allowed_mcp_servers: vec![],
+            allowed_peer_agents: allowed_peers,
+            allowed_secrets: vec![],
+            allowed_memory_partitions: vec![],
+        }
+    }
+
+    fn completed_output(summary: &str) -> TaskOutput {
+        TaskOutput {
+            artifacts: vec![Artifact {
+                kind: ArtifactKind::Text,
+                name: "response".to_string(),
+                content: summary.to_string(),
+                mime_type: Some("text/plain".to_string()),
+            }],
+            summary: summary.to_string(),
+            token_usage: TokenUsage::default(),
+            duration: Duration::from_millis(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_target_returns_capability_denied() {
+        let manager = test_manager().await;
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let ctx = test_ctx(vec!["browser".to_string()]);
+
+        let err = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "writer",
+                        "instruction": "draft a summary",
+                    }),
+                },
+            )
+            .await
+            .expect_err("capability should be denied");
+
+        assert!(matches!(
+            err,
+            NeuromancerError::Tool(ToolError::CapabilityDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn assistance_timeout_is_propagated() {
+        let manager = test_manager().await;
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let ctx = test_ctx(vec!["browser".to_string()]);
+
+        let err = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "fetch data",
+                        "timeout_secs": 0,
+                    }),
+                },
+            )
+            .await
+            .expect_err("await should timeout");
+        assert!(matches!(
+            err,
+            NeuromancerError::Agent(AgentError::Timeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn assistance_success_returns_child_output() {
+        let manager = test_manager().await;
+        let manager_for_worker = manager.clone();
+        tokio::spawn(async move {
+            let child = manager_for_worker
+                .wait_for_next_task()
+                .await
+                .expect("child task");
+            manager_for_worker
+                .transition(
+                    child.id,
+                    Some("queued"),
+                    TaskState::Completed {
+                        output: completed_output("from helper"),
+                    },
+                    None,
+                )
+                .await
+                .expect("complete child");
+        });
+
+        let broker = OrchestratorSkillBroker::new(test_skill_broker(), manager);
+        let ctx = AgentContext {
+            task_id: uuid::Uuid::new_v4(),
+            ..test_ctx(vec!["browser".to_string()])
+        };
+        let result = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "fetch data",
+                        "timeout_secs": 5,
+                    }),
+                },
+            )
+            .await
+            .expect("assistance should succeed");
+
+        let ToolOutput::Success(payload) = result.output else {
+            panic!("expected success payload");
+        };
+        assert_eq!(payload["summary"], serde_json::json!("from helper"));
     }
 }
