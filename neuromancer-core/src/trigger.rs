@@ -19,6 +19,7 @@ pub enum TriggerType {
     User,
     Admin,
     Internal,
+    UserConversation,
 }
 
 /// Source of a trigger event.

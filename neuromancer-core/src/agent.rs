@@ -23,6 +23,9 @@ pub struct AgentCapabilities {
     pub memory_partitions: Vec<String>,
     pub filesystem_roots: Vec<String>,
     pub network_policy: Option<String>,
+    /// Whether this agent supports direct UserConversation chat sessions.
+    #[serde(default)]
+    pub user_conversation: bool,
 }
 
 impl Default for AgentCapabilities {
@@ -36,6 +39,7 @@ impl Default for AgentCapabilities {
             memory_partitions: Vec::new(),
             filesystem_roots: Vec::new(),
             network_policy: None,
+            user_conversation: false,
         }
     }
 }
