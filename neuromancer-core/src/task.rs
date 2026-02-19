@@ -135,6 +135,20 @@ pub enum ArtifactKind {
     Data,
 }
 
+impl std::str::FromStr for ArtifactKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "text" => Ok(Self::Text),
+            "code" => Ok(Self::Code),
+            "file" => Ok(Self::File),
+            "url" => Ok(Self::Url),
+            "data" => Ok(Self::Data),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
@@ -161,6 +175,51 @@ impl AgentErrorLike {
         Self {
             code: code.into(),
             message: message.into(),
+        }
+    }
+}
+
+/// Controls post-processing of an agent's terminal response.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum OutputMode {
+    /// Return text as-is (System0, UserConversation).
+    #[default]
+    Passthrough,
+    /// Run extraction step to produce structured TaskOutput (task dispatch).
+    Extract,
+}
+
+/// Extraction schema for structured output via LLM `output_schema`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TaskOutputSchema {
+    pub summary: String,
+    pub artifacts: Vec<ArtifactSchema>,
+    pub no_reply: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ArtifactSchema {
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+}
+
+impl TaskOutputSchema {
+    pub fn into_task_output(self, token_usage: TokenUsage, duration: Duration) -> TaskOutput {
+        TaskOutput {
+            summary: self.summary,
+            artifacts: self
+                .artifacts
+                .into_iter()
+                .map(|a| Artifact {
+                    kind: a.kind.parse().unwrap_or(ArtifactKind::Text),
+                    name: a.name,
+                    content: a.content,
+                    mime_type: None,
+                })
+                .collect(),
+            token_usage,
+            duration,
         }
     }
 }
