@@ -75,10 +75,11 @@ where
             .tools(tool_definitions)
             .build();
 
+        let history_vec: Vec<_> = request.chat_history.iter().collect();
         let request_debug = render_request_debug(
             system_prompt,
             &current_prompt,
-            &request.chat_history,
+            &history_vec,
             &request.tools,
         );
         let response = self.model.completion(request).await.map_err(|e| {
@@ -107,6 +108,7 @@ where
                         arguments: tc.function.arguments.clone(),
                     });
                 }
+                _ => {} // Reasoning, Image, etc. — ignored for now
             }
         }
 
@@ -155,7 +157,7 @@ fn extract_user_text(message: &rig::completion::Message) -> Option<String> {
 fn render_request_debug(
     system_prompt: &str,
     current_prompt: &str,
-    chat_history: &[rig::completion::Message],
+    chat_history: &[&rig::completion::Message],
     tools: &[rig::completion::ToolDefinition],
 ) -> String {
     serde_json::json!({
@@ -232,6 +234,7 @@ mod tests {
         let messages = vec![
             rig::completion::Message::user("question"),
             rig::completion::Message::Assistant {
+                id: None,
                 content: rig::OneOrMany::one(rig::message::AssistantContent::tool_call(
                     "call-1",
                     "list_agents",

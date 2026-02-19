@@ -117,7 +117,10 @@ impl ConversationContext {
                             call.arguments.clone(),
                         )
                     })) {
-                        out.push(rig::completion::Message::Assistant { content });
+                        out.push(rig::completion::Message::Assistant {
+                            id: None,
+                            content,
+                        });
                     }
                 }
                 (MessageRole::Tool, MessageContent::ToolResult(result)) => {
@@ -239,7 +242,7 @@ mod tests {
         let rig_msgs = ctx.to_rig_messages();
         assert_eq!(rig_msgs.len(), 1);
         match &rig_msgs[0] {
-            rig::completion::Message::Assistant { content } => assert_eq!(content.len(), 2),
+            rig::completion::Message::Assistant { content, .. } => assert_eq!(content.len(), 2),
             _ => panic!("expected assistant message"),
         }
     }

@@ -61,7 +61,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 
 # LLM
-rig-core = { version = "0.11", features = ["derive"] }
+rig-core = { version = "0.31", features = ["derive"] }
 
 # MCP
 rmcp = { version = "0.1", features = ["client", "transport-sse", "transport-child-process"] }

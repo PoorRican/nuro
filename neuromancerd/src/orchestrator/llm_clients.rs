@@ -4,6 +4,7 @@ use neuromancer_agent::llm::{LlmClient, RigLlmClient};
 use neuromancer_core::agent::AgentConfig;
 use neuromancer_core::config::NeuromancerConfig;
 use neuromancer_core::error::NeuromancerError;
+use rig::client::CompletionClient;
 
 use crate::orchestrator::error::System0Error;
 
@@ -47,17 +48,27 @@ pub fn build_llm_client(
                 ))
             })?;
 
-            let client = match (slot.base_url.as_deref(), default_base_url(provider)) {
-                (Some(url), _) | (None, Some(url)) => {
-                    rig::providers::openai::Client::from_url(&key, url)
-                }
-                (None, None) if provider == "openai" => rig::providers::openai::Client::new(&key),
-                _ => {
-                    return Err(System0Error::Config(format!(
-                        "provider '{provider}' requires a base_url in config"
-                    )));
-                }
+            let base_url = slot
+                .base_url
+                .as_deref()
+                .or_else(|| default_base_url(provider));
+
+            let client: Result<rig::providers::openai::CompletionsClient, _> = if let Some(url) = base_url {
+                rig::providers::openai::CompletionsClient::builder()
+                    .api_key(&key)
+                    .base_url(url)
+                    .build()
+            } else if provider == "openai" {
+                rig::providers::openai::CompletionsClient::new(&key)
+            } else {
+                return Err(System0Error::Config(format!(
+                    "provider '{provider}' requires a base_url in config"
+                )));
             };
+
+            let client = client.map_err(|e| {
+                System0Error::Config(format!("failed to create LLM client: {e}"))
+            })?;
 
             Ok(Arc::new(RigLlmClient::new(
                 client.completion_model(&slot.model),
