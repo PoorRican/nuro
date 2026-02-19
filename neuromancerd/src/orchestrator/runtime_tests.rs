@@ -452,3 +452,101 @@ fn render_system0_prompt_handles_empty_lists() {
     assert!(rendered.contains("agents=none"));
     assert!(rendered.contains("tools=none"));
 }
+
+#[tokio::test]
+async fn bootstrap_threads_suspends_stale_collaboration_threads() {
+    use neuromancer_core::thread::{
+        AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, TruncationStrategy,
+    };
+
+    let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> = Arc::new(
+        crate::orchestrator::threads::SqliteThreadStore::in_memory()
+            .await
+            .expect("thread store"),
+    );
+    let now = chrono::Utc::now();
+
+    // Create a parent thread that has failed.
+    thread_store
+        .create_thread(&AgentThread {
+            id: "parent-1".to_string(),
+            agent_id: "planner".to_string(),
+            scope: ThreadScope::Task {
+                task_id: "task-1".to_string(),
+            },
+            compaction_policy: CompactionPolicy::InPlace {
+                strategy: TruncationStrategy::default(),
+            },
+            context_window_budget: 128_000,
+            status: ThreadStatus::Failed,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("create parent");
+
+    // Create an active collaboration thread referencing the failed parent.
+    thread_store
+        .create_thread(&AgentThread {
+            id: "collab-browser-1".to_string(),
+            agent_id: "browser".to_string(),
+            scope: ThreadScope::Collaboration {
+                parent_thread_id: "parent-1".to_string(),
+                root_scope: Box::new(ThreadScope::Task {
+                    task_id: "task-1".to_string(),
+                }),
+            },
+            compaction_policy: CompactionPolicy::InPlace {
+                strategy: TruncationStrategy::default(),
+            },
+            context_window_budget: 128_000,
+            status: ThreadStatus::Active,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("create collab thread");
+
+    // Create a collaboration thread whose parent is missing entirely.
+    thread_store
+        .create_thread(&AgentThread {
+            id: "collab-browser-2".to_string(),
+            agent_id: "browser".to_string(),
+            scope: ThreadScope::Collaboration {
+                parent_thread_id: "nonexistent-parent".to_string(),
+                root_scope: Box::new(ThreadScope::Task {
+                    task_id: "task-2".to_string(),
+                }),
+            },
+            compaction_policy: CompactionPolicy::InPlace {
+                strategy: TruncationStrategy::default(),
+            },
+            context_window_budget: 128_000,
+            status: ThreadStatus::Active,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("create orphan collab thread");
+
+    // Run bootstrap.
+    super::System0Runtime::bootstrap_threads(&thread_store)
+        .await
+        .expect("bootstrap_threads");
+
+    // Verify: stale collab thread should match parent status (Failed).
+    let t1 = thread_store
+        .get_thread(&"collab-browser-1".to_string())
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(t1.status, ThreadStatus::Failed);
+
+    // Verify: orphan collab thread should be Failed (parent not found).
+    let t2 = thread_store
+        .get_thread(&"collab-browser-2".to_string())
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(t2.status, ThreadStatus::Failed);
+}

@@ -9,7 +9,7 @@ use neuromancer_core::rpc::{
     DelegatedRun, OrchestratorSubagentTurnResult, OrchestratorTurnResult, ThreadSummary,
 };
 use neuromancer_core::thread::{
-    AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, UserConversation,
+    AgentThread, CompactionPolicy, ThreadScope, ThreadStatus, ThreadStore, UserConversation,
 };
 use neuromancer_core::task::{OutputMode, Task, TaskId, TaskOutput};
 use neuromancer_core::tool::{AgentContext, ToolBroker, ToolCall, ToolResult, ToolSpec};
@@ -81,6 +81,8 @@ impl System0Runtime {
             .map_err(|err| System0Error::Config(err.to_string()))?;
         let thread_store: Arc<dyn neuromancer_core::thread::ThreadStore> =
             Arc::new(thread_store);
+
+        Self::bootstrap_threads(&thread_store).await?;
 
         let allowlisted_system0_tools =
             effective_system0_tool_allowlist(&config.orchestrator.capabilities.skills);
@@ -198,6 +200,59 @@ impl System0Runtime {
             _turn_worker: turn_worker,
             _report_worker: report_worker,
         })
+    }
+
+    /// Clean up stale collaboration threads and log recovery summary.
+    ///
+    /// Active collaboration threads whose parent is no longer active get
+    /// transitioned to match the parent's terminal status.
+    async fn bootstrap_threads(
+        thread_store: &Arc<dyn ThreadStore>,
+    ) -> Result<(), System0Error> {
+        let collab_threads = thread_store
+            .list_threads_by_scope_type("collaboration")
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+
+        let mut suspended = 0usize;
+        for thread in &collab_threads {
+            if thread.status != ThreadStatus::Active {
+                continue;
+            }
+            let parent_thread_id = match &thread.scope {
+                ThreadScope::Collaboration { parent_thread_id, .. } => parent_thread_id,
+                _ => continue,
+            };
+            let parent_status = match thread_store.get_thread(parent_thread_id).await {
+                Ok(Some(parent)) => parent.status,
+                Ok(None) => ThreadStatus::Failed,
+                Err(_) => continue,
+            };
+            if matches!(parent_status, ThreadStatus::Failed | ThreadStatus::Completed | ThreadStatus::Suspended) {
+                if let Err(err) = thread_store.update_status(&thread.id, parent_status.clone()).await {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        error = ?err,
+                        "bootstrap_thread_status_update_failed"
+                    );
+                } else {
+                    suspended += 1;
+                }
+            }
+        }
+
+        let conversations = thread_store
+            .list_user_conversations()
+            .await
+            .map_err(|err| System0Error::Config(err.to_string()))?;
+        let active_conversations = conversations.iter().filter(|c| c.status == ThreadStatus::Active).count();
+
+        tracing::info!(
+            collab_suspended = suspended,
+            conversations_active = active_conversations,
+            "thread_recovery_complete"
+        );
+        Ok(())
     }
 
     pub async fn enqueue_direct(&self, task: Task) -> Result<TaskId, System0Error> {
