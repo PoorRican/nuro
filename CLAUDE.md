@@ -211,3 +211,7 @@ Canonical example: `defaults/bootstrap/neuromancer.toml`.
 ## Reference
 
 System design specification: `docs/initial_sds.md`.
+
+## Referencing Crates
+
+Whenever you are looking for how crates are implemented, ALWAYS go directly to crates.io
