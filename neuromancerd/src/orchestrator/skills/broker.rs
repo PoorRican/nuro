@@ -660,6 +660,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_collaboration_caller_state_transitions() {
+        use neuromancer_core::agent::TaskExecutionState;
+        use neuromancer_core::task::TaskState;
+
+        let manager = test_manager().await;
+        let thread_store = test_thread_store().await;
+        let caller_task_id = uuid::Uuid::new_v4();
+        let caller_thread_id = format!("planner-{}", &caller_task_id.to_string()[..8]);
+
+        // Create the caller's thread + execution context.
+        let now = Utc::now();
+        thread_store
+            .create_thread(&AgentThread {
+                id: caller_thread_id.clone(),
+                agent_id: "planner".to_string(),
+                scope: ThreadScope::Task {
+                    task_id: caller_task_id.to_string(),
+                },
+                compaction_policy: CompactionPolicy::InPlace {
+                    strategy: TruncationStrategy::default(),
+                },
+                context_window_budget: 128_000,
+                status: ThreadStatus::Active,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("create caller thread");
+        manager
+            .register_execution_context(
+                caller_task_id,
+                TaskExecutionContext {
+                    turn_id: None,
+                    call_id: None,
+                    thread_id: Some(caller_thread_id.clone()),
+                    trigger_type: TriggerType::Internal,
+                    publish_output: false,
+                },
+            )
+            .await;
+
+        // Put the caller task into a Running state so transitions are valid.
+        let mut caller_task = neuromancer_core::task::Task::new(
+            neuromancer_core::trigger::TriggerSource::Internal,
+            "test".to_string(),
+            "planner".to_string(),
+        );
+        caller_task.id = caller_task_id;
+        manager.enqueue_direct(caller_task).await.expect("enqueue caller");
+        // Drain the queue so it's picked up.
+        let _ = manager.wait_for_next_task().await;
+        manager
+            .transition(
+                caller_task_id,
+                Some("queued"),
+                TaskState::Running {
+                    execution_state: TaskExecutionState::Thinking {
+                        conversation_len: 0,
+                        iteration: 0,
+                    },
+                },
+                None,
+            )
+            .await
+            .expect("transition to running");
+
+        // Spawn a worker that verifies WaitingForCollaboration, then completes the child.
+        let manager_for_worker = manager.clone();
+        tokio::spawn(async move {
+            let child = manager_for_worker
+                .wait_for_next_task()
+                .await
+                .expect("child task");
+
+            // At this point the caller should be in WaitingForCollaboration.
+            let caller = manager_for_worker
+                .get_task(caller_task_id)
+                .await
+                .expect("get caller")
+                .expect("caller exists");
+            match &caller.state {
+                TaskState::Running { execution_state } => {
+                    assert!(
+                        matches!(
+                            execution_state,
+                            TaskExecutionState::WaitingForCollaboration { .. }
+                        ),
+                        "expected WaitingForCollaboration, got: {execution_state:?}"
+                    );
+                }
+                other => panic!("expected Running state, got: {other:?}"),
+            }
+
+            manager_for_worker
+                .transition(
+                    child.id,
+                    Some("queued"),
+                    TaskState::Completed {
+                        output: completed_output("done"),
+                    },
+                    None,
+                )
+                .await
+                .expect("complete child");
+        });
+
+        let broker =
+            OrchestratorSkillBroker::new(test_skill_broker(), manager.clone(), thread_store);
+        let ctx = AgentContext {
+            task_id: caller_task_id,
+            ..test_ctx(vec!["browser".to_string()])
+        };
+        let _result = broker
+            .call_tool(
+                &ctx,
+                ToolCall {
+                    id: "call-1".to_string(),
+                    tool_id: "request_agent_assistance".to_string(),
+                    arguments: serde_json::json!({
+                        "target_agent": "browser",
+                        "instruction": "help me",
+                        "timeout_secs": 5,
+                    }),
+                },
+            )
+            .await
+            .expect("assistance should succeed");
+
+        // After call_tool returns, caller should be back in Thinking state.
+        let caller_after = manager
+            .get_task(caller_task_id)
+            .await
+            .expect("get caller")
+            .expect("caller exists");
+        match &caller_after.state {
+            TaskState::Running { execution_state } => {
+                assert!(
+                    matches!(
+                        execution_state,
+                        TaskExecutionState::Thinking { .. }
+                    ),
+                    "expected Thinking after collaboration, got: {execution_state:?}"
+                );
+            }
+            other => panic!("expected Running state after collaboration, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn collaboration_thread_is_reused_across_calls() {
         let manager = test_manager().await;
         let thread_store = test_thread_store().await;
