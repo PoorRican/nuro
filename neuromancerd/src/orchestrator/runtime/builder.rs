@@ -66,6 +66,8 @@ pub(super) fn build_subagents(
     report_tx: &mpsc::Sender<neuromancer_core::agent::SubAgentReport>,
     task_manager: &TaskManager,
     thread_store: &Arc<dyn neuromancer_core::thread::ThreadStore>,
+    _secrets_broker: &Option<Arc<dyn neuromancer_core::secrets::SecretsBroker>>,
+    _mcp_pool: &Option<Arc<neuromancer_mcp::McpClientPool>>,
 ) -> Result<HashMap<String, Arc<AgentRuntime>>, System0Error> {
     let mut subagents = HashMap::new();
     for (agent_id, agent_toml) in &config.agents {

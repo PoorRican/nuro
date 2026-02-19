@@ -50,7 +50,12 @@ struct TurnRequest {
 }
 
 impl System0Runtime {
-    pub async fn new(config: &NeuromancerConfig, config_path: &Path) -> Result<Self, System0Error> {
+    pub async fn new(
+        config: &NeuromancerConfig,
+        config_path: &Path,
+        secrets_broker: Option<Arc<dyn neuromancer_core::secrets::SecretsBroker>>,
+        mcp_pool: Option<Arc<neuromancer_mcp::McpClientPool>>,
+    ) -> Result<Self, System0Error> {
         let layout = XdgLayout::from_env().map_err(map_xdg_err)?;
         let local_root = layout.runtime_root();
         let config_dir = config_path
@@ -96,6 +101,8 @@ impl System0Runtime {
             &report_tx,
             &task_manager,
             &thread_store,
+            &secrets_broker,
+            &mcp_pool,
         )?;
         let config_snapshot =
             serde_json::to_value(config).map_err(|err| System0Error::Config(err.to_string()))?;
@@ -311,6 +318,37 @@ impl System0Runtime {
             .send(TurnRequest {
                 message,
                 trigger_type: TriggerType::Admin,
+                response_tx,
+            })
+            .await
+            .map_err(|err| System0Error::Unavailable(err.to_string()))?;
+
+        let received = tokio::time::timeout(builder::TURN_TIMEOUT, response_rx)
+            .await
+            .map_err(|_| {
+                System0Error::Timeout(humantime::format_duration(builder::TURN_TIMEOUT).to_string())
+            })?;
+
+        received.map_err(|_| System0Error::Unavailable("turn worker stopped".to_string()))?
+    }
+
+    /// Same as `turn()` but accepts a custom `TriggerType` instead of hardcoding `Admin`.
+    pub async fn turn_with_trigger(
+        &self,
+        message: String,
+        trigger_type: TriggerType,
+    ) -> Result<OrchestratorTurnResult, System0Error> {
+        if message.trim().is_empty() {
+            return Err(System0Error::InvalidRequest(
+                "message must not be empty".to_string(),
+            ));
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        self.turn_tx
+            .send(TurnRequest {
+                message,
+                trigger_type,
                 response_tx,
             })
             .await
